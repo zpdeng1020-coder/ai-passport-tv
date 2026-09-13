@@ -228,10 +228,14 @@ def report_missing_ffmpeg() -> None:
     print()
 
 
-# How long a child is given to notice the closed stdin pipe and leave before
-# the stronger signal is sent. It is a wake-up, not a shutdown -- the child
-# exits without unwinding -- so this only has to cover the time it takes a
-# blocked read to return, not the time a tidy exit would need.
+# How long a child is given to shut down properly after being asked, before
+# anything forceful happens to it. Generous, because this is the path that
+# closes a socket and ends an ffmpeg child rather than simply stopping.
+GRACEFUL_EXIT_TIMEOUT_S = 10
+
+# How long a child is given to notice the closed stdin pipe and leave. It is a
+# wake-up, not a shutdown -- the child exits where it stands -- so this only has
+# to cover the time it takes a blocked read to return.
 WATCH_EXIT_TIMEOUT_S = 5
 
 
@@ -336,62 +340,82 @@ def spawn(command: list[str]) -> subprocess.Popen:
     environment[parentwatch.WATCH_ENV] = "1"
 
     kwargs: dict = {"cwd": datadir.data_dir(), "env": environment,
-                    # A pipe this process holds open and never writes to. Its
-                    # only purpose is to be something the operating system
-                    # closes when this process ends, however it ends -- which
-                    # is the one thing a signal handler cannot cover. See
-                    # tools/parentwatch.py, including why stdin and not another
-                    # stream.
+                    # The pipe the child watches on POSIX, so that the kernel
+                    # tells it when this process ends -- including when it is
+                    # killed outright, which no handler can cover. Windows does
+                    # not use this and needs it anyway: the bundle goes through
+                    # a bootloader that does not pass stdin through, which is
+                    # how the first attempt at this passed on two platforms and
+                    # failed on the third. See tools/parentwatch.py.
                     "stdin": subprocess.PIPE}
     if os.name == "posix":
         kwargs["start_new_session"] = True
     else:
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    return subprocess.Popen(command, **kwargs)
+    process = subprocess.Popen(command, **kwargs)
+    # And the platform-specific half: a job object on Windows, nothing on
+    # POSIX where the pipe above is already the arrangement.
+    parentwatch.attach(process)
+    return process
+
+
+def _close_stdin(process: subprocess.Popen) -> None:
+    """Let go of the child's stdin, which is how it learns we are finishing.
+
+    Not an input stream. On POSIX it is the pipe the child watches so that a
+    SIGKILL aimed at this process still ends it; on Windows it is the only
+    notification a child can act on, because `terminate()` there is
+    `TerminateProcess` and cannot be handled. Closing it is what makes both
+    work, and it is the last resort in `stop` rather than the first -- see
+    there for why the order matters.
+    """
+    if process.stdin is None:
+        return
+    try:
+        process.stdin.close()
+    except OSError:
+        pass
+    process.stdin = None
 
 
 def stop(process: subprocess.Popen | None) -> None:
-    """Ask a child to stop, then insist. Safe to call on one already gone."""
-    if process is None:
+    """Ask a child to stop, then insist. Safe to call on one already gone.
+
+    Asked first, because a child that leaves on its own closes its socket and
+    ends its own ffmpeg, and says so. Closing the stdin pipe looks like a
+    tidier way to do the same thing and is not: it makes the child exit where
+    it stands, so a run that ended normally stopped printing "已停止。" and the
+    device saw the connection drop rather than close. Tried after the polite
+    request has failed, it is exactly right -- that is the child which is stuck
+    or was never told, and leaving it would keep the port for the next run.
+
+    The two platforms ask differently, and this is not a preference: SIGTERM
+    reaches a handler on POSIX, and on Windows there is no signal a process can
+    receive, so the pipe is the only way to ask at all.
+    """
+    if process is None or process.poll() is not None:
         return
-    # The stdin pipe is closed first and from this side. On Windows it is the
-    # only notification a child gets that this process is ending: `terminate()`
-    # there is `TerminateProcess`, which the child cannot handle, so it never
-    # reaches its own shutdown and never closes its socket in an orderly way.
-    # Closing our end is a fact the child can observe, and the wake-up below is
-    # what lets it act before anything more forceful arrives.
-    #
-    # Harmless on POSIX, and kept here rather than in a branch so that the
-    # sequence is the same on every platform: one of them is the case that
-    # matters, and a difference in behaviour between them is exactly what this
-    # round of fixes is removing.
-    if process.stdin is not None:
+
+    if os.name == "posix":
         try:
-            process.stdin.close()
-        except OSError:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            # Already gone, or not ours to signal. The waits below still apply.
             pass
-        process.stdin = None
         try:
-            process.wait(timeout=WATCH_EXIT_TIMEOUT_S)
+            process.wait(timeout=GRACEFUL_EXIT_TIMEOUT_S)
+            _close_stdin(process)
             return
         except subprocess.TimeoutExpired:
             pass
-    if process.poll() is not None:
-        return
+
+    # Still here, so the request did not land -- or could not be made. Both
+    # routes below are forceful and in that order: the pipe, which the child
+    # acts on promptly, then the kill it cannot refuse.
+    _close_stdin(process)
     try:
-        if os.name == "posix":
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        else:
-            process.terminate()
-    except (ProcessLookupError, PermissionError, OSError):
-        # Already gone, or not ours to signal. Waiting below still applies.
-        pass
-    try:
-        process.wait(timeout=10)
+        process.wait(timeout=WATCH_EXIT_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        # Ten seconds is generous for a process that closes a socket. One that
-        # has not stopped by now is stuck, and leaving it would keep the port
-        # occupied for the next run.
         process.kill()
         process.wait()
 
