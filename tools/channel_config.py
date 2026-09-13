@@ -26,8 +26,20 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-CHANNELS_FILE = ROOT / "channels.txt"
+# This page writes the channel list, so where that file goes has to be the data
+# directory and not anything derived from this file's own location. The
+# difference only shows up in a bundled build, where `__file__` names a temporary
+# directory that the runtime deletes on exit -- saving there would look like it
+# worked and lose the edit. The bootstrap below is the same one tools/launch.py
+# needs: run as a script, this file's directory is on the search path rather than
+# the repository root.
+_BOOTSTRAP_ROOT = Path(__file__).resolve().parents[1]
+if str(_BOOTSTRAP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BOOTSTRAP_ROOT))
+
+from tools import datadir  # noqa: E402  (resolves only after the path above)
+
+CHANNELS_FILE = datadir.channels_file()
 DEFAULT_SOURCE = "https://live.zhoujie218.top/tv/iptv4.m3u"
 
 # The device's real limits, mirrored from main/av_protocol.h and server/live.py.

@@ -17,6 +17,14 @@ The checks come first and are the point of the whole script. Every one of them
 reports what is missing, why it is needed, and what to do about it, because the
 alternative is a stack trace at the moment the user least wants to read one.
 
+Two locations matter here and they are not the same place. `CODE_ROOT` is where
+the code is, which settles `import server` and the path to the channel page;
+`datadir.data_dir()` is where the channel list is written and where the children
+run. From a checkout both are the repository, and it would be tempting to keep
+one variable for them. A bundled build is the case that separates them: the code
+unpacks into a temporary directory that is deleted on exit, so anything written
+there is lost. `tools/datadir.py` argues the point at length.
+
 Standard library only, like the rest of the server.
 """
 
@@ -32,15 +40,31 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# datadir answers "where does the data go", and every path below depends on that
+# answer, so it has to be importable before the rest of this module runs. Running
+# this file as a script puts its own directory on the search path rather than the
+# repository root, so the package form `tools.datadir` resolves only once the
+# root has been added by hand. That is the same bootstrapping the module needed
+# for `server`, and it is why the import sits below rather than at the top.
+_BOOTSTRAP_ROOT = Path(__file__).resolve().parents[1]
+if str(_BOOTSTRAP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BOOTSTRAP_ROOT))
+
+from tools import datadir  # noqa: E402  (resolves only after the path above)
+
+# Where the code lives. Importing `server` is the only thing this is for, and it
+# is not where anything is written -- see `data_dir` below for that. The two used
+# to be one variable, which is correct from a checkout and wrong from a bundled
+# executable, where this path names a temporary directory.
+CODE_ROOT = datadir.code_root()
 
 # Run as a file, Python puts this file's own directory on the search path, not
 # the repository root -- so `import server` fails from here even though the
 # package is right there. Adding the root explicitly is what makes the script
 # runnable both as `python3 tools/launch.py` and by double-clicking it, which is
 # the whole point of having it.
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+if str(CODE_ROOT) not in sys.path:
+    sys.path.insert(0, str(CODE_ROOT))
 
 # From reading the code rather than copying the README, which says 3.11:
 # every module has `from __future__ import annotations`, so the subscripted
@@ -149,7 +173,28 @@ def spawn(command: list[str]) -> subprocess.Popen:
     server gets to close its socket and end its own ffmpeg rather than being
     interrupted mid-write.
     """
-    kwargs: dict = {"cwd": ROOT}
+    # The working directory is the data directory, because the channel list is
+    # found relative to it (server/live.py looks for a plain `channels.txt`).
+    # Setting it here is what makes the bundled build read the user's list rather
+    # than looking for one beside the executable. The path is absolute and
+    # already created by data_dir(), so a child that starts before anything is
+    # written still has a valid working directory.
+    #
+    # That move costs the children their other use of the working directory:
+    # `python -m server.av_server` finds the package through the working
+    # directory, and running from the data directory instead made the media
+    # server exit with "No module named 'server'". PYTHONPATH puts the code back
+    # on the search path without moving the working directory back, which is what
+    # keeps the two jobs of that one setting separate. Prepended rather than
+    # appended so the checkout's own modules win over anything installed
+    # system-wide with the same name.
+    environment = dict(os.environ)
+    existing = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        str(CODE_ROOT) if not existing else os.pathsep.join([str(CODE_ROOT), existing])
+    )
+
+    kwargs: dict = {"cwd": datadir.data_dir(), "env": environment}
     if os.name == "posix":
         kwargs["start_new_session"] = True
     else:
@@ -193,7 +238,8 @@ def start_media_server(channel: str) -> subprocess.Popen:
 
 def start_config_page() -> subprocess.Popen:
     """Launch the channel page. Bound to loopback, which is where it is opened."""
-    return spawn([sys.executable, "-u", str(ROOT / "tools" / "channel_config.py"),
+    return spawn([sys.executable, "-u",
+                  str(CODE_ROOT / "tools" / "channel_config.py"),
                   "--port", str(CONFIG_PORT)])
 
 
@@ -205,11 +251,30 @@ def channels_mtime() -> float | None:
     but it means a saved change does nothing until a restart, and from the
     page's side that is indistinguishable from the save having failed.
     """
-    path = ROOT / "channels.txt"
+    path = datadir.channels_file()
     try:
         return path.stat().st_mtime
     except OSError:
         return None
+
+
+def channels_now() -> dict:
+    """The channel table as it is on disk right now.
+
+    `server.live.CHANNELS` is read once, when that module is first imported, and
+    never re-read -- deliberately, so that a running session does not have its
+    channel list changed underneath it. That is the wrong answer for a restart,
+    which is starting a new session and needs the table the user has just saved.
+
+    Re-imported rather than cached: the point is to see the current file, and a
+    cached copy is exactly what would still be showing the old table.
+    """
+    import importlib
+
+    from server import live
+
+    importlib.reload(live)
+    return live.CHANNELS
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -237,6 +302,25 @@ def main(argv: list[str] | None = None) -> int:
     # the truth, and better than anything this file could work out separately.
     # Printing it again here would say the same thing twice, and if the two ever
     # disagreed the reader would have no way to tell which to believe.
+    #
+    # Imported here rather than at the top because it reads the channel file as a
+    # side effect of being imported, and the working directory has to be the data
+    # directory by then. The packages under `server/` are reached through
+    # CODE_ROOT on the search path.
+    # The parent moves to the data directory too, not just the children it
+    # starts. It reads the channel table itself -- to pick a channel now, and to
+    # pick one again after a save -- and `server.live` finds that table relative
+    # to the working directory. Left where it was started, it read a different
+    # (usually absent) table and quietly fell back to the built-in channels, so
+    # the restart after a save passed a channel name that the server, reading the
+    # real table, rejected. Changed before the import below, because the import
+    # is what reads the file.
+    try:
+        os.chdir(datadir.data_dir())
+    except OSError as error:
+        print(f"无法切换到数据目录：{error}", file=sys.stderr)
+        return 1
+
     from server.live import CHANNELS
 
     # The media server takes --channel as a required choice, so "whichever it
@@ -250,7 +334,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"可用的前几个：{', '.join(list(CHANNELS)[:5])}", file=sys.stderr)
         return 1
 
-    if not (ROOT / "channels.txt").is_file():
+    # Printed before the children start, so it is not buried by their output.
+    # The location is not predictable from the outside -- it is beside the
+    # program when that directory can be written to and in the user's own
+    # application directory when it cannot -- so a channel list that went
+    # somewhere unexpected is otherwise indistinguishable from one that was never
+    # saved.
+    print(datadir.describe(datadir.data_dir()), flush=True)
+
+    if not datadir.channels_file().is_file():
         print("还没有 channels.txt，将使用内置的默认频道。", flush=True)
         print("在下面的频道配置页里挑选并保存，就会生成它。", flush=True)
         print()
@@ -288,15 +380,46 @@ def main(argv: list[str] | None = None) -> int:
                       flush=True)
                 page = None
 
+            # A change is any difference from what was seen last time, including
+            # the first appearance of the file. The file starts absent when the
+            # data directory is new -- which is every first run of a bundled
+            # build -- and the earlier version of this only restarted on a change
+            # between two times, so saving the first channel list took effect
+            # only after the next restart. Measured: the page reported a
+            # successful save and the server went on offering the built-in
+            # channels.
             current = channels_mtime()
-            if current is not None and seen_mtime is not None and current != seen_mtime:
+            if current != seen_mtime:
                 seen_mtime = current
-                print("\n频道表已更新，正在重启媒体服务器…", flush=True)
-                stop(server)
-                server = start_media_server(channel)
-                print("已重启，设备会自动重新连接。", flush=True)
-            elif current is not None:
-                seen_mtime = current
+                # Only worth restarting when there is now a file to read. Going
+                # the other way -- a file removed while running -- leaves the
+                # server on its current channel list, which is the same thing
+                # that happens when it is edited by hand and it does not warrant
+                # tearing down a working stream.
+                if current is not None:
+                    print("\n频道表已更新，正在重启媒体服务器…", flush=True)
+                    stop(server)
+                    # The channel being played may not be in the table that was
+                    # just saved -- the first save replaces the built-in list
+                    # entirely, and none of those names appear in it. The media
+                    # server takes --channel as a required choice from the table
+                    # it reads at start-up, so passing a name that is no longer
+                    # there is a hard error and the server exits, leaving nothing
+                    # listening. Measured: saving a first channel list printed
+                    # "invalid choice: 'cgtn'" and stopped on port 8096, which
+                    # the user sees as the picture going away when they save.
+                    #
+                    # Falling back to the first entry of the new table is what
+                    # the server itself does when a device asks for a channel it
+                    # does not know, so the behaviour stays consistent.
+                    available = channels_now()
+                    if channel not in available and available:
+                        replacement = next(iter(available))
+                        print(f"频道 {channel} 已不在新表里，改为 {replacement}。",
+                              flush=True)
+                        channel = replacement
+                    server = start_media_server(channel)
+                    print("已重启，设备会自动重新连接。", flush=True)
     except KeyboardInterrupt:
         print("\n正在停止…", flush=True)
         return 0
