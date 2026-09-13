@@ -1,0 +1,4 @@
+__pycache__/
+.local/
+*.s16le
+frame-*.jpg

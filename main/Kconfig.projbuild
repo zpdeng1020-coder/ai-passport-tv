@@ -1,0 +1,8 @@
+menu "Local audio/video prototype"
+config AV_RAW_PROTOTYPE
+    bool "Boot standalone raw FAV1 LAN test instead of LVGL demo"
+    default n
+    help
+        Exclusive landscape JPEG/PCM test; does not start LVGL or BLE.
+        Supply ignored main/av_private_config.h. No flashing is performed.
+endmenu

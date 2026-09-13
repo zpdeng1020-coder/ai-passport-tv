@@ -1,0 +1,16 @@
+dependencies:
+  idf:
+    version: ">=5.5.3,<5.6.0"
+# The WiFi provisioning component is not listed here on purpose. It used to be
+# pulled from the component registry as 78/esp-wifi-connect, and it now lives in
+# this repository as components/esp-wifi-connect.
+#
+# It was vendored so its configuration page can carry this project's wording.
+# That page is the first thing anyone setting up a device sees, and the field
+# that now takes the streaming server's address is labelled "Custom OTA URL" in
+# the published component -- a label that would leave a reader with no way to
+# know what to type. The component is MIT licensed and the copyright notice is
+# kept with it.
+#
+# The cost is that upstream fixes no longer arrive on their own: the copy has to
+# be updated by hand. See components/esp-wifi-connect/README.md.

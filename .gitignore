@@ -1,0 +1,34 @@
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+.vscode/
+.idea/
+# Local-only LAN prototype credentials; never publish credential-bearing binaries.
+main/av_private_config.h
+build-av/
+build-demo/
+# Any other build directory. A local build directory was added here by name once
+# and the next one -- created with a different name, for a public build -- was
+# not covered. Its .elf happened to be clean only because a public build omits
+# the private header; that is luck, not a rule, and the rule has to hold for
+# whatever directory someone happens to build into.
+build-*/
+__pycache__/
+# No firmware image belongs in the repository: the AV prototype build compiles the
+# private header into it, so an image carries the WiFi credentials and the pairing
+# token. Searching an image for those strings does not show them -- the compiler
+# inlines short literals as instruction immediates -- so "I looked and did not
+# find them" is not evidence that an image is clean. Blocks the firmware by name
+# as well as by extension, so one copied to an unexpected directory is still out.
+FoloToy-AI-Passport*.bin
+*.bin
+# The debug information in an ELF carries string literals that the compiled image
+# does not: a local build's .elf contains the WiFi password and the pairing token
+# in full, readable with a plain text search, while the same build's .bin does
+# not. Anything that carries debug info has to stay out for that reason.
+*.elf
+*.map
+# ...except the generated glyph table, which the build needs and which holds no
+# secrets. Must follow the blanket rule above to be re-included.
+!main/ui_font_cjk.bin
