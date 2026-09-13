@@ -42,6 +42,7 @@ hiddenimports = [
     "tools.datadir",
     "tools.ffmpeg_fetch",
     "tools.launch",
+    "tools.parentwatch",
     "tools.channel_config",
     "tools.subcommands",
 ]

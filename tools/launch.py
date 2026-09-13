@@ -50,7 +50,7 @@ _BOOTSTRAP_ROOT = Path(__file__).resolve().parents[1]
 if str(_BOOTSTRAP_ROOT) not in sys.path:
     sys.path.insert(0, str(_BOOTSTRAP_ROOT))
 
-from tools import datadir, ffmpeg_fetch  # noqa: E402  (after the path above)
+from tools import datadir, ffmpeg_fetch, parentwatch  # noqa: E402  (after the path above)
 from tools.certs import use_system_ca  # noqa: E402
 from tools.console import use_utf8  # noqa: E402
 
@@ -228,6 +228,13 @@ def report_missing_ffmpeg() -> None:
     print()
 
 
+# How long a child is given to notice the closed stdin pipe and leave before
+# the stronger signal is sent. It is a wake-up, not a shutdown -- the child
+# exits without unwinding -- so this only has to cover the time it takes a
+# blocked read to return, not the time a tidy exit would need.
+WATCH_EXIT_TIMEOUT_S = 5
+
+
 def _treat_as_interrupt(_signum, _frame) -> None:
     """Turn a termination signal into the same path Ctrl-C takes.
 
@@ -296,6 +303,11 @@ def spawn(command: list[str]) -> subprocess.Popen:
     the children, so exactly one process decides the order things stop in -- the
     server gets to close its socket and end its own ffmpeg rather than being
     interrupted mid-write.
+
+    The children are given a stdin pipe as well, which is not about input. It is
+    how they learn this process has ended when it is killed rather than asked to
+    stop -- the case no signal handler covers, and one that leaves them holding
+    the ports. See tools/parentwatch.py.
     """
     # The working directory is the data directory, because the channel list is
     # found relative to it (server/live.py looks for a plain `channels.txt`).
@@ -317,8 +329,20 @@ def spawn(command: list[str]) -> subprocess.Popen:
     environment["PYTHONPATH"] = (
         str(CODE_ROOT) if not existing else os.pathsep.join([str(CODE_ROOT), existing])
     )
+    # Tells the child to leave when this process does. The pipe below is what it
+    # actually watches; the variable is how it knows a pipe is there to watch,
+    # so that the same program started by hand from a terminal -- which the
+    # server's README documents -- does not sit reading the keyboard.
+    environment[parentwatch.WATCH_ENV] = "1"
 
-    kwargs: dict = {"cwd": datadir.data_dir(), "env": environment}
+    kwargs: dict = {"cwd": datadir.data_dir(), "env": environment,
+                    # A pipe this process holds open and never writes to. Its
+                    # only purpose is to be something the operating system
+                    # closes when this process ends, however it ends -- which
+                    # is the one thing a signal handler cannot cover. See
+                    # tools/parentwatch.py, including why stdin and not another
+                    # stream.
+                    "stdin": subprocess.PIPE}
     if os.name == "posix":
         kwargs["start_new_session"] = True
     else:
@@ -328,7 +352,31 @@ def spawn(command: list[str]) -> subprocess.Popen:
 
 def stop(process: subprocess.Popen | None) -> None:
     """Ask a child to stop, then insist. Safe to call on one already gone."""
-    if process is None or process.poll() is not None:
+    if process is None:
+        return
+    # The stdin pipe is closed first and from this side. On Windows it is the
+    # only notification a child gets that this process is ending: `terminate()`
+    # there is `TerminateProcess`, which the child cannot handle, so it never
+    # reaches its own shutdown and never closes its socket in an orderly way.
+    # Closing our end is a fact the child can observe, and the wake-up below is
+    # what lets it act before anything more forceful arrives.
+    #
+    # Harmless on POSIX, and kept here rather than in a branch so that the
+    # sequence is the same on every platform: one of them is the case that
+    # matters, and a difference in behaviour between them is exactly what this
+    # round of fixes is removing.
+    if process.stdin is not None:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+        process.stdin = None
+        try:
+            process.wait(timeout=WATCH_EXIT_TIMEOUT_S)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+    if process.poll() is not None:
         return
     try:
         if os.name == "posix":

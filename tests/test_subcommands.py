@@ -151,7 +151,8 @@ class ImportCoverageTests(unittest.TestCase):
     REQUIRED = (
         "server.tv_server", "server.live", "server.media", "server.netident",
         "server.protocol", "tools.launch", "tools.channel_config",
-        "tools.certs", "tools.datadir", "tools.ffmpeg_fetch", "tools.subcommands",
+        "tools.certs", "tools.datadir", "tools.ffmpeg_fetch", "tools.parentwatch",
+        "tools.subcommands",
     )
 
     # The part of the server that must not be loaded until the working directory

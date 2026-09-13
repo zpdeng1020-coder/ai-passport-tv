@@ -80,3 +80,5 @@
 - 引入社区治理文档（参照 cindy 改写，放仓库根目录）：新增 `CONTRIBUTING.md` / `.zh_CN.md`（贡献指南，针对 ESP-IDF/AI agent/fork 场景改写）、`CODE_OF_CONDUCT.md` / `.zh_CN.md`（贡献者公约）、`SECURITY.md` / `.zh_CN.md`（安全报告流程）、`SUPPORT.md` / `.zh_CN.md`（支持渠道）；AGENTS.md 与 docs/README.md 同步引用。
 
 - 构建自带的冒烟测试在 Windows 上读不懂程序的中文输出：`subprocess.run(text=True)` 用系统代码页解码，读取线程抛 `UnicodeDecodeError`，stdout 变成 `None`，随后比较时出错。程序本身一直是正确的，坏的是检查它的那段代码。现在仓库里每一处捕获子进程输出的地方都写明编码，并由一个 AST 扫描看守以免新增遗漏——该扫描还查出了第二处，在仓库检查工具里，中文路径同样会让它出错。
+
+- 孤儿检测改为能在 Windows 上生效的做法。检查 `os.getppid()` 在 POSIX 上可行（子进程会被重新挂到 init 下），但 Windows 上父进程编号从不改变，检查永远不触发——于是 macOS 与 Linux 通过、Windows 失败，而问题正是 Windows 上报告的。现在启动器给每个子进程一个它从不写入的 stdin 管道，并在退出时关闭；启动器无论以何种方式结束——包括被直接强杀——子进程的读取都会返回文件结束，随即退出。管道是句柄而不是取值，不会过期，也不含任何平台差异。验证方式：用 `kill -9` 强杀启动器，修复前两个子进程存活并占着两个端口，修复后什么都不剩。

@@ -75,19 +75,13 @@ use_system_ca()
 #
 # So the order is: chdir first, then import. The spec lists everything, which is
 # what keeps the lazily imported modules in the bundle.
-from tools import certs, channel_config, datadir, ffmpeg_fetch, launch  # noqa: E402,F401
+from tools import (certs, channel_config, datadir, ffmpeg_fetch, launch,  # noqa: E402,F401
+                   parentwatch)
 from tools.subcommands import CERTS_COMMAND, CONFIG_COMMAND, MEDIA_COMMAND  # noqa: E402
 
 # Named in packaging/tv-server.spec's hiddenimports, and imported here only as
 # the names are actually needed -- see _load_server_modules below.
 SERVER_MODULES = ("tv_server", "live", "media", "netident", "protocol")
-
-# How often a child checks whether the process that started it is still there.
-# Long, because this is a net under a case that should not happen rather than a
-# prompt reaction to a case that should -- and the cost of being slow is one
-# extra run that reports a busy port, while the cost of being quick is a timer
-# waking every child of every run for nothing. See _exit_when_orphaned.
-ORPHAN_CHECK_SECONDS = 5.0
 
 
 def _load_server_modules():
@@ -167,53 +161,6 @@ def _run_config(argv: list[str]) -> int:
     return channel_config.main(argv)
 
 
-def _exit_when_orphaned() -> None:
-    """Leave when the process that started this one is gone.
-
-    The launcher asks its children to stop before it exits, and it now does
-    that for every signal that means "stop" as well as for Ctrl-C. What it
-    cannot do is ask when it is killed outright -- SIGKILL, a crash, the
-    machine's own idea -- and then the children outlive it in their own
-    session, holding ports 8096 and 8097. The next run says "端口已被占用" and
-    nothing on screen connects that to a program the user believes they closed.
-
-    A bundled build makes it worse than an occupied port. This executable
-    unpacks its code into a temporary directory on start and deletes that
-    directory on exit; the children were running out of the same one. They keep
-    working from what they have already imported, so they look fine, until one
-    of them needs a module it has not loaded yet and dies with "LookupError:
-    unknown encoding: idna" -- a message about a codec, from a program whose
-    problem was that its code no longer exists.
-
-    Watching the parent is what closes that. Checked rather than signalled: a
-    signal would need the parent alive to send it, which is the case this is
-    for. The check is on the parent *changing*, not on a particular number,
-    because the reparented pid is 1 on POSIX and something else on Windows --
-    what matters is that it is no longer the process that started us.
-
-    A thread, and a daemon one, so it never holds up an exit. It sleeps for a
-    long time between checks: this is a safety net for something that should
-    not happen, not a watchdog for something that should.
-    """
-    import threading
-    import time
-
-    original = os.getppid()
-
-    def watch() -> None:
-        while True:
-            time.sleep(ORPHAN_CHECK_SECONDS)
-            if os.getppid() != original:
-                # Deliberately abrupt. There is nothing to clean up that the
-                # exit itself does not release -- the socket and any ffmpeg
-                # child go with the process -- and running the ordinary
-                # shutdown path here would be reaching for code that may be
-                # exactly what has been deleted.
-                os._exit(0)
-
-    threading.Thread(target=watch, daemon=True).start()
-
-
 def _run_certs() -> int:
     """Report whether this build can verify a TLS certificate, and exit.
 
@@ -241,12 +188,13 @@ def main(argv: list[str] | None = None) -> int:
     if arguments and arguments[0] == CERTS_COMMAND:
         return _run_certs()
 
-    # A child, not the launcher, and not asked another question. The launcher
+    # A child, not the launcher, and not the certificate question. The launcher
     # has no parent to watch for -- its parent is a shell, and a shell exiting
-    # is not a reason to stop -- so the watch is set up only for the two that
-    # are started by this program. See _exit_when_orphaned.
+    # is not a reason to stop -- so the watch is offered only to the two
+    # processes this program starts, and they take it only when the launcher
+    # says so. See tools/parentwatch.py.
     if arguments and arguments[0] in (MEDIA_COMMAND, CONFIG_COMMAND):
-        _exit_when_orphaned()
+        parentwatch.start()
 
     # The working directory is set before anything reads a file, because the
     # channel table is found relative to it and the data directory is not where
