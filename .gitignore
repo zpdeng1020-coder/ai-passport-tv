@@ -32,3 +32,7 @@ FoloToy-AI-Passport*.bin
 # ...except the generated glyph table, which the build needs and which holds no
 # secrets. Must follow the blanket rule above to be re-included.
 !main/ui_font_cjk.bin
+
+# macOS folder metadata. Written by Finder whenever a directory is opened,
+# so it appears without anyone creating it and carries no project content.
+.DS_Store
