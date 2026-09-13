@@ -149,6 +149,15 @@ class AVServer:
         self.ready = threading.Event()
         self.listener: socket.socket | None = None
         self.completed = self.rejected = self.failed = self.dropped_video = 0
+        # A connection that closed before it became a session. Kept apart from
+        # `failed` because it is the ordinary outcome of three things that are
+        # not failures: the device changing channel, the device going to sleep,
+        # and anything at all on the network checking whether the port is open.
+        # Each opens a connection and closes it again without saying anything,
+        # which is an error at the socket layer and nothing of the sort in the
+        # world it is being counted in. Counted rather than discarded so the
+        # diagnostic log still shows every connection that arrived.
+        self.abandoned = 0
         self.audio_sent = self.video_sent = 0
         self.session_id = 0
         self.phase = "idle"
@@ -195,8 +204,21 @@ class AVServer:
                     except (OSError, EOFError, ProtocolError, LiveError) as error:
                         # A write might be partial: close, never send another frame.
                         # Deliberately omit payloads, token, peer IP, exception repr.
-                        self.failed += 1
-                        outcome = "failed"
+                        #
+                        # Whether this is a fault depends on how far the session
+                        # got. A peer that vanished during the handshake never
+                        # became a session -- nothing was authenticated, nothing
+                        # was sent, and at the other end somebody changed channel
+                        # or closed a window. Counting that as a failure made a
+                        # healthy run end with "失败 3 次" and no way to find out
+                        # what the three were. Past authentication it is a real
+                        # fault, and stays one.
+                        if self.session_id == 0:
+                            self.abandoned += 1
+                            outcome = "abandoned"
+                        else:
+                            self.failed += 1
+                            outcome = "failed"
                         reason = type(error).__name__
                         # No fallback capture here: _live_session already records
                         # ffmpeg's diagnostics in its own finally, before clearing
@@ -563,11 +585,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "prepare":
             media = prepare(args.media_dir, args.ffmpeg)
-            print(f"Prepared 10 seconds, {len(media.frames)} JPEGs, max {max(map(len, media.frames))} bytes.")
+            print(f"已生成 10 秒素材，{len(media.frames)} 张画面，单张最大 {max(map(len, media.frames))} 字节。")
             return 0
         if args.command == "import-video":
             media = import_video(args.input, args.media_dir, args.seconds, args.start, args.ffmpeg)
-            print(f"Imported {media.duration_ms // 1000} seconds; {WIDTH}x{HEIGHT} at {FPS} FPS; 16 kHz mono.")
+            print(f"已导入 {media.duration_ms // 1000} 秒；{WIDTH}x{HEIGHT}，{FPS} 帧每秒，16 kHz 单声道。")
             return 0
         token = load_token(args.token_file)
         if args.command == "live":
@@ -606,14 +628,20 @@ def main(argv: list[str] | None = None) -> int:
             if token is None:
                 print("提示：本网络上的其他设备也能收看这台电脑转发的频道。", flush=True)
             server.serve()
-            # Was "Stopped: completed=0, failed=0, rejected=0, dropped_video=0." --
-            # four counters that mean nothing to whoever just pressed Ctrl-C,
+            # Was "Stopped: completed=0, failed=0, rejected=0, dropped_video=0."
+            # -- four counters that mean nothing to whoever just pressed Ctrl-C,
             # and it is the last thing the program says. The counts are still
             # worth keeping for diagnosis, so they are printed only when
             # something actually went wrong; a clean exit says so in plain
             # words.
+            #
+            # Connections abandoned during the handshake are not part of that
+            # condition. A device changing channel produces one every time, and
+            # counting them as trouble made an ordinary end of run look as
+            # though something had broken three times over -- the reader is
+            # left holding a number with nothing to attach it to.
             if server.failed or server.rejected or server.dropped_video:
-                print(f"已停止。失败 {server.failed} 次，拒绝 {server.rejected} 次，"
+                print(f"已停止。出错 {server.failed} 次，拒绝 {server.rejected} 次，"
                       f"丢帧 {server.dropped_video} 次。", flush=True)
             else:
                 print("已停止。", flush=True)
@@ -626,8 +654,8 @@ def main(argv: list[str] | None = None) -> int:
             print(line, flush=True)
         server.serve()
         if server.failed or server.rejected or server.dropped_video:
-            print(f"Stopped: completed={server.completed}, failed={server.failed}, "
-                  f"rejected={server.rejected}, dropped_video={server.dropped_video}.")
+            print(f"已停止：正常结束 {server.completed} 次，出错 {server.failed} 次，"
+                  f"被拒绝 {server.rejected} 次，丢弃画面 {server.dropped_video} 帧。")
         else:
             print("已停止。", flush=True)
         return 0

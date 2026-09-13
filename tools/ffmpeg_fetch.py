@@ -325,12 +325,16 @@ if __name__ == "__main__":  # pragma: no cover - a convenience, not a feature
     from pathlib import Path as _Path
 
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+    from tools.certs import use_system_ca as _use_system_ca
     from tools.console import use_utf8 as _use_utf8
 
     # This block prints Chinese, and on Windows the console's default encoding
     # cannot represent it. The library above does not need this -- its callers
     # set it -- but running this file directly makes it the entry point.
     _use_utf8()
+    # And this is a step that downloads over HTTPS, so it fails the same way the
+    # playlist loader does when the certificate bundle is missing.
+    _use_system_ca()
 
     from tools import datadir as _datadir
 

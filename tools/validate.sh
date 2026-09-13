@@ -79,6 +79,11 @@ run_static_checks() {
     # on macOS and Linux, where the console is already UTF-8, and fatal on
     # Windows at the first line the program prints.
     python3 tests/test_console.py
+    # Certificate authorities on a machine that is not the build machine. The
+    # same shape as the console problem above -- invisible where the code was
+    # written, fatal in the hands of whoever downloaded it -- and this one was
+    # found by a user rather than by a test.
+    python3 tests/test_certs.py
     # Live transcoding and the device/server CONFIG contract. Networked cases
     # skip themselves unless AV_LIVE_TEST=1, so this stays offline by default.
     python3 tests/test_live_transcode.py

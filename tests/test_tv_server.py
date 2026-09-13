@@ -373,6 +373,79 @@ class LiveServerTests(unittest.TestCase):
             while True:
                 receive_packet(connection, 1)
 
+    def test_a_connection_dropped_at_the_handshake_is_not_a_failure(self):
+        """The ordinary outcome of changing channel, counted honestly.
+
+        Three things produce this and none of them is a fault: the device
+        switching channel, the device going to sleep, and anything on the
+        network checking whether the port is open. Each opens a connection and
+        closes it without a word. Counted as failures, they made a healthy run
+        end with "失败 3 次" -- a number the reader has no way to place, printed
+        as the last thing the program says.
+
+        Distinguished by how far the session got rather than by which exception
+        was raised: a peer that leaves during the handshake never authenticated,
+        so nothing had happened yet that could fail.
+        """
+        connection = self.connect()
+        connection.close()
+        # The server notices on its next read. Nothing is asserted about when,
+        # only about the account it ends up keeping.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and self.server.abandoned == 0:
+            time.sleep(0.05)
+        self.assertEqual(self.server.abandoned, 1)
+        self.assertEqual(self.server.failed, 0,
+                         "a dropped handshake was counted as a server fault")
+
+    def test_changing_channel_repeatedly_leaves_only_clean_ends(self):
+        """What the device actually does, and what it should cost.
+
+        A channel change is an END on the live session followed by a new
+        connection -- the protocol has no other way to switch, and the server
+        accepts nothing else once a session is running. So this happens every
+        time someone presses UP, and none of it is a fault.
+
+        It is checked because a plausible-looking tidiness in the server works
+        against it: any connection left waiting in the backlog when a session
+        ends is closed and counted, which is right for a straggler from the old
+        session and wrong for a device that has already reconnected. Which of
+        the two it is cannot be told from the socket, so the honest account is
+        the one this asserts -- a completed session with nothing against it.
+        """
+        for _ in range(5):
+            connection = self.connect()
+            send_packet(connection, hello())
+            config = receive_packet(connection, 1)
+            send_packet(connection, Packet(Kind.END, config.session, 1, 0))
+            connection.close()
+            time.sleep(0.05)
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and self.server.completed < 5:
+            time.sleep(0.05)
+        self.assertEqual(self.server.completed, 5)
+        self.assertEqual(self.server.failed, 0)
+        self.assertEqual(
+            self.server.rejected, 0,
+            "换台被记成了「拒绝」；这个数字会出现在程序退出时的那行提示里，"
+            "用户看到的是一次正常的换台变成了一次故障")
+
+    def test_a_session_that_breaks_after_authentication_is_a_failure(self):
+        """The other side of the same line, so the change cannot be a pretext
+        for counting nothing at all."""
+        connection = self.connect()
+        send_packet(connection, hello())
+        config = receive_packet(connection, 1)
+        self.assertNotEqual(config.session, 0)
+        # Authenticated and streaming; now vanish mid-session.
+        connection.close()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and self.server.failed == 0:
+            time.sleep(0.05)
+        self.assertEqual(self.server.failed, 1)
+        self.assertEqual(self.server.abandoned, 0)
+
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg optional for offline preparation only")
 class PreparationTests(unittest.TestCase):

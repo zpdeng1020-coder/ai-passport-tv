@@ -15,3 +15,12 @@ attached. Nothing here is documented for users.
 
 MEDIA_COMMAND = "__media"
 CONFIG_COMMAND = "__config"
+
+# Asks the program to report what it knows about its own certificate
+# authorities, and exits. Not a part of the program -- a question put to it, by
+# the build check that watches for the one failure a built executable cannot
+# show from its source: a certificate path recorded on the machine it was built
+# on and absent on the machine it was downloaded to. The build machine's own
+# Python answers that question correctly, so it has to be the built program that
+# is asked. See tools/smoke_test_package.py and tools/certs.py.
+CERTS_COMMAND = "__certs"

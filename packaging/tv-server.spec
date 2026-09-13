@@ -38,6 +38,7 @@ hiddenimports = [
     "server.netident",
     "server.protocol",
     "tools",
+    "tools.certs",
     "tools.datadir",
     "tools.ffmpeg_fetch",
     "tools.launch",

@@ -151,7 +151,7 @@ class ImportCoverageTests(unittest.TestCase):
     REQUIRED = (
         "server.tv_server", "server.live", "server.media", "server.netident",
         "server.protocol", "tools.launch", "tools.channel_config",
-        "tools.datadir", "tools.ffmpeg_fetch", "tools.subcommands",
+        "tools.certs", "tools.datadir", "tools.ffmpeg_fetch", "tools.subcommands",
     )
 
     # The part of the server that must not be loaded until the working directory
@@ -233,6 +233,45 @@ class SubprocessShapeTests(unittest.TestCase):
         with mock.patch.object(launch.datadir, "is_frozen", return_value=True):
             command = launch.subprocess_command(MEDIA_COMMAND)
         self.assertEqual(command[1], MEDIA_COMMAND)
+
+
+class HelpTextTests(unittest.TestCase):
+    """`--help` is the answer to "what does this program do", in one language.
+
+    The program is a file someone downloaded and may know nothing else about, and
+    every other line it prints is Chinese. `--help` was the exception: it came
+    out in English, headings and all, under a Chinese description of what it was
+    for. These assertions exist because the English is what argparse does by
+    itself -- nothing turns it back on deliberately, so nothing will notice if a
+    future argument brings it back.
+    """
+
+    def _help(self) -> str:
+        parser = launch._Parser(description="启动媒体服务器和频道配置页。")
+        parser.add_argument("--channel", default=None, help="开机先打开哪个频道")
+        parser.add_argument("--no-config-page", action="store_true", help="只运行媒体服务器")
+        return parser.format_help()
+
+    def test_no_english_headings_survive(self):
+        """Three strings argparse writes on its own, none of them settable.
+
+        `usage:` and the options heading have to be rewritten after formatting;
+        `-h`'s own description is only reachable by declaring the option again,
+        which is why the parser suppresses the automatic one.
+        """
+        text = self._help()
+        for english in ("usage:", "options:", "optional arguments:",
+                        "show this help message and exit"):
+            with self.subTest(english=english):
+                self.assertNotIn(english, text)
+
+    def test_the_headings_are_present_in_chinese(self):
+        """Not merely absent -- replaced. A parser that dropped every line would
+        pass a test that only looked for the English."""
+        text = self._help()
+        self.assertIn("用法：", text)
+        self.assertIn("选项：", text)
+        self.assertIn("显示这段说明并退出", text)
 
 
 if __name__ == "__main__":

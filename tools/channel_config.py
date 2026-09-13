@@ -39,11 +39,17 @@ if str(_BOOTSTRAP_ROOT) not in sys.path:
     sys.path.insert(0, str(_BOOTSTRAP_ROOT))
 
 from tools import datadir  # noqa: E402  (resolves only after the path above)
+from tools.certs import use_system_ca  # noqa: E402
 from tools.console import use_utf8  # noqa: E402
 
 # This page's messages are Chinese too, and on Windows the console's default
 # encoding cannot represent them. See tools/console.py.
 use_utf8()
+
+# This page is also the one that loads a playlist over HTTPS, so it is the one
+# where a missing certificate bundle shows up first -- as "无法获取" for an
+# address that works in every browser. See tools/certs.py.
+use_system_ca()
 
 # Resolved on each use rather than once at import. It used to be a module-level
 # constant, which fixes the path at whatever moment this module happens to be

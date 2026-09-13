@@ -51,12 +51,19 @@ if str(_BOOTSTRAP_ROOT) not in sys.path:
     sys.path.insert(0, str(_BOOTSTRAP_ROOT))
 
 from tools import datadir, ffmpeg_fetch  # noqa: E402  (after the path above)
+from tools.certs import use_system_ca  # noqa: E402
 from tools.console import use_utf8  # noqa: E402
 
 # Every message this program prints for a person is Chinese, and on Windows the
 # console's default encoding cannot represent it -- the first one would end the
 # process with a UnicodeEncodeError. Set before anything is written.
 use_utf8()
+
+# And the certificate authorities, before anything reaches the network. This is
+# a different failure with the same shape: correct on the machine the code was
+# written on, wrong on the machine it was built on and downloaded to. Both are
+# no-ops when the platform is already in order. See tools/certs.py.
+use_system_ca()
 
 # Where the code lives. Importing `server` is the only thing this is for, and it
 # is not where anything is written -- see `data_dir` below for that. The two used
@@ -219,6 +226,55 @@ def report_missing_ffmpeg() -> None:
     print("装好后重新运行本程序。如果 ffmpeg 装在非标准位置，", flush=True)
     print("设置环境变量 TV_FFMPEG 指向它的完整路径即可。", flush=True)
     print()
+
+
+def _treat_as_interrupt(_signum, _frame) -> None:
+    """Turn a termination signal into the same path Ctrl-C takes.
+
+    Ctrl-C is not the only way this program ends. A closed terminal window
+    sends SIGHUP; `kill` sends SIGTERM; a logout or a shutdown sends one of the
+    two. Python's default for those is to stop the process where it stands,
+    which means no `finally` block, which means the two children are never
+    asked to stop. They are in their own session -- that is deliberate, so that
+    one process decides the order things stop in -- so they outlive their
+    parent and go on holding ports 8096 and 8097. The next run then reports
+    "端口已被占用" and the machine appears to need a restart.
+
+    Worse in a bundled build: the parent's exit deletes the directory its code
+    was unpacked into, and the children it left behind are running out of that
+    directory. Whatever they had already loaded keeps working, so they look
+    healthy -- the channel page goes on answering -- until one of them reaches
+    for a module it has not imported yet, and then it dies with something like
+    "LookupError: unknown encoding: idna". That message describes the symptom
+    and nothing about the cause.
+
+    Raising KeyboardInterrupt is what makes the walk out identical to Ctrl-C:
+    the handler in main catches it, prints one line, and the cleanup in the
+    `finally` block runs with it. This is the documented way for a signal
+    handler to leave the normal control flow intact.
+    """
+    raise KeyboardInterrupt
+
+
+def _install_termination_handlers() -> None:
+    """Route the signals that mean "stop now" through the ordinary shutdown.
+
+    SIGHUP and SIGTERM exist on POSIX; Windows has SIGTERM but no SIGHUP, and
+    a platform without a signal raises rather than returning, so each is asked
+    for on its own and a refusal is not an error -- there is nothing to
+    install, and the code that would have used it is what the default handling
+    already skips.
+    """
+    for name in ("SIGHUP", "SIGTERM"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            signal.signal(signum, _treat_as_interrupt)
+        except (ValueError, OSError):
+            # Not the main thread, or a platform that will not allow it. The
+            # behaviour is then no worse than before this existed.
+            continue
 
 
 def spawn(command: list[str]) -> subprocess.Popen:
@@ -391,14 +447,42 @@ def channels_now() -> dict:
     return live.CHANNELS
 
 
+class _Parser(argparse.ArgumentParser):
+    """The argument parser, in the language the rest of the output is in.
+
+    This is a bundled program someone downloaded and ran; `--help` is the one
+    way to ask it what it does, and it was answering in English under a Chinese
+    everything-else. The three pieces argparse fixes itself -- the `usage:`
+    heading, the `options:` heading, and `-h`'s own description -- cannot be set
+    through its public interface, so they are rewritten afterwards. The heading
+    has been spelled `optional arguments:` before Python 3.10 and `options:`
+    since, and both spellings are handled rather than the running interpreter's
+    being assumed.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        kwargs["add_help"] = False
+        super().__init__(**kwargs)
+        self.add_argument("-h", "--help", action="help", help="显示这段说明并退出")
+
+    def format_help(self) -> str:
+        return (super().format_help()
+                .replace("usage: ", "用法：", 1)
+                .replace("optional arguments:", "选项：")
+                .replace("options:", "选项："))
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Start the media server and the channel page.")
+    parser = _Parser(description="启动媒体服务器和频道配置页。")
     parser.add_argument("--channel", default=None,
-                        help="channel to open first (default: the server's own default)")
+                        help="开机先打开哪个频道（默认用媒体服务器自带的频道）")
     parser.add_argument("--no-config-page", action="store_true",
-                        help="start only the media server")
+                        help="只运行媒体服务器，不启动配置页")
     args = parser.parse_args(argv)
+
+    # Before any child exists, so there is no window in which one could be
+    # started and then abandoned by a signal that arrived first.
+    _install_termination_handlers()
 
     if not python_is_new_enough():
         running = ".".join(str(part) for part in sys.version_info[:3])
