@@ -79,3 +79,5 @@
 - Updated software-design and project README references for the new documentation structure.
 - Added the documentation catalog and task-triggered routing based on the earlier repository model.
 - Added bilingual contribution, code-of-conduct, security, and support documents tailored to this ESP-IDF and fork workflow.
+
+- The build's own smoke test could not read the program's Chinese output on Windows: `subprocess.run(text=True)` decodes with the system code page, so the reader thread raised `UnicodeDecodeError`, stdout came back as `None`, and the check died comparing it. The program was correct throughout -- the check that inspects it was the broken part. Every subprocess capture in the repository now states its encoding, checked by an AST scan that would notice a new one, and it found a second instance in the repository checker, where a Chinese path would have done the same thing.

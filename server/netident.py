@@ -72,9 +72,17 @@ def lan_address() -> str | None:
 
 def _run(command: list[str]) -> str | None:
     """First line of a command's output, or None. Never raises: this is a
-    convenience lookup, and a missing or failing tool is an ordinary outcome."""
+    convenience lookup, and a missing or failing tool is an ordinary outcome.
+
+    The encoding is stated because these commands report a machine's name, and
+    a name is where non-ASCII characters actually turn up -- `COMPUTERNAME` is
+    read from the environment but `scutil` and `avahi-resolve` print. Left to
+    the platform, a Windows machine with a Chinese name would raise inside the
+    reader thread rather than return the name it has.
+    """
     try:
-        done = subprocess.run(command, capture_output=True, text=True, timeout=5)
+        done = subprocess.run(command, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=5)
     except (OSError, subprocess.SubprocessError):
         return None
     if done.returncode != 0:

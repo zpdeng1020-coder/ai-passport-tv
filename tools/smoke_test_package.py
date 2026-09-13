@@ -83,11 +83,23 @@ ORPHAN_TIMEOUT_S = 30
 # unrelated listener on the runner is not mistaken for this program's.
 MEDIA_PORT = 8096
 
+# How to read what a child printed. The encoding is stated rather than left to
+# the platform, and this is not a detail: the default for `text=True` is the
+# system code page, so on a Windows runner the program's Chinese output cannot
+# be decoded at all and `subprocess.run` raises UnicodeDecodeError in its own
+# reader thread -- after which stdout is None and the comparison below fails
+# with a TypeError about NoneType. That is exactly how this build broke: three
+# thousand lines of correct implementation, and the check that reads its output
+# could not read Chinese. Errors are replaced for the same reason the program's
+# own console wrapper replaces them: a mis-decoded character in a message is
+# readable, an exception is a build that stops.
+_CAPTURE_TEXT = {"text": True, "encoding": "utf-8", "errors": "replace"}
+
 
 def check_help(executable: Path) -> None:
     """Check that the executable loads and reports itself."""
     result = subprocess.run([str(executable), "--help"],
-                            capture_output=True, text=True, timeout=HELP_TIMEOUT_S)
+                            capture_output=True, timeout=HELP_TIMEOUT_S, **_CAPTURE_TEXT)
     if result.returncode != 0:
         raise SystemExit(
             f"--help 返回 {result.returncode}\n"
@@ -270,7 +282,7 @@ def check_certificates(executable: Path) -> None:
     environment["SSL_CERT_FILE"] = absent
     environment["SSL_CERT_DIR"] = absent + ".d"
     result = subprocess.run([str(executable), CERTS_COMMAND], env=environment,
-                            capture_output=True, text=True, timeout=HELP_TIMEOUT_S)
+                            capture_output=True, timeout=HELP_TIMEOUT_S, **_CAPTURE_TEXT)
     answer = (result.stdout + result.stderr).strip()
     print(f"  2. HTTPS 证书（模拟用户机器，也就是已发布产物在别处的表现）\n"
           f"     {answer}", flush=True)

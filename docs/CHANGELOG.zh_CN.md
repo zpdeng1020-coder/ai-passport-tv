@@ -78,3 +78,5 @@
 - 同步更新索引：`docs/software-design/README.md`、`README.en_US.md` / `README.zh_CN.md` 的 `docs/` 目录说明。
 - 参考 cindy 仓库文档组织完善索引：新增 `docs/README.md` 根总索引；AGENTS.md 规则索引按触发场景改写（附触发条件）；`docs/contribution/` 与 `docs/development/` 的 README 补充收录标准。
 - 引入社区治理文档（参照 cindy 改写，放仓库根目录）：新增 `CONTRIBUTING.md` / `.zh_CN.md`（贡献指南，针对 ESP-IDF/AI agent/fork 场景改写）、`CODE_OF_CONDUCT.md` / `.zh_CN.md`（贡献者公约）、`SECURITY.md` / `.zh_CN.md`（安全报告流程）、`SUPPORT.md` / `.zh_CN.md`（支持渠道）；AGENTS.md 与 docs/README.md 同步引用。
+
+- 构建自带的冒烟测试在 Windows 上读不懂程序的中文输出：`subprocess.run(text=True)` 用系统代码页解码，读取线程抛 `UnicodeDecodeError`，stdout 变成 `None`，随后比较时出错。程序本身一直是正确的，坏的是检查它的那段代码。现在仓库里每一处捕获子进程输出的地方都写明编码，并由一个 AST 扫描看守以免新增遗漏——该扫描还查出了第二处，在仓库检查工具里，中文路径同样会让它出错。

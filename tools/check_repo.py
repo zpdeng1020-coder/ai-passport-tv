@@ -46,12 +46,20 @@ def is_vendored(path: Path) -> bool:
 
 
 def git_files() -> list[Path]:
+    # The encoding is stated rather than left to the platform. Paths in this
+    # repository can be Chinese, and the system code page on a Windows machine
+    # cannot decode them -- so the file list would either lose entries or raise
+    # inside the reader thread, and the check would report a repository
+    # problem that is really a decoding problem. Errors are replaced because
+    # a mangled path in an error message is more useful than no message.
     result = subprocess.run(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
         cwd=ROOT,
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     return [ROOT / line for line in result.stdout.splitlines() if line]
 

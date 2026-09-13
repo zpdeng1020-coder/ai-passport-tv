@@ -207,5 +207,94 @@ class EntryPointTests(unittest.TestCase):
         self.assertNotIn("_probe_comments.py", [p.name for p in offenders])
 
 
+class CaptureEncodingTests(unittest.TestCase):
+    """Reading a subprocess's output has to state the encoding as well.
+
+    The mirror image of the problem above, and the one that was left. Writing
+    Chinese to a cp1252 console fails; so does *reading* it, because
+    `subprocess.run(text=True)` decodes with the same system code page. On the
+    Windows runner the smoke test raised UnicodeDecodeError inside its own
+    reader thread, which left stdout as None and turned the next line into
+    "TypeError: unsupported operand type(s) for +: 'NoneType' and 'str'" -- a
+    message about the check, saying nothing about the program, which was
+    correct.
+
+    Only `text=True` without an encoding is flagged. Stating one, or reading
+    bytes and decoding deliberately, are both answers to the problem; the
+    second is what the certificate check does, since it reads a line of machine
+    output rather than prose.
+    """
+
+    # Everything that runs and reads back another process. Both the tools and
+    # the smoke test matter: the smoke test is where it actually broke.
+    SCANNED_DIRS = ("tools", "tests")
+
+    def _captures_without_an_encoding(self) -> list[str]:
+        import ast
+
+        root = Path(__file__).resolve().parents[1]
+        offenders: list[str] = []
+        for directory in self.SCANNED_DIRS:
+            for path in sorted((root / directory).glob("*.py")):
+                if path.name == Path(__file__).name:
+                    # This file discusses text=True in its own docstrings.
+                    continue
+                try:
+                    tree = ast.parse(path.read_text(encoding="utf-8"))
+                except SyntaxError:
+                    continue
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+                    if name not in ("run", "check_output", "Popen", "call"):
+                        continue
+                    keywords = {k.arg: k.value for k in node.keywords if k.arg}
+                    text = keywords.get("text") or keywords.get("universal_newlines")
+                    if not (isinstance(text, ast.Constant) and text.value is True):
+                        continue
+                    if "encoding" not in keywords:
+                        offenders.append(f"{path.name}:{node.lineno}")
+        return offenders
+
+    def test_no_capture_decodes_with_the_platform_default(self):
+        offenders = self._captures_without_an_encoding()
+        self.assertEqual(
+            offenders, [],
+            "these read a child process's output without saying what encoding "
+            "it is in; on Windows the platform default cannot represent the "
+            "Chinese this program prints, and the check itself dies instead")
+
+    def test_the_scan_would_notice_a_new_offender(self):
+        """The scan has to be able to fail, or it proves nothing."""
+        root = Path(__file__).resolve().parents[1]
+        probe = root / "tools" / "_probe_capture.py"
+        probe.write_text(
+            "import subprocess\n"
+            "subprocess.run(['x'], text=True, capture_output=True)\n",
+            encoding="utf-8")
+        try:
+            offenders = self._captures_without_an_encoding()
+        finally:
+            probe.unlink()
+        self.assertIn("_probe_capture.py:2", offenders)
+
+    def test_stating_the_encoding_is_accepted(self):
+        """The fix, and not another way of writing the bug."""
+        root = Path(__file__).resolve().parents[1]
+        probe = root / "tools" / "_probe_capture_ok.py"
+        probe.write_text(
+            "import subprocess\n"
+            "subprocess.run(['x'], text=True, encoding='utf-8', errors='replace')\n"
+            "subprocess.run(['x'], capture_output=True)   # bytes, decoded later\n",
+            encoding="utf-8")
+        try:
+            offenders = self._captures_without_an_encoding()
+        finally:
+            probe.unlink()
+        self.assertNotIn("_probe_capture_ok.py:2", offenders)
+        self.assertNotIn("_probe_capture_ok.py:3", offenders)
+
+
 if __name__ == "__main__":
     unittest.main()
