@@ -62,6 +62,19 @@ run_static_checks() {
     python3 tests/test_verify_firmware.py
     python3 tests/test_av_server.py
     python3 tests/test_video_import.py
+    # Where the writable data lives, and how the two answers it used to give --
+    # code location and data location -- are kept apart. Getting that wrong is
+    # silent: the program still runs and the user's channel list goes somewhere
+    # they will not find it.
+    python3 tests/test_datadir.py
+    # Fetching ffmpeg on a machine that does not have it. The network is stubbed
+    # out; what is checked is the platform choice, the hash check, and what
+    # happens when either is wrong.
+    python3 tests/test_ffmpeg_fetch.py
+    # The sub-command protocol between the launcher and a bundled executable.
+    # This is the part that only exists when packaged, and where four separate
+    # failures were found by hand.
+    python3 tests/test_subcommands.py
     # Live transcoding and the device/server CONFIG contract. Networked cases
     # skip themselves unless AV_LIVE_TEST=1, so this stays offline by default.
     python3 tests/test_live_transcode.py

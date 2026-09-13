@@ -57,6 +57,15 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Shared with the server workflow's release job, which publishes to the same
+    # release for the same tag. A release is updated by reading it and writing it
+    # back, so two jobs doing that concurrently lose one side's files; concurrency
+    # groups are repository-wide, so the same group name makes them queue instead.
+    # cancel-in-progress must stay false -- cancelling a release job halfway is
+    # how a published release ends up missing an asset.
+    concurrency:
+      group: release-${{ github.ref_name }}
+      cancel-in-progress: false
     steps:
       - name: Download firmware artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

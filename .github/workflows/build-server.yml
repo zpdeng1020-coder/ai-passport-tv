@@ -1,0 +1,103 @@
+name: Build server
+
+on:
+  push:
+    tags:
+      - "**"
+  pull_request:
+    paths:
+      - "server/**"
+      - "tools/**"
+      - "packaging/**"
+      - "tests/**"
+      - "channels.txt"
+      - ".github/workflows/build-server.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    strategy:
+      # Every platform is built even if one fails. A single failure is a fact
+      # about that platform, and cancelling the others would hide whether the
+      # same change broke the rest -- which is the question a matrix is for.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: Linux x86_64
+          - os: macos-latest
+            label: macOS arm64
+          - os: windows-latest
+            label: Windows x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11"
+
+      # PyInstaller builds for the machine it runs on; there is no cross-build
+      # here, which is why this is a matrix rather than one job with flags.
+      - name: Install PyInstaller
+        run: python -m pip install --disable-pip-version-check pyinstaller
+
+      - name: Build
+        run: python tools/build_server.py
+
+      # A build that succeeds is not a program that runs. Every failure found
+      # while writing this was of that kind: the bundle built cleanly and died
+      # on start, because PyInstaller cannot see an import reached only through
+      # a name at run time. This starts the executable and checks it serves.
+      - name: Smoke test
+        run: python tools/smoke_test_package.py build-server
+
+      - name: Upload server artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: server-${{ matrix.os }}
+          path: build-server/*
+          if-no-files-found: error
+
+  release:
+    # Tag pushes only, and only once every platform has been built. Publishing a
+    # release with two of the three downloads in it would look complete and not
+    # be.
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # The firmware workflow publishes to the same release for the same tag, and
+    # a release is updated by reading it and writing it back. Two jobs doing that
+    # at once lose one side's files. Concurrency groups are repository-wide, so
+    # naming the group after the tag makes the two workflows queue behind each
+    # other -- and cancel-in-progress must stay false, because cancelling a
+    # release job halfway is how a published release ends up missing an asset.
+    concurrency:
+      group: release-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: List what will be published
+        run: ls -la release/
+
+      - name: Create release (tag push)
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: "${{ github.ref_name }}"
+          files: release/av-server-*
+          fail_on_unmatched_files: true
