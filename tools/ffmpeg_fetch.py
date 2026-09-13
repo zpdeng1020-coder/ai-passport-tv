@@ -321,6 +321,17 @@ if __name__ == "__main__":  # pragma: no cover - a convenience, not a feature
     # Running this file directly fetches ffmpeg and says where it went, for
     # anyone who would rather do this step on its own than start the server to
     # trigger it.
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+    from tools.console import use_utf8 as _use_utf8
+
+    # This block prints Chinese, and on Windows the console's default encoding
+    # cannot represent it. The library above does not need this -- its callers
+    # set it -- but running this file directly makes it the entry point.
+    _use_utf8()
+
     from tools import datadir as _datadir
 
     def announce(size: int) -> None:

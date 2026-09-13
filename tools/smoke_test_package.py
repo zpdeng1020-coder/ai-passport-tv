@@ -44,6 +44,15 @@ import tempfile
 import time
 from pathlib import Path
 
+# Before anything is printed. This script's messages are Chinese, and a Windows
+# console's default encoding cannot represent them -- the first print ended the
+# process with a UnicodeEncodeError, in CI, after the program it had just built
+# was working fine.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tools.console import use_utf8  # noqa: E402
+
+use_utf8()
+
 # How long to wait for the program to reach the point of listening. It unpacks
 # itself, then starts two children, one of which may be fetching ffmpeg, so this
 # is generous on purpose: a slow machine must not look like a broken build. A

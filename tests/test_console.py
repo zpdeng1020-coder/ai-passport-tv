@@ -110,42 +110,101 @@ class StreamTests(unittest.TestCase):
 
 
 class EntryPointTests(unittest.TestCase):
-    """Every program that prints Chinese has to call this first.
+    """Every script that prints Chinese has to set the encoding first.
 
-    Checked by reading the source, because the failure only appears on Windows:
-    a missing call is invisible on the machines this is developed on. All three
-    entry points print Chinese before doing anything else.
+    Found by scanning rather than by keeping a list. A list was tried first and
+    was wrong within the hour: it named four files, and the fifth -- the smoke
+    test runner -- failed on Windows with exactly the error this module exists to
+    prevent, because nobody had remembered to add it. A check that has to be
+    updated whenever a file is added protects only the files someone thought of.
     """
 
-    ENTRIES = ("tools/packaged_entry.py", "tools/launch.py",
-               "tools/channel_config.py", "tools/build_server.py")
+    # Where runnable scripts live. `server/` has none: it is a package whose
+    # modules are imported, and the bundled entry point sets the encoding before
+    # any of them is loaded.
+    SCRIPT_DIRS = ("tools",)
 
-    def test_every_entry_point_switches_to_utf8(self):
+    @classmethod
+    def _scripts_with_chinese_output(cls) -> list[Path]:
+        """Scripts that can print Chinese and do not set the encoding.
+
+        A script is included when it contains a Chinese string inside something
+        that writes to a stream, and does not import the helper. Both halves are
+        needed: plenty of files hold Chinese in comments and docstrings, which
+        never reach a console and would be a false alarm.
+        """
+        import ast
+
         root = Path(__file__).resolve().parents[1]
-        for relative in self.ENTRIES:
-            with self.subTest(entry=relative):
-                source = (root / relative).read_text(encoding="utf-8")
-                self.assertIn("use_utf8()", source,
-                              f"{relative} prints Chinese without setting the encoding")
+        offenders: list[Path] = []
+        for directory in cls.SCRIPT_DIRS:
+            for path in sorted((root / directory).glob("*.py")):
+                source = path.read_text(encoding="utf-8")
+                if "use_utf8" in source:
+                    continue
+                try:
+                    tree = ast.parse(source)
+                except SyntaxError:
+                    continue
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+                    if name not in ("print", "write", "writeLine"):
+                        continue
+                    for argument in ast.walk(node):
+                        if (isinstance(argument, ast.Constant)
+                                and isinstance(argument.value, str)
+                                and any("一" <= ch <= "鿿" for ch in argument.value)):
+                            offenders.append(path)
+                            break
+                    else:
+                        continue
+                    break
+                else:
+                    continue
+                break
+        return offenders
 
-    def test_the_call_comes_before_anything_is_printed(self):
-        """After the imports, but ahead of the first message.
+    def test_no_script_prints_chinese_without_setting_the_encoding(self):
+        offenders = self._scripts_with_chinese_output()
+        self.assertEqual(
+            [str(p.name) for p in offenders], [],
+            "these print Chinese but never call use_utf8(); on Windows the first "
+            "such message raises UnicodeEncodeError and ends the process")
 
-        Position matters and is easy to lose in a refactor: a call placed after
-        the first print does not protect that print.
+    def test_the_scan_would_notice_a_new_offender(self):
+        """The scan has to be able to fail, or it proves nothing.
+
+        A file is written into the scanned directory that prints Chinese and does
+        not import the helper, and the scan must report it. Without this, a
+        mistake in the scan -- a wrong glob, a condition that never matches --
+        would read as "everything is fine".
         """
         root = Path(__file__).resolve().parents[1]
-        for relative in self.ENTRIES:
-            with self.subTest(entry=relative):
-                source = (root / relative).read_text(encoding="utf-8")
-                call = source.index("use_utf8()")
-                # The first string literal that looks like a message to a person,
-                # rather than the module docstring or a help= argument.
-                for marker in ("print(", "sys.stdout.write("):
-                    at = source.find(marker)
-                    if at != -1:
-                        self.assertLess(call, at,
-                                        f"{relative}: use_utf8() comes after the first {marker}")
+        probe = root / "tools" / "_probe_offender.py"
+        probe.write_text('print("中文消息")\n', encoding="utf-8")
+        try:
+            offenders = self._scripts_with_chinese_output()
+        finally:
+            probe.unlink()
+        self.assertIn("_probe_offender.py", [p.name for p in offenders])
+
+    def test_a_script_that_only_mentions_chinese_in_comments_is_not_flagged(self):
+        """Comments do not reach a console, so they are not this check's business.
+
+        Without this the scan would flag most of the repository and be turned
+        off, which is worse than not having it.
+        """
+        root = Path(__file__).resolve().parents[1]
+        probe = root / "tools" / "_probe_comments.py"
+        probe.write_text('# 这里全是中文注释\n"""还有中文文档。"""\n'
+                         'print("ascii only")\n', encoding="utf-8")
+        try:
+            offenders = self._scripts_with_chinese_output()
+        finally:
+            probe.unlink()
+        self.assertNotIn("_probe_comments.py", [p.name for p in offenders])
 
 
 if __name__ == "__main__":
