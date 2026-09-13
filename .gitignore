@@ -50,3 +50,9 @@ FoloToy-AI-Passport*.bin
 # macOS folder metadata. Written by Finder whenever a directory is opened,
 # so it appears without anyone creating it and carries no project content.
 .DS_Store
+
+# The server executable and its build scratch. Distributed through the releases
+# page like the firmware, so it is not tracked -- and the blanket rule above
+# would not catch it anyway, since the file has no extension on macOS and Linux.
+build-server/
+build-server-work/

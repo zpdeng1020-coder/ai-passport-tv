@@ -39,7 +39,16 @@ if str(_BOOTSTRAP_ROOT) not in sys.path:
 
 from tools import datadir  # noqa: E402  (resolves only after the path above)
 
-CHANNELS_FILE = datadir.channels_file()
+# Resolved on each use rather than once at import. It used to be a module-level
+# constant, which fixes the path at whatever moment this module happens to be
+# imported -- and in the bundled build that is before the program has decided
+# where its data goes. Reading it late costs one directory check and removes the
+# dependence on import order entirely.
+def channels_file() -> Path:
+    """The channel table this page reads and writes."""
+    return datadir.channels_file()
+
+
 DEFAULT_SOURCE = "https://live.zhoujie218.top/tv/iptv4.m3u"
 
 # The device's real limits, mirrored from main/av_protocol.h and server/live.py.
@@ -138,10 +147,10 @@ def read_selection() -> list[dict]:
     User-Agent is carried through to the page and back for the same reason: it
     is part of the channel, not a detail of how it is stored.
     """
-    if not CHANNELS_FILE.is_file():
+    if not channels_file().is_file():
         return []
     selected = []
-    for number, raw in enumerate(CHANNELS_FILE.read_text(encoding="utf-8").splitlines(), 1):
+    for number, raw in enumerate(channels_file().read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -208,7 +217,7 @@ def write_selection(entries: list[dict]) -> None:
             raise ValueError("内部错误：频道 id 重复")
         seen.add(key)
         lines.append(f"{key} | {name} | {url}" + (f" | {agent}" if agent else ""))
-    CHANNELS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    channels_file().write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def estimate_config_bytes(names: list[str]) -> int:
@@ -686,16 +695,25 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
             self._json({"error": str(error)}, 400)
             return
-        self._json({"path": str(CHANNELS_FILE), "count": len(channels)})
+        self._json({"path": str(channels_file()), "count": len(channels)})
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Run the page until interrupted.
+
+    `argv` is optional and defaults to None, meaning "read sys.argv" -- which is
+    how argparse behaves on its own and what running this file directly relies
+    on. It exists because inside a bundled executable this module is not a
+    program but a function that one process calls on behalf of another: the real
+    sys.argv there begins with the executable's internal sub-command, which
+    argparse would reject as an unknown argument.
+    """
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--bind", default="127.0.0.1",
                         help="listen address (default: loopback only)")
     parser.add_argument("--port", type=int, default=8097)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not is_private(args.bind) and args.bind != "0.0.0.0":
         print(f"拒绝监听 {args.bind}：只允许回环或本网地址", file=sys.stderr)
@@ -704,7 +722,7 @@ def main() -> int:
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
     shown = "127.0.0.1" if args.bind in ("0.0.0.0", "::") else args.bind
     print(f"频道配置页：http://{shown}:{args.port}")
-    print(f"写入目标：{CHANNELS_FILE}")
+    print(f"写入目标：{channels_file()}")
     print("按 Ctrl-C 结束。这个页面没有口令，只在本网使用。")
     try:
         server.serve_forever()

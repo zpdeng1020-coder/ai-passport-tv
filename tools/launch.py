@@ -58,6 +58,11 @@ from tools import datadir, ffmpeg_fetch  # noqa: E402  (after the path above)
 # executable, where this path names a temporary directory.
 CODE_ROOT = datadir.code_root()
 
+# Where the channel page's script is, from a checkout. Only meaningful when not
+# bundled, and only used on that path: a bundled build has no such file, and asks
+# its own executable to be the page instead.
+CONFIG_ROOT = CODE_ROOT
+
 # Run as a file, Python puts this file's own directory on the search path, not
 # the repository root -- so `import server` fails from here even though the
 # package is right there. Adding the root explicitly is what makes the script
@@ -83,6 +88,12 @@ CHANNELS_POLL_S = 1.0
 # setting rather than a parameter threaded through every call: both places that
 # start the media server need it, and neither has anything else to say about it.
 FFMPEG: str | None = None
+
+# The first argument a bundled executable is given to become one of its parts.
+# Kept in tools/subcommands.py so that this module and the entry point can agree
+# on them without importing one another.
+from tools.subcommands import CONFIG_COMMAND as PACKAGED_CONFIG_COMMAND  # noqa: E402
+from tools.subcommands import MEDIA_COMMAND as PACKAGED_MEDIA_COMMAND  # noqa: E402
 
 
 def python_is_new_enough() -> bool:
@@ -275,6 +286,36 @@ def stop(process: subprocess.Popen | None) -> None:
         process.wait()
 
 
+def subprocess_command(sub_command: str | None, *arguments: str) -> list[str]:
+    """How to start one of this program's parts as a separate process.
+
+    The one place that knows whether this is a checkout or a bundled executable,
+    and the only place the two behave differently.
+
+    From a checkout, a part is handed to a Python interpreter -- the media server
+    as a module for `-m` to find, the channel page as the absolute path of its
+    script. Absolute matters: the children run with their working directory set
+    to the data directory, so a path relative to the checkout would not resolve.
+
+    Bundled, there is neither an interpreter nor a script file. `sys.executable`
+    is the executable itself, which knows nothing about `-m`, and the source it
+    would name lives in a temporary directory that is already gone. So the
+    executable is asked to be the part it wants, by name -- one more process of
+    this same program, with a first argument that says which part to play.
+    See tools/packaged_entry.py, which is what reads that argument.
+
+    `sub_command` of None means "this program, behaving normally", which is what
+    a bundled build falls back to.
+    """
+    if not datadir.is_frozen():
+        return [sys.executable, "-u"]
+
+    prefix = [sys.executable]
+    if sub_command:
+        prefix.append(sub_command)
+    return prefix
+
+
 def start_media_server(channel: str) -> subprocess.Popen:
     """Launch the media server.
 
@@ -291,8 +332,11 @@ def start_media_server(channel: str) -> subprocess.Popen:
     transcoding. Caught by running the whole thing with ffmpeg hidden, which is
     the case this feature exists for and the only one that shows it.
     """
-    command = [sys.executable, "-u", "-m", "server.av_server", "live",
-               "--channel", channel, "--port", str(MEDIA_PORT)]
+    if datadir.is_frozen():
+        command = subprocess_command(PACKAGED_MEDIA_COMMAND)
+    else:
+        command = subprocess_command(None) + ["-m", "server.av_server"]
+    command += ["live", "--channel", channel, "--port", str(MEDIA_PORT)]
     if FFMPEG:
         command += ["--ffmpeg", FFMPEG]
     return spawn(command)
@@ -300,9 +344,11 @@ def start_media_server(channel: str) -> subprocess.Popen:
 
 def start_config_page() -> subprocess.Popen:
     """Launch the channel page. Bound to loopback, which is where it is opened."""
-    return spawn([sys.executable, "-u",
-                  str(CODE_ROOT / "tools" / "channel_config.py"),
-                  "--port", str(CONFIG_PORT)])
+    if datadir.is_frozen():
+        command = subprocess_command(PACKAGED_CONFIG_COMMAND)
+    else:
+        command = subprocess_command(None) + [str(CONFIG_ROOT / "tools" / "channel_config.py")]
+    return spawn(command + ["--port", str(CONFIG_PORT)])
 
 
 def channels_mtime() -> float | None:
