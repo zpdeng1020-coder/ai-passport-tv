@@ -15,7 +15,7 @@ As with the official firmware, the device's factory identity is preserved; flash
 | **The same WiFi** | The device and the computer on one network |
 | **A USB cable** | For flashing; unplug it afterwards |
 
-The computer stays on while you watch. It is what converts the television signal into something the device can display. Switch it off and the device sits on the waiting screen.
+The computer stays on while you watch. It is what converts the television signal into something the device can display. Switch it off and the device sits on the waiting screen. Nothing has to be installed on it beforehand -- the download in the next step brings what it needs.
 
 ## How it works
 
@@ -63,34 +63,70 @@ Or flash it by hand — same result:
 
 ## Step 2: Start the service
 
-On the computer, in this repository's directory:
+One program runs on the computer. It does two jobs: it pulls a television channel off the internet and converts it into something the device can display, and it serves a small web page for choosing which channels are offered. There are two ways to get it, and they do exactly the same thing.
 
-- **macOS / Linux:**
+### Download one file
 
-  ```sh
-  ./run.sh
-  ```
+Go to this repository's **Releases** page and take the one for your computer:
 
-- **Windows:** double-click `run.bat`
+| Your computer | Download |
+| --- | --- |
+| Windows | `tv-server-windows-amd64.exe` |
+| macOS (M-series chip) | `tv-server-darwin-arm64` |
+| Linux | `tv-server-linux-x86_64` |
 
-The first run reports anything missing. Two things are needed: Python 3.9 or newer, and ffmpeg. If ffmpeg is absent it prints the install command for your system; install it once and it is done.
+> **Intel Macs have no ready-made file** — use the "run it from the source" route below. The build machines are all Apple silicon and cannot produce an Intel binary. Saying so is better than offering a download that will not start.
 
-It prints two things: the address it is listening on, and the address to enter on the device.
+Put it in an empty folder and double-click it. **Nothing needs to be installed first** — the first run fetches the video converter it needs (about 21–31 MB, once, and never again).
 
-**Its messages are in Chinese** — the program is written for people who read Chinese, and the Chinese README is the main one. The line to look for is the one ending in a `name:port` pair, and the line under it is what you copy:
+The first time you open it, the system may stop you with a warning that the file is from an unidentified developer. That is not a sign of a damaged file: this project has no code-signing certificate, so the system cannot identify it. To get past it:
+
+- **Windows**: click "More info", then "Run anyway"
+- **macOS**: right-click the file, choose "Open", and confirm once
+
+You only have to do this the first time; after that it opens normally.
+
+### Or run it from the source
+
+With Python and ffmpeg already installed, clone the repository and run:
+
+```sh
+./run.sh          # macOS / Linux
+```
+
+On Windows, double-click `run.bat`. Anything missing is reported with the install command for your system.
+
+### What you will see
+
+**The program's own messages are in Chinese** — it is written for people who read Chinese, and the Chinese README is the main one. What follows is that output rendered in English so you know what to look for; the real lines say the same things in Chinese, and the parts worth copying — addresses, ports, paths — are identical either way.
 
 ```
-Serving on 192.168.1.20:8096
+Data directory: /Users/you/Downloads/ai-passport-tv
+Channel page: http://127.0.0.1:8097
+  Open this in a browser on this computer to choose and reorder channels.
+
+Listening on 192.168.1.20:8096
 
 Server address to enter on the device:
     my-laptop.local:8096
 ```
 
-(The real output says those two English lines in Chinese. The `name:port` value is the part that matters and it is identical either way.)
+The line worth copying is the one under the last heading — the `name:port` pair. **Note it down**, because it goes into the device in the next step. It is this computer's own name, so it keeps working when the router hands out a different address. There is a fallback address on the following lines, in the form `192.168.x.x:8096`, for a network where the name does not resolve.
 
-**Note that `name:port` line down** — it goes into the device in the next step. It is this computer's own name, so it keeps working when the router hands out a different address.
+The first line names the folder where the channel list is kept: the program's own folder, or the per-user location when that folder cannot be written to. The channel page address is what you open later to change which channels are offered.
 
-The same window also prints a "channel page" address, used later to change which channels are offered.
+### If the device cannot connect, check the firewall first
+
+**Windows blocks incoming connections by default.** The channel page opens fine in a browser on that computer while the device cannot reach the server at all — and the device only says it cannot connect, which says nothing about a firewall. This is the most common thing to go wrong.
+
+The first time you run it, Windows usually asks whether to allow the program through the firewall: tick **private networks**. If that prompt was dismissed, or never appeared, add the rule by hand:
+
+```powershell
+# In an administrator PowerShell
+New-NetFirewallRule -DisplayName "AI Passport TV" -Direction Inbound -Protocol TCP -LocalPort 8096 -Action Allow -Profile Private
+```
+
+macOS and Linux normally need nothing here.
 
 ## Step 3: Connect the device
 
@@ -157,10 +193,26 @@ The phone may have switched back to the home WiFi after joining `FoloToy-XXXX`. 
 
 That is expected. Every channel change means the computer starts pulling and converting again. Network streams are the slowest case.
 
-## What has not been tested
+## How far this has been tested
 
-- **`run.bat` has never been run on a real Windows machine.** Development happened on macOS only. It is deliberately thin — it locates Python and hands over to `tools/launch.py` — but treat it as unverified.
-- Linux has been checked by reading the code, not by running it on a machine.
+Saying what has actually been run, and what has not, is more useful than a general assurance.
+
+**Run for real**
+
+- **Windows 11, end to end**: the downloaded `.exe` was started on a machine with no Python and no ffmpeg. It fetched ffmpeg itself, brought up both services, and served all 127 channels. That was a real machine, not a simulation.
+- **macOS, end to end**: built, started, streamed, and the channel list was saved and picked up after the automatic restart.
+- The server is built by CI on Linux, macOS and Windows, and each build is started once as a smoke test before it is published.
+
+**Not verified**
+
+- **Nobody has used this on Linux.** The build and the tests pass there in CI, but a CI runner is not a desktop and no one has clicked through it.
+- **The Intel macOS build has never run on an Intel Mac**; it is only built in CI.
+- Apple's system may block an unsigned program, and how that looks varies by macOS version and settings. The paragraph above describes the common case.
+
+**To be expected**
+
+- Public streams go dead. That is the normal state of things, not a fault — use the channel page's check button to drop the dead ones.
+- Changing channel takes several seconds, because the computer starts converting again from the beginning.
 
 ## Building the firmware yourself
 

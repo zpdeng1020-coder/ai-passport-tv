@@ -67,6 +67,18 @@ tag 触发的 Release 只有在合并固件与它的 Release 说明一起发布�
 用英文写 Release 说明（项目双语时再配一份简体中文），并在 GitHub/GitLab Release 上链接它们。对
 用户可见的行为，保持与 `docs/CHANGELOG.md` 一致。
 
+## 服务器产物的构建（`build-server.yml`）
+
+服务端是另一个可独立分发的程序，由 `.github/workflows/build-server.yml` 构建，与固件互不影响。本文件与该工作流也需同步维护。
+
+- **触发条件**：push tag、改动 `server/`、`tools/`、`packaging/`、`tests/` 或 `channels.txt` 的 pull request，以及手动触发。平时的分支 push 不触发。
+- **三平台矩阵**：Linux x86_64、macOS arm64、Windows x86_64 各在自己的 runner 上构建。PyInstaller 不能跨平台构建，所以是矩阵而不是一个 job 加参数。矩阵设 `fail-fast: false`——某个平台失败是那个平台的事实，取消其余平台会掩盖同一改动是否也破坏了它们。
+- **构建后立即冒烟测试**：每个平台的产物会当场启动一次，检查 `--help` 正常返回、空目录启动后两个服务都起来、媒体服务器端口接受连接、程序旁边生成了频道表。
+  这一步不可省。本功能此前查出的每个缺陷都是"构建成功但一跑就死"——PyInstaller 按静态分析决定打包什么，只在运行时按名字导入的模块会被静默漏掉，只报告"构建成功"的流水线会把这些全部发出去。
+- **产物**：`build-server/tv-server-<system>-<arch>[.exe]`，随 tag 发布到 Release。与固件一样不进仓库。
+- **与固件工作流共用一个 release 并发组**：Release 的更新是"读-改-写"，两个 workflow 同时写同一个 tag 的 Release 会丢文件。两者用同一个 `concurrency` 组串行执行，且 `cancel-in-progress` 保持 `false`——发布任务被中途取消，正是已发布的 Release 缺文件的方式。
+
+
 ## 相关文件
 
 - `.github/workflows/build-firmware.yml`：本流水线定义。

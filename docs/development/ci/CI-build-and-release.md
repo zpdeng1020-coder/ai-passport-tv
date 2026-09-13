@@ -58,6 +58,17 @@ Write the release notes in English (and a Simplified Chinese version where the
 project is bilingual) and link them from the GitHub/GitLab release. Keep them
 consistent with `docs/CHANGELOG.md` for user-visible behavior.
 
+## Building the server (`.github/workflows/build-server.yml`)
+
+The server is a second, independently distributed program, built by its own workflow. This page is kept in step with that one as well.
+
+- **Triggers**: tag pushes, pull requests touching `server/`, `tools/`, `packaging/`, `tests/` or `channels.txt`, and manual dispatch. Ordinary branch pushes do not trigger it.
+- **Three-platform matrix**: Linux x86_64, macOS arm64 and Windows x86_64, each built on its own runner. PyInstaller cannot cross-build, so this is a matrix rather than one job with flags. `fail-fast: false`, because one platform failing is a fact about that platform and cancelling the others hides whether the same change broke them too.
+- **Smoke test immediately after each build**: the artifact is started on the spot and checked for four things -- `--help` returns successfully, starting in an empty directory brings up both services, the media server's port accepts a connection, and a channel table appears beside the program.
+  This step is not optional. Every defect found in this feature was of the form "builds cleanly, dies on start": PyInstaller ships what its static analysis can see, so a module reached only by name at run time is silently left out, and a pipeline that reported only "build succeeded" would have published every one of them.
+- **Artifacts**: `build-server/tv-server-<system>-<arch>[.exe]`, published to the release for a tag and not committed, like the firmware.
+- **A shared release concurrency group with the firmware workflow**: a release is updated by reading it and writing it back, so two workflows writing the same tag's release at once lose files. Both use the same `concurrency` group to queue, and `cancel-in-progress` stays `false` -- cancelling a release job halfway is how a published release ends up missing an asset.
+
 ## Related documents
 
 - Firmware publishing to the community: [publish-to-community.md](../release/publish-to-community.md)
