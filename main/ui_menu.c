@@ -1,3 +1,10 @@
+// strnlen is POSIX, not C. macOS exposes it through <string.h> without being
+// asked, glibc only exposes it when a feature-test macro asks for POSIX 2008 --
+// so this file built on macOS and failed on the Linux CI runner with
+// "implicit declaration of function 'strnlen'". The macro has to come before
+// any header is included, which is why it is the first thing in the file.
+#define _POSIX_C_SOURCE 200809L
+
 #include "ui_menu.h"
 
 #include <stdlib.h>
