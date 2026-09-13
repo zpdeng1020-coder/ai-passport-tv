@@ -71,7 +71,7 @@ It prints two things: the address it is listening on, and the address to enter o
 Serving on 192.168.1.20:8096
 
 Server address to enter on the device:
-    MacBook-Air.local:8096
+    my-laptop.local:8096
 ```
 
 (The real output says those two English lines in Chinese. The `name:port` value is the part that matters and it is identical either way.)
@@ -88,7 +88,7 @@ On its first boot the device enters setup by itself, showing colour bars and a n
 2. **Open `192.168.4.1` in a browser.**
 3. Fill in two things:
    - your **home WiFi name and password**
-   - the **server address**: the line you noted down, e.g. `MacBook-Air.local:8096`
+   - the **server address**: the line you noted down, e.g. `my-laptop.local:8096`
 4. Press connect. The device restarts, the hotspot disappears, and a picture appears after a few seconds.
 
 If it does not enter setup by itself, or you need to change the address later: **double-click ↑** for the status page, then **hold ↑** on that page.
@@ -127,7 +127,7 @@ The channel list is a plain text file, `channels.txt`. Editing it by hand works 
 
 **The device says it cannot reach the server**
 
-The service is not running, or the address is wrong. Double-click ↑, then hold ↑, and enter it again. Prefer the computer's name (`MacBook-Air.local:8096`) over its IP address.
+The service is not running, or the address is wrong. Double-click ↑, then hold ↑, and enter it again. Prefer the computer's name (`my-laptop.local:8096`) over its IP address.
 
 **The picture freezes, or it stays on "connecting"**
 
