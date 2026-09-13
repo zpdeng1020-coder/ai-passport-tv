@@ -16,7 +16,7 @@
 
 - 仓库 CI 修复：`main/ui_menu.c` 使用 POSIX 的 `strnlen` 而 glibc 需特性宏才暴露，导致 macOS 本地全绿、Linux CI 持续失败；补 `_POSIX_C_SOURCE` 后 Cross 编译到 aarch64-linux-gnu 验证对照（去掉宏可精确复现原错误）。新增服务器三平台构建工作流，构建后立即启动做冒烟测试，并与固件工作流共用一个 release 并发组以免两者同时改写同一 Release 而丢文件。
 
-- 服务器侧命名由 `av` 统一为 `tv`：模块 `server/av_server.py` → `tv_server.py`，可执行文件、Release 产物、环境变量（`AV_DATA_DIR`/`AV_FFMPEG`/`AV_CHANNELS_FILE` 等）与文档一并更改。固件侧的 `av_` 前缀保持不变（那是音视频编解码，与本项目做的事不同），跨设备的 `AV_PAIRING_TOKEN` 与固件模块名 `av_protocol` 亦保留。
+- 服务器侧命名由 `av` 统一为 `tv`：模块 `server/av_server.py` → `tv_server.py`，可执行文件、Release 产物、环境变量（`AV_DATA_DIR`/`AV_FFMPEG`/`AV_CHANNELS_FILE` 等）与文档一并更改。固件侧的 `av_` 前缀保持不变（那是音视频编解码，与本项目做的事不同），固件模块名 `av_protocol` 亦保留。`AV_PAIRING_TOKEN` 起初被一并保留，理由是同名于固件里的常量、属于跨设备约定；这个理由不成立——两者只需令牌的**值**相同，名字各归各的，故服务器的环境变量随其余一并改为 `TV_PAIRING_TOKEN`。
 
 - README 补充下载即用路径、Windows 防火墙需放行 8096（实测发现：Windows 默认拦截入站，设备只显示"连不上服务器"，看不出是防火墙）、未签名程序的系统拦截及绕过方式，并把"没测过的部分"改写为逐项的验证清单。
 

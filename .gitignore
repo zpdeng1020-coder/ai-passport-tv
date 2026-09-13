@@ -56,10 +56,3 @@ FoloToy-AI-Passport*.bin
 # would not catch it anyway, since the file has no extension on macOS and Linux.
 build-server/
 build-server-work/
-
-# Handover notes for whoever picks this project up next. Written in the
-# maintainer's own working language and about the maintainer's own setup, so it
-# is a working document rather than part of the project -- publishing it would
-# tell a reader about conversations they were not part of. Kept in the working
-# copy, where the next person will find it, and out of the public repository.
-交接文档*.md

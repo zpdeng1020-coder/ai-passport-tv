@@ -29,7 +29,13 @@ from .media import (AUDIO_CHUNK_MS, AUDIO_LEAD_MS, DURATION_MS, FPS, HEIGHT,
 from .protocol import (AUDIO_BYTES, IO_TIMEOUT, Kind, Packet, ProtocolError,
                        json_bytes, json_object, receive_packet, send_packet)
 
-TOKEN_ENV = "AV_PAIRING_TOKEN"
+# The name of the environment variable an operator can set instead of
+# --token-file. Renamed with everything else on this side: it is the server's
+# own setting, not a name shared with the device. The firmware has a
+# compile-time constant of the same spelling in main/av_config.h, but only the
+# token's VALUE has to agree between them; the two names are free to differ, and
+# having them differ is less misleading than suggesting one is the other.
+TOKEN_ENV = "TV_PAIRING_TOKEN"
 # Every value here is the constant the sender actually paces by, never a copy of
 # it. A hand-copied "video_lead_ms": 50 stayed behind after the leads were
 # unified, so the device was told a timing that no longer matched the sender.

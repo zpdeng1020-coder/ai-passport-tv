@@ -107,16 +107,64 @@ def main(argv: list[str] | None = None) -> int:
     # Renamed to carry the platform, because the release page holds all of them
     # side by side and a file called `tv-server` three times over is not
     # something a person can choose between.
-    named = produced.with_name(f"tv-server-{system}-{machine}"
-                               + (".exe" if platform.system() == "Windows" else ""))
+    is_windows = platform.system() == "Windows"
+    stem = f"tv-server-{system}-{machine}"
+    named = produced.with_name(stem + (".exe" if is_windows else ""))
     if named.exists():
         named.unlink()
     produced.rename(named)
 
-    size = named.stat().st_size
+    # On macOS and Linux the executable is shipped inside a zip, and on Windows
+    # it is shipped as itself. The difference is not cosmetic.
+    #
+    # A release asset is served as a plain file download, and the POSIX
+    # executable bit is not part of the file -- it is metadata the filesystem
+    # keeps. What arrives on the user's machine is therefore mode 0644, and
+    # whatever they double-click cannot be run: macOS reports "permission
+    # denied" or opens it in a text editor. A zip stores that bit and restores
+    # it on extraction, which is the only way to deliver a runnable program as
+    # a download. Measured, not assumed: the released binary downloads as
+    # -rw-r--r-- and the same file inside a zip extracts as -rwxr-xr-x.
+    #
+    # Windows needs none of this: it has no executable bit, and an .exe runs
+    # because of its extension.
+    if not is_windows:
+        archive = named.with_name(named.name + ".zip")
+        if archive.exists():
+            archive.unlink()
+        _zip_with_mode(named, archive)
+        named.unlink()
+        published = archive
+    else:
+        published = named
+
+    size = published.stat().st_size
     print()
-    print(f"完成：{named.relative_to(ROOT)}  ({size / 1e6:.1f} MB)")
+    print(f"完成：{published.relative_to(ROOT)}  ({size / 1e6:.1f} MB)")
+    if not is_windows:
+        print(f"  可执行文件在压缩包里：{named.name}（解压后即有执行权限）")
     return 0
+
+
+def _zip_with_mode(source: Path, archive: Path) -> None:
+    """Put one file into a zip, preserving its Unix permission bits.
+
+    `ZipFile.write` does not do this on its own: it records what the filesystem
+    reports, and on a machine where the bit was never set the archive would be
+    extracted without it just the same. The mode is set on the entry explicitly
+    so that the result does not depend on the building machine's umask or on
+    the file's permissions at the moment this runs.
+    """
+    import zipfile
+
+    mode = 0o755
+    info = zipfile.ZipInfo(source.name, date_time=(1980, 1, 1, 0, 0, 0))
+    # The high 16 bits are the Unix mode; the low bits are the MS-DOS
+    # attributes, which is what tools on Windows read.
+    info.external_attr = (mode & 0xFFFF) << 16
+    info.compress_type = zipfile.ZIP_DEFLATED
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr(info, source.read_bytes())
 
 
 if __name__ == "__main__":

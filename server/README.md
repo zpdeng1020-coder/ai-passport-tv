@@ -123,7 +123,7 @@ python3 -m server.tv_server run --media-dir server/.local/media \
 ```
 
 Provision the same token to the device through the separately managed private
-configuration. Do not print or commit it. Alternatively, supply `AV_PAIRING_TOKEN`
+configuration. Do not print or commit it. Alternatively, supply `TV_PAIRING_TOKEN`
 through a secret-aware environment launcher; do not also use `--token-file`.
 Tokens are 16–128 printable ASCII characters; use random tokens, not passwords.
 Token files must be regular, owned by the process user, exactly mode 0400 or 0600,

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -91,8 +92,12 @@ def start_in_empty_directory(executable: Path) -> tuple[subprocess.Popen, Path]:
     workdir = Path(tempfile.mkdtemp(prefix="ai-passport-smoke-"))
     staged = workdir / executable.name
     staged.write_bytes(executable.read_bytes())
+    # The mode is copied, not invented. Setting 0o755 here was the second half
+    # of the same mistake the caller made: it gave the test a runnable file no
+    # matter what the artifact's permissions were, so an artifact that users
+    # could not run passed anyway.
     if os.name == "posix":
-        staged.chmod(0o755)
+        shutil.copymode(executable, staged)
     process = subprocess.Popen([str(staged)], cwd=workdir)
     return process, workdir
 
@@ -150,6 +155,55 @@ def _port_is_open(host: str, port: int) -> bool:
         return False
 
 
+def _as_released(target: Path) -> Path:
+    """The executable as a user receives it, unpacked if it ships in an archive.
+
+    macOS and Linux builds are published inside a zip, because a release asset
+    download does not carry the POSIX executable bit and the program inside
+    would arrive unrunnable. Testing the build output directly would test a file
+    nobody downloads: it still has the bit the build gave it.
+
+    Unpacked here, in a temporary directory, so that the permissions examined
+    afterwards are the ones the archive restores -- which is the same thing a
+    user gets.
+
+    Unpacked by hand rather than with `ZipFile.extractall`, which does not
+    restore permission bits: extracting this archive with it yields mode 0644
+    while the same archive unpacked by `unzip`, or by double-clicking it in
+    Finder, yields 0755. Testing through extractall therefore reported a broken
+    artifact that works -- the second time in this file that a tool's convenience
+    diverged from what the user experiences. The mode is read from the entry and
+    applied explicitly.
+    """
+    import stat
+    import tempfile
+    import zipfile
+
+    if target.is_dir():
+        archives = [p for p in sorted(target.iterdir())
+                    if p.is_file() and p.suffix == ".zip"]
+        if len(archives) == 1:
+            target = archives[0]
+    if target.suffix != ".zip":
+        return target
+
+    destination = Path(tempfile.mkdtemp(prefix="ai-passport-release-"))
+    with zipfile.ZipFile(target) as archive:
+        entries = [i for i in archive.infolist() if not i.is_dir()]
+        if len(entries) != 1:
+            raise SystemExit(
+                f"{target.name} 里应当恰好有一个文件，实际有 {len(entries)} 个")
+        entry = entries[0]
+        unpacked = destination / entry.filename
+        unpacked.write_bytes(archive.read(entry))
+        # What the archive says the mode is. Falls back to 0644 for an entry
+        # written by a tool that recorded no Unix mode at all, which is the
+        # honest reading rather than inventing an executable bit.
+        mode = (entry.external_attr >> 16) & 0o7777
+        unpacked.chmod(mode if mode else stat.S_IRUSR | stat.S_IWUSR)
+    return unpacked
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Start a built server executable and check that it works.")
@@ -161,14 +215,37 @@ def main(argv: list[str] | None = None) -> int:
     if target.is_dir():
         candidates = [p for p in sorted(target.iterdir())
                       if p.is_file() and p.name.startswith("tv-server")]
-        if len(candidates) != 1:
+        if not candidates:
+            raise SystemExit(f"{target} 里没有 tv-server* 产物")
+        # A zip is preferred when both forms are present, because the zip is
+        # what gets published: macOS and Linux builds are shipped inside one so
+        # that the executable bit survives the download. Given the choice, the
+        # one to test is the one users receive.
+        archives = [p for p in candidates if p.suffix == ".zip"]
+        if len(archives) > 1 or (not archives and len(candidates) > 1):
             raise SystemExit(
                 f"{target} 里有 {len(candidates)} 个 tv-server*，无法确定用哪个")
-        target = candidates[0]
+        target = archives[0] if archives else candidates[0]
+
+    # Unpacked here if it arrived as one, so that what gets tested is what a
+    # user ends up with rather than what happened to be on the build machine.
+    target = _as_released(target)
+
     if not target.is_file():
         raise SystemExit(f"找不到 {target}")
-    if os.name == "posix":
-        target.chmod(target.stat().st_mode | 0o111)
+
+    # The executable bit is checked, not granted. This line used to chmod the
+    # file before testing it, which is how the smoke test passed on artifacts
+    # that could not be run by anyone who downloaded them: a release asset
+    # arrives as mode 0644, because the executable bit is filesystem metadata
+    # rather than part of the file. Granting it here tested a file that users
+    # would never have. Now the packaged form is unpacked exactly as a download
+    # would be and the resulting permissions are what gets tested.
+    if os.name == "posix" and not target.stat().st_mode & 0o111:
+        raise SystemExit(
+            f"{target.name} 没有执行权限（mode {oct(target.stat().st_mode & 0o777)}）。"
+            "用户下载后双击会得到 permission denied。"
+            "macOS/Linux 的产物应当打成 zip 发布，zip 会保留执行权限位。")
 
     print(f"检查 {target.name}（{target.stat().st_size / 1e6:.1f} MB）", flush=True)
 

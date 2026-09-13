@@ -20,7 +20,8 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from server.tv_server import AVServer, authenticate, load_token, local_ipv4
+from server.tv_server import (AVServer, TOKEN_ENV, authenticate, load_token,
+                            local_ipv4)
 from server.media import (AUDIO_CHUNK_MS, AUDIO_LEAD_MS, FPS, FRAME_COUNT, HEIGHT,
                           Media, START_DELAY_MS, VIDEO_LEAD_MS, WIDTH, prepare,
                           schedule, synthetic_frame, validate_jpeg)
@@ -167,7 +168,11 @@ class AuthenticationTests(unittest.TestCase):
             json_object(b'{"version":1,"version":1}')
 
     def test_environment_and_restricted_token_file(self):
-        with patch.dict(os.environ, {"AV_PAIRING_TOKEN": TEST_TOKEN.decode()}, clear=True):
+        # Taken from the module rather than written out, so that renaming the
+        # variable cannot leave this test quietly checking a name the server
+        # no longer reads -- which is what happened when the server side was
+        # renamed and this line kept the old spelling.
+        with patch.dict(os.environ, {TOKEN_ENV: TEST_TOKEN.decode()}, clear=True):
             self.assertEqual(load_token(), TEST_TOKEN)
             with self.assertRaises(ValueError):
                 load_token(Path("unused"))

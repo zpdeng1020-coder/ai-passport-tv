@@ -24,6 +24,19 @@ CARDID_OFFSET = 0x356000
 CARDID_SIZE = 0x4000
 ENTRY = struct.Struct("<HBBII16sI")
 
+# Marks of the application this repository exists to build, and of the one it
+# must not ship by accident.
+#
+# Both are ESP32-C3 images for the same board and both pass every other check
+# here, so nothing structural tells them apart. What differs is the code: this
+# project's firmware contains the Wi-Fi setup page it serves, and the upstream
+# BSP demo contains its own peripheral initialisation. Those strings are the
+# evidence -- found by downloading a released image, reading its contents, and
+# comparing against a correct build, after the release published the demo under
+# this project's name for two versions without anything noticing.
+APP_MARKER = b"preferred_language"
+DEMO_MARKER = b"FoloToy AI Passport BSP demo"
+
 
 @dataclass(frozen=True)
 class Partition:
@@ -68,6 +81,28 @@ def parse_partition_table(raw: bytes) -> tuple[list[Partition], bool]:
     if not partitions:
         raise ValueError("partition table is empty")
     return partitions, found_md5
+
+
+def verify_application_identity(merged: bytes) -> None:
+    """Refuse a merged image that is not this project's application.
+
+    Every other check in this file is about layout: where the partitions sit,
+    how big they are, and whether anything infringes the protected region. A
+    demo image satisfies all of them, which is how one came to be published.
+
+    Checked positively and negatively. The positive test says the setup page is
+    present; the negative one says the upstream demo is not. Either alone would
+    miss a case -- an image could carry both, and one that carried neither would
+    pass a negative-only check.
+    """
+    if DEMO_MARKER in merged:
+        raise ValueError(
+            "merged artifact is the upstream BSP demo, not this project's "
+            "application -- check that the build used --prototype")
+    if APP_MARKER not in merged:
+        raise ValueError(
+            "merged artifact does not contain this project's application; "
+            "the setup page it serves is absent")
 
 
 def verify_protected_layout(merged: bytes, build_dir: Path) -> None:
@@ -147,6 +182,7 @@ def main() -> int:
 
     try:
         verify_protected_layout(merged, build_dir)
+        verify_application_identity(merged)
     except (OSError, UnicodeDecodeError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

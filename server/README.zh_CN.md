@@ -94,7 +94,7 @@ python3 -m server.tv_server run --media-dir server/.local/media \
 ```
 
 通过另外管理的设备私有配置写入相同 token，不打印、不提交。
-也可由支持秘密管理的启动器提供 `AV_PAIRING_TOKEN` 环境变量；此时不能同时指定
+也可由支持秘密管理的启动器提供 `TV_PAIRING_TOKEN` 环境变量；此时不能同时指定
 `--token-file`。token 为 16–128 个可打印 ASCII 字符，应使用随机值而非口令。
 文件必须为进程用户拥有的普通文件，权限严格为 0400 或 0600，不能是符号链接。
 用非特权账户运行。比对使用 `hmac.compare_digest`，失败时不输出 token 或输入 JSON。

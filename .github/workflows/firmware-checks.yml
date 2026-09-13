@@ -47,12 +47,15 @@ jobs:
           extra_docker_args: >-
             -e CCACHE_DIR=/app/${{ github.repository }}/.ccache
             -e IDF_CCACHE_ENABLE=1
-          command: ./tools/validate.sh --firmware
+          # --prototype: this project's application, not the upstream demo.
+          # See the note in build-firmware.yml -- the same command was
+          # carried over from the template and built the wrong program.
+          command: ./tools/validate.sh --prototype
 
       - name: Upload verified firmware
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: firmware-${{ github.run_id }}
-          path: build/FoloToy-AI-Passport-full.bin
+          path: build/FoloToy-AI-Passport-prototype-public.bin
           if-no-files-found: error
           retention-days: 7
