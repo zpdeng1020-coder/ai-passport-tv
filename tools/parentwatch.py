@@ -63,6 +63,13 @@ WATCH_ENV = "TV_WATCH_PARENT"
 # byte that never comes.
 _BUFFER = 1
 
+# How often the POSIX launcher asks whether it has been reparented, and how to
+# change it. Not a setting anyone should need: it is a net under a case that
+# should not happen, and the interval only decides how long an already-dead
+# program takes to notice.
+DEFAULT_POLL_SECONDS = 1.0
+POLL_ENV = "TV_PARENT_POLL_SECONDS"
+
 _started = False
 
 # The job object, kept alive for as long as this process runs. Letting it be
@@ -166,6 +173,91 @@ def attach(process: subprocess.Popen) -> None:
         # A process already in a job that forbids nesting, or an unexpected
         # handle. Not fatal, and not worth reporting: see above.
         return
+
+
+def watch_parent() -> bool:
+    """End this process when the one that started it does.
+
+    For the launcher, not for its children -- they have `start()` and `attach()`
+    below, which are exact in a way this cannot always be. This is the outer
+    layer, and it exists because a bundled program is not one process.
+
+    PyInstaller puts a bootloader in front: the executable the user runs unpacks
+    the bundle and then runs the real program as its own child. So "the program"
+    is two processes, and the one a user or a script kills -- the bootloader --
+    is not the one holding the children's job object or watching their pipes.
+    Killing the bootloader therefore leaves the launcher orphaned, still running,
+    still holding both ports; the smoke test found exactly that on Windows, where
+    `terminate()` is `TerminateProcess` and reaches nothing but its target. On
+    POSIX the bootloader forwards SIGTERM to its child, which is why the same
+    check passed there and hid this.
+
+    Two mechanisms, because the platforms genuinely differ:
+
+    * Windows: open a handle to the parent and wait on it. The handle becomes
+      signalled when the process ends, whatever ended it, so this is exact --
+      no polling, no interval to choose, and nothing the other process has to
+      cooperate with.
+    * POSIX: ask whether the parent has changed. There is a better-looking
+      answer and it is not one: `waitpid` only works on one's own children, and
+      the pipe this module uses elsewhere belongs to the children rather than
+      here. `getppid` is documented to return 1 once the parent is gone, and a
+      second is far more often than this needs to be right -- it is a case that
+      should not happen.
+
+    Returns whether a watch was started, which is only useful to a test.
+    """
+    if os.name == "nt":
+        return _watch_parent_on_windows()
+    return _watch_parent_by_repolling()
+
+
+def _watch_parent_on_windows() -> bool:
+    """Wait on a handle to the parent process. Exact and event-driven."""
+    import ctypes
+    import threading
+
+    synchronize = 0x00100000
+    infinite = 0xFFFFFFFF
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(synchronize, False, os.getppid())
+    except Exception:
+        return False
+    if not handle:
+        # No rights to the parent, or it is already gone. Nothing to watch;
+        # the pipe and job arrangements still cover the children.
+        return False
+
+    def watch() -> None:
+        kernel32.WaitForSingleObject(handle, infinite)
+        os._exit(0)
+
+    threading.Thread(target=watch, daemon=True, name="parent-watch").start()
+    return True
+
+
+def _watch_parent_by_repolling() -> bool:
+    """Notice that this process has been reparented, and leave."""
+    import threading
+    import time
+
+    original = os.getppid()
+    if original <= 1:
+        # Already an orphan, so there is nothing to wait for and nothing that
+        # would change. Reported rather than treated as an error.
+        return False
+    interval = os.environ.get(POLL_ENV)
+    seconds = float(interval) if interval else DEFAULT_POLL_SECONDS
+
+    def watch() -> None:
+        while True:
+            time.sleep(seconds)
+            if os.getppid() != original:
+                os._exit(0)
+
+    threading.Thread(target=watch, daemon=True, name="parent-watch").start()
+    return True
 
 
 def start() -> bool:

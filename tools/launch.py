@@ -556,6 +556,20 @@ def main(argv: list[str] | None = None) -> int:
     # started and then abandoned by a signal that arrived first.
     _install_termination_handlers()
 
+    # And the third layer, for the case none of the others reaches: a bundled
+    # program is two processes, because PyInstaller puts a bootloader in front,
+    # and killing the bootloader -- Task Manager, or any script's `terminate()`
+    # -- reaches nothing else. Without this the launcher survives it and goes on
+    # holding the children and the ports.
+    #
+    # Only when bundled, and that guard is the whole reason this is not inside
+    # parentwatch: from a checkout the parent is the shell that ran run.sh, and
+    # treating its exit as a reason to stop would end a program someone had
+    # deliberately put in the background. There is no bootloader to watch for,
+    # so there is nothing to lose by not watching. See tools/parentwatch.py.
+    if datadir.is_frozen():
+        parentwatch.watch_parent()
+
     if not python_is_new_enough():
         running = ".".join(str(part) for part in sys.version_info[:3])
         needed = ".".join(str(part) for part in MIN_PYTHON)
