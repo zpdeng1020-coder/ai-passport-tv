@@ -13,7 +13,7 @@ from enum import IntEnum
 HEADER = struct.Struct("!4sBBHIIII")
 MAGIC = b"FAV1"
 VERSION = 1
-# Control payload ceiling, matching main/av_protocol.h AV_CONTROL_MAX. The
+# Control payload ceiling, matching main/av_protocol.h TV_CONTROL_MAX. The
 # channel list travels in one CONFIG packet: a few hundred channels is about
 # 12 KB of JSON, which the previous 1024-byte ceiling rejected outright.
 CONTROL_MAX = 24 * 1024

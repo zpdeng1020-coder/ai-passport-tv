@@ -1,4 +1,4 @@
-[English](local-av-prototype.md) | 简体中文
+[English](local-tv-prototype.md) | 简体中文
 
 # 独立本地音画原型
 

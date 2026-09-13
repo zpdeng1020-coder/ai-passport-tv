@@ -113,7 +113,7 @@ LICENSE                  Repository license
 
 ## Local audio/video prototype
 
-See [standalone local audio/video prototype](local-av-prototype.md) for the optional
+See [standalone local audio/video prototype](local-tv-prototype.md) for the optional
 RAW boot entry, private configuration, protocol, memory ownership and estimated
 clock limitations. The default demo and theme are preserved.
 

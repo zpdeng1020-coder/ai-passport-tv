@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from server.av_server import AVServer, authenticate, load_token, local_ipv4
+from server.tv_server import AVServer, authenticate, load_token, local_ipv4
 from server.media import (AUDIO_CHUNK_MS, AUDIO_LEAD_MS, FPS, FRAME_COUNT, HEIGHT,
                           Media, START_DELAY_MS, VIDEO_LEAD_MS, WIDTH, prepare,
                           schedule, synthetic_frame, validate_jpeg)

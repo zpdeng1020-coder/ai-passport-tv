@@ -160,10 +160,10 @@ def main(argv: list[str] | None = None) -> int:
     target = args.path
     if target.is_dir():
         candidates = [p for p in sorted(target.iterdir())
-                      if p.is_file() and p.name.startswith("av-server")]
+                      if p.is_file() and p.name.startswith("tv-server")]
         if len(candidates) != 1:
             raise SystemExit(
-                f"{target} 里有 {len(candidates)} 个 av-server*，无法确定用哪个")
+                f"{target} 里有 {len(candidates)} 个 tv-server*，无法确定用哪个")
         target = candidates[0]
     if not target.is_file():
         raise SystemExit(f"找不到 {target}")

@@ -109,13 +109,13 @@ def python_is_new_enough() -> bool:
 def find_ffmpeg() -> str | None:
     """The ffmpeg to use, or None.
 
-    AV_FFMPEG first, then whatever is on PATH. One setting for people who have
+    TV_FFMPEG first, then whatever is on PATH. One setting for people who have
     it installed somewhere unusual, and no configuration at all for everyone
     else -- which is the common case, since every platform's package manager
     puts it on PATH. Both are checked before anything is fetched, so a machine
     that already has ffmpeg never downloads one.
     """
-    override = os.environ.get("AV_FFMPEG")
+    override = os.environ.get("TV_FFMPEG")
     if override:
         return override if Path(override).is_file() else None
     return shutil.which("ffmpeg")
@@ -217,7 +217,7 @@ def report_missing_ffmpeg() -> None:
         print(line, flush=True)
     print()
     print("装好后重新运行本程序。如果 ffmpeg 装在非标准位置，", flush=True)
-    print("设置环境变量 AV_FFMPEG 指向它的完整路径即可。", flush=True)
+    print("设置环境变量 TV_FFMPEG 指向它的完整路径即可。", flush=True)
     print()
 
 
@@ -249,7 +249,7 @@ def spawn(command: list[str]) -> subprocess.Popen:
     # written still has a valid working directory.
     #
     # That move costs the children their other use of the working directory:
-    # `python -m server.av_server` finds the package through the working
+    # `python -m server.tv_server` finds the package through the working
     # directory, and running from the data directory instead made the media
     # server exit with "No module named 'server'". PYTHONPATH puts the code back
     # on the search path without moving the working directory back, which is what
@@ -333,7 +333,7 @@ def start_media_server(channel: str) -> subprocess.Popen:
     The ffmpeg path is passed on the command line rather than through the
     environment, because the server reads it from `--ffmpeg` and nowhere else --
     it defaults to the bare name "ffmpeg" and looks it up on PATH. Setting
-    AV_FFMPEG alone left the child searching for a program that is not there: the
+    TV_FFMPEG alone left the child searching for a program that is not there: the
     media server started, accepted a connection, and then failed to begin
     transcoding. Caught by running the whole thing with ffmpeg hidden, which is
     the case this feature exists for and the only one that shows it.
@@ -341,7 +341,7 @@ def start_media_server(channel: str) -> subprocess.Popen:
     if datadir.is_frozen():
         command = subprocess_command(PACKAGED_MEDIA_COMMAND)
     else:
-        command = subprocess_command(None) + ["-m", "server.av_server"]
+        command = subprocess_command(None) + ["-m", "server.tv_server"]
     command += ["live", "--channel", channel, "--port", str(MEDIA_PORT)]
     if FFMPEG:
         command += ["--ffmpeg", FFMPEG]

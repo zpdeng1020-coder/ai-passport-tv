@@ -129,7 +129,7 @@ class DataDirTests(unittest.TestCase):
             with mock.patch.object(sys, "frozen", True, create=True), \
                     mock.patch.object(sys, "_MEIPASS", extracted, create=True), \
                     mock.patch.object(sys, "executable",
-                                      str(Path(beside) / "av-server")), \
+                                      str(Path(beside) / "tv-server")), \
                     mock.patch.dict(os.environ, {}, clear=False):
                 os.environ.pop(datadir.ENV_DATA_DIR, None)
                 self.assertEqual(datadir.code_root(), Path(extracted))

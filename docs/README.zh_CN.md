@@ -111,7 +111,7 @@ LICENSE                  仓库许可证
 
 ## 本地音画原型
 
-[独立本地音画原型](local-av-prototype.zh_CN.md) 说明可选 RAW 启动入口、私有配置、协议、内存所有权及估计时钟局限。默认 demo 与主题保留。
+[独立本地音画原型](local-tv-prototype.zh_CN.md) 说明可选 RAW 启动入口、私有配置、协议、内存所有权及估计时钟局限。默认 demo 与主题保留。
 
 ## 文档索引
 

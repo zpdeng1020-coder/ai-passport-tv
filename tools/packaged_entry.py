@@ -5,7 +5,7 @@ of them to be when it starts. That is all this module does.
 
 The reason it is needed at all: the launcher starts the media server and the
 channel page as separate processes, both by asking Python to run something else.
-`sys.executable -m server.av_server` needs a Python installation and a package on
+`sys.executable -m server.tv_server` needs a Python installation and a package on
 the search path; a script path needs that script to exist on disk. Inside a
 bundled executable neither is true -- `sys.executable` is the executable itself,
 and the source it would point at is unpacked into a temporary directory that no
@@ -67,9 +67,9 @@ use_utf8()
 from tools import channel_config, datadir, ffmpeg_fetch, launch  # noqa: E402,F401
 from tools.subcommands import CONFIG_COMMAND, MEDIA_COMMAND  # noqa: E402
 
-# Named in packaging/av-server.spec's hiddenimports, and imported here only as
+# Named in packaging/tv-server.spec's hiddenimports, and imported here only as
 # the names are actually needed -- see _load_server_modules below.
-SERVER_MODULES = ("av_server", "live", "media", "netident", "protocol")
+SERVER_MODULES = ("tv_server", "live", "media", "netident", "protocol")
 
 
 def _load_server_modules():
@@ -125,7 +125,7 @@ def prepare_data_dir() -> None:
 def _run_media(argv: list[str]) -> int:
     """Become the media server.
 
-    Takes the remaining arguments, because av_server.main does. The two entry
+    Takes the remaining arguments, because tv_server.main does. The two entry
     points are not written alike -- see _run_config.
 
     The server is loaded here rather than at the top of the file, which is why
@@ -134,7 +134,7 @@ def _run_media(argv: list[str]) -> int:
     import time is the right one.
     """
     server = _load_server_modules()
-    return server.av_server.main(argv)
+    return server.tv_server.main(argv)
 
 
 def _run_config(argv: list[str]) -> int:
@@ -142,7 +142,7 @@ def _run_config(argv: list[str]) -> int:
 
     The remaining arguments are passed explicitly. Letting it read `sys.argv`
     would hand it the executable's own sub-command as well -- by the time this
-    runs, sys.argv is `[av-server, __config, --port, 8097]` and argparse rejects
+    runs, sys.argv is `[tv-server, __config, --port, 8097]` and argparse rejects
     `__config` as an unknown argument. Taking the slice keeps the internal
     protocol out of the page's parser.
     """

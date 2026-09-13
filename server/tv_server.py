@@ -570,9 +570,15 @@ def main(argv: list[str] | None = None) -> int:
             # standing between this stream and anyone who can reach the port is
             # the network it is bound to, and that is worth knowing before the
             # port is forwarded rather than after.
-            print("No pairing token configured: any device that can reach this "
-                  "address will be served. Supply --token-file or "
-                  f"{TOKEN_ENV} to require one.", flush=True)
+            #
+            # In Chinese like every other message this program prints: the reader
+            # has just been told in Chinese what to type on the device, and this
+            # is a caution about the same thing. A different language here would
+            # read as boilerplate and get skipped, which is the opposite of what
+            # a warning is for.
+            print("没有设置配对令牌：本机网络上任何设备都能连上来收看。", flush=True)
+            print(f"需要限制的话，用 --token-file 或环境变量 {TOKEN_ENV} 指定一个。",
+                  flush=True)
         if args.command == "live":
             server = AVServer(None, token, args.bind, args.port, args.duration_seconds * 1000,
                               logger=lambda message: print(message, flush=True))

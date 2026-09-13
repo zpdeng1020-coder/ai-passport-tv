@@ -26,12 +26,12 @@ from .protocol import AUDIO_BYTES, VIDEO_MAX
 # Device-side limits, mirroring main/av_protocol.h. A channel id the firmware
 # would skip must be rejected here instead, where it can be reported; the
 # tests cross-check these against the header so the two cannot drift.
-AV_CONTROL_MAX = 7168
+TV_CONTROL_MAX = 7168
 # Must match main/av_protocol.h. The device rejects a list longer than its own
 # limit, and a server willing to send more turns that difference into a session
 # that dies at the boundary instead of a channel that is simply not offered.
-AV_CHANNEL_MAX = 128
-AV_CHANNEL_ID_MAX = 16
+TV_CHANNEL_MAX = 128
+TV_CHANNEL_ID_MAX = 16
 # Ceiling on the bytes one channel table line may occupy, used only to bound the
 # read of channels.txt. It is generous next to a real line (a long name plus a
 # long URL) so a legal file is never truncated, and the four-field form with a
@@ -78,7 +78,7 @@ PREBUFFER_TIMEOUT_S = 60
 JPEG_QUALITY = "8"
 
 # The channel table can be replaced without touching this file: point
-# AV_CHANNELS_FILE at a text file, or drop a channels.txt beside the working
+# TV_CHANNELS_FILE at a text file, or drop a channels.txt beside the working
 # directory, and it is read at startup. Each line is
 #
 #     id | Display name | https://...
@@ -86,7 +86,7 @@ JPEG_QUALITY = "8"
 # with blank lines and '#' comments ignored. Source addresses change and expire,
 # so editing a text file is the expected way to maintain them, not a code change.
 CHANNELS_FILE = "channels.txt"
-CHANNELS_ENV = "AV_CHANNELS_FILE"
+CHANNELS_ENV = "TV_CHANNELS_FILE"
 # The built-in fallback uses broadcasters' own public streams. They are more
 # dependable than community relays and their terms are clearer, which matters
 # because the alternative sources are unverified re-streams of unknown standing.
@@ -137,8 +137,8 @@ def parse_channels(text: str) -> tuple[dict[str, str], dict[str, str]]:
         else:
             raise ValueError(f"line {number}: expected 'id | name | url [| user-agent]', "
                              f"got {len(parts)} fields")
-        if not key or len(key) >= AV_CHANNEL_ID_MAX:
-            raise ValueError(f"line {number}: id must be 1..{AV_CHANNEL_ID_MAX - 1} characters")
+        if not key or len(key) >= TV_CHANNEL_ID_MAX:
+            raise ValueError(f"line {number}: id must be 1..{TV_CHANNEL_ID_MAX - 1} characters")
         if not all("!" <= char <= "~" for char in key):
             raise ValueError(f"line {number}: id must be printable ASCII")
         if key in channels:
@@ -157,7 +157,7 @@ def parse_channels(text: str) -> tuple[dict[str, str], dict[str, str]]:
         #
         # Reported once, below, with the numbers, so the operator is told rather
         # than left to notice a channel missing.
-        if len(channels) >= AV_CHANNEL_MAX:
+        if len(channels) >= TV_CHANNEL_MAX:
             dropped += 1
             continue
         if not label:
@@ -183,21 +183,21 @@ def parse_channels(text: str) -> tuple[dict[str, str], dict[str, str]]:
     packet = len(json.dumps({"channel_list": [{"id": k, "name": labels[k]}
                                               for k in channels]},
                             ensure_ascii=True, separators=(",", ":")).encode("ascii"))
-    if packet > AV_CONTROL_MAX or dropped:
+    if packet > TV_CONTROL_MAX or dropped:
         total = len(channels) + dropped
         # Two separate faults, said separately. Reporting the count when the
         # count is fine sends the reader to cut channels they do not need to cut,
         # and the real cause -- names too long -- goes unfixed.
         if dropped:
             print(f"警告：channels.txt 有 {total} 个频道，设备最多接收 "
-                  f"{AV_CHANNEL_MAX} 个。", flush=True)
+                  f"{TV_CHANNEL_MAX} 个。", flush=True)
             print(f"      超出的 {dropped} 个已被忽略，设备只会显示前 "
                   f"{len(channels)} 个。", flush=True)
-        if packet > AV_CONTROL_MAX:
+        if packet > TV_CONTROL_MAX:
             if not dropped:
                 print(f"警告：{total} 个频道，数量没有超，但频道名太长。", flush=True)
             print(f"      下发给设备的列表有 {packet} 字节，超过设备的 "
-                  f"{AV_CONTROL_MAX} 字节上限，设备可能一个频道都收不到。", flush=True)
+                  f"{TV_CONTROL_MAX} 字节上限，设备可能一个频道都收不到。", flush=True)
             print(f"      每个频道名平均 {packet // max(1, len(channels))} 字节，"
                   f"缩短频道名（尤其是中文名）是有效的办法。", flush=True)
         print("      用 python3 tools/channel_config.py 调整，或直接编辑 channels.txt。",
@@ -226,7 +226,7 @@ def load_channels(path: Path | None = None) -> None:
     else:
         if not source.is_file():
             raise ValueError(f"channel file not found: {source}")
-        # Bounded by the channel limit, never by AV_CONTROL_MAX or VIDEO_MAX.
+        # Bounded by the channel limit, never by TV_CONTROL_MAX or VIDEO_MAX.
         # Those are wire limits for a single packet, and using one of them here
         # silently truncated the file mid-line: the parser then saw a half line
         # with one field and refused the whole table, so the server exited at
@@ -236,12 +236,12 @@ def load_channels(path: Path | None = None) -> None:
         # most this many bytes (id, name, url and agent), so nothing a valid file
         # can contain is ever cut, while a stray multi-megabyte file still stops
         # at a known size.
-        limit = AV_CHANNEL_MAX * MAX_CHANNEL_LINE_BYTES
+        limit = TV_CHANNEL_MAX * MAX_CHANNEL_LINE_BYTES
         with source.open(encoding="utf-8", errors="strict") as handle:
             text = handle.read(limit + 1)
         if len(text) > limit:
             raise ValueError(f"{source} is larger than {limit} bytes; the device "
-                             f"cannot hold more than {AV_CHANNEL_MAX} channels")
+                             f"cannot hold more than {TV_CHANNEL_MAX} channels")
         channels, labels, agents = parse_channels(text)
     CHANNELS, CHANNEL_LABELS, CHANNEL_AGENTS = channels, labels, agents
     # Keep the previous default when it is still offered, otherwise start at the

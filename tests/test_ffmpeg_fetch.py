@@ -272,7 +272,7 @@ class VerificationTests(unittest.TestCase):
                                       side_effect=PermissionError("read-only")):
                 with self.assertRaises(ffmpeg_fetch.FetchError) as caught:
                     ffmpeg_fetch.fetch(target)
-            self.assertIn("AV_DATA_DIR", str(caught.exception))
+            self.assertIn("TV_DATA_DIR", str(caught.exception))
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = ROOT / "packaging" / "av-server.spec"
+SPEC = ROOT / "packaging" / "tv-server.spec"
 OUTPUT = ROOT / "build-server"
 WORK = ROOT / "build-server-work"
 
@@ -99,15 +99,15 @@ def main(argv: list[str] | None = None) -> int:
         print("构建失败。", file=sys.stderr)
         return result.returncode
 
-    produced = OUTPUT / ("av-server.exe" if platform.system() == "Windows" else "av-server")
+    produced = OUTPUT / ("tv-server.exe" if platform.system() == "Windows" else "tv-server")
     if not produced.is_file():
         print(f"构建报告成功，但没有找到 {produced}", file=sys.stderr)
         return 1
 
     # Renamed to carry the platform, because the release page holds all of them
-    # side by side and a file called `av-server` three times over is not
+    # side by side and a file called `tv-server` three times over is not
     # something a person can choose between.
-    named = produced.with_name(f"av-server-{system}-{machine}"
+    named = produced.with_name(f"tv-server-{system}-{machine}"
                                + (".exe" if platform.system() == "Windows" else ""))
     if named.exists():
         named.unlink()

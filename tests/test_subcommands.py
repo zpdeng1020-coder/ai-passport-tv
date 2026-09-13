@@ -141,7 +141,7 @@ class ImportCoverageTests(unittest.TestCase):
     PyInstaller finds modules by walking imports it can resolve statically, and
     an import inside a function that it cannot resolve is left out -- the bundle
     builds happily and fails in the user's hands. Anything imported lazily here
-    has to be named in packaging/av-server.spec as well, and this checks the
+    has to be named in packaging/tv-server.spec as well, and this checks the
     first half of that contract.
     """
 
@@ -149,7 +149,7 @@ class ImportCoverageTests(unittest.TestCase):
     # dispatches to, and the packages it reaches at run time. Listed once here and
     # asserted against the spec, so the two cannot drift.
     REQUIRED = (
-        "server.av_server", "server.live", "server.media", "server.netident",
+        "server.tv_server", "server.live", "server.media", "server.netident",
         "server.protocol", "tools.launch", "tools.channel_config",
         "tools.datadir", "tools.ffmpeg_fetch", "tools.subcommands",
     )
@@ -159,7 +159,7 @@ class ImportCoverageTests(unittest.TestCase):
     # and keeps what it read, so importing it early freezes the wrong answer --
     # this is the "invalid choice: 'cgtn'" failure, and it is the reason these
     # are imported lazily at all.
-    DEFERRED = ("server.av_server", "server.live", "server.media",
+    DEFERRED = ("server.tv_server", "server.live", "server.media",
                 "server.netident", "server.protocol")
 
     def test_the_spec_lists_every_module_the_bundle_needs(self):
@@ -171,7 +171,7 @@ class ImportCoverageTests(unittest.TestCase):
         executable, in front of a user.
         """
         spec = (Path(packaged_entry.__file__).resolve().parents[1]
-                / "packaging" / "av-server.spec").read_text(encoding="utf-8")
+                / "packaging" / "tv-server.spec").read_text(encoding="utf-8")
         missing = [m for m in self.REQUIRED if f'"{m}"' not in spec]
         self.assertEqual(missing, [], "must be listed in hiddenimports")
 
@@ -184,7 +184,7 @@ class ImportCoverageTests(unittest.TestCase):
         checks the connection between the two files rather than trusting it.
         """
         spec = (Path(packaged_entry.__file__).resolve().parents[1]
-                / "packaging" / "av-server.spec").read_text(encoding="utf-8")
+                / "packaging" / "tv-server.spec").read_text(encoding="utf-8")
         for module in self.DEFERRED:
             with self.subTest(module=module):
                 self.assertIn(f'"{module}"', spec)
@@ -214,7 +214,7 @@ class ImportCoverageTests(unittest.TestCase):
         loaded or one that is missing from the bundle.
         """
         spec = (Path(packaged_entry.__file__).resolve().parents[1]
-                / "packaging" / "av-server.spec").read_text(encoding="utf-8")
+                / "packaging" / "tv-server.spec").read_text(encoding="utf-8")
         for name in packaged_entry.SERVER_MODULES:
             with self.subTest(name=name):
                 self.assertIn(f'"server.{name}"', spec)

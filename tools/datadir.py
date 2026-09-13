@@ -17,7 +17,7 @@ whether or not the program is bundled.
 
 The order below is a preference, not a guess:
 
-1. `AV_DATA_DIR`, when set. Tests and anyone who wants to keep the data
+1. `TV_DATA_DIR`, when set. Tests and anyone who wants to keep the data
    elsewhere need a way to say so without a command-line flag on a program that
    is meant to be double-clicked.
 
@@ -44,7 +44,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-ENV_DATA_DIR = "AV_DATA_DIR"
+ENV_DATA_DIR = "TV_DATA_DIR"
 
 # Where the data goes when the program's own directory is not writable. One name
 # across platforms, spelled the way each platform expects to see it.

@@ -11,7 +11,7 @@
 ## 导入视频文件
 
 ```sh
-python3 -m server.av_server import-video --input /path/to/video.mp4 \
+python3 -m server.tv_server import-video --input /path/to/video.mp4 \
   --media-dir server/.local/my-video --seconds 60 --start 0
 ```
 
@@ -38,7 +38,7 @@ run.bat                  # Windows
 两个服务也可以分开单独运行：
 
 ```sh
-python3 -m server.av_server live --channel ch000      # 媒体服务器，端口 8096
+python3 -m server.tv_server live --channel ch000      # 媒体服务器，端口 8096
 python3 tools/channel_config.py                       # 频道配置页，端口 8097
 ```
 
@@ -47,7 +47,7 @@ python3 tools/channel_config.py                       # 频道配置页，端口
 因为路由器重新分配 IP 之后名字不用改。多网卡机器仍可手动指定 `--bind`。
 
 ```sh
-python3 -m server.av_server live --channel ch000 \
+python3 -m server.tv_server live --channel ch000 \
   --bind 192.168.1.20 --port 8096 --token-file <仅属主可读的文件>
 ```
 
@@ -59,7 +59,7 @@ python3 -m server.av_server live --channel ch000 \
 ## 一次预生成、复制、再运行
 
 ```sh
-python3 -m server.av_server prepare --media-dir server/.local/media
+python3 -m server.tv_server prepare --media-dir server/.local/media
 # Optional: --ffmpeg /absolute/path/to/ffmpeg
 ```
 
@@ -88,7 +88,7 @@ fd = os.open(folder / 'token', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 with os.fdopen(fd, 'w') as stream:
     stream.write(secrets.token_hex(32) + '\n')
 PY
-python3 -m server.av_server run --media-dir server/.local/media \
+python3 -m server.tv_server run --media-dir server/.local/media \
   --bind 127.0.0.1 --port 8096 --token-file server/.local/token \
   --duration-seconds 1800
 ```
@@ -166,9 +166,9 @@ ERROR 类型保留且支持拆包；服务器错误时关闭连接，不冒险�
 ## 主机验证
 
 ```sh
-python3 tests/test_av_server.py -v
+python3 tests/test_tv_server.py -v
 python3 tests/test_video_import.py -v
-python3 tests/test_live_transcode.py -v   # 加 AV_LIVE_TEST=1 才真实拉流
+python3 tests/test_live_transcode.py -v   # 加 TV_LIVE_TEST=1 才真实拉流
 ```
 
 测试覆盖包头字节、拆包/粘包、EOF、不搜索 magic 恢复、未知字段、载荷及 uint32 边界、
@@ -184,5 +184,5 @@ PATH 有 ffmpeg 时，还真实预生成并重新加载 10 秒素材，检查全
 
 保留约定的不等预送量，只明确跨类型 PTS 的排序含义。非法输入直接关闭而非回复 ERROR，
 避免半包歧义；新增 CONFIG 字段为补充提示。本次允许修改范围是 `server/` 和
-`tests/test_av_server.py`，故说明放在服务器旁，文档索引/changelog 由协调改动整合。
+`tests/test_tv_server.py`，故说明放在服务器旁，文档索引/changelog 由协调改动整合。
 本模块不改固件或部署配置。

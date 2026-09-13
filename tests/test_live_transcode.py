@@ -55,8 +55,8 @@ class FramingTests(unittest.TestCase):
         self.assertTrue(all(len(b) == AUDIO_BYTES for b in blocks))
 
 
-@unittest.skipUnless(os.environ.get("AV_LIVE_TEST") == "1",
-                     "set AV_LIVE_TEST=1 to fetch a real channel")
+@unittest.skipUnless(os.environ.get("TV_LIVE_TEST") == "1",
+                     "set TV_LIVE_TEST=1 to fetch a real channel")
 class LiveNetworkTests(unittest.TestCase):
     def test_real_channel_yields_frames_and_audio(self):
         channel = LiveChannel(CHANNELS["cgtn"])
@@ -163,7 +163,7 @@ class ConfigContractTests(unittest.TestCase):
             self.assertIsInstance(entry.get("id"), str)
 
     def test_config_matches_the_device_contract(self):
-        from server.av_server import CONFIG
+        from server.tv_server import CONFIG
         from server.media import AUDIO_CHUNK_MS, FPS, HEIGHT, WIDTH
         expected = {"width": WIDTH, "height": HEIGHT, "fps": FPS,
                     "sample_rate": 16000, "channels": 1, "sample_bits": 16,
@@ -177,12 +177,12 @@ class ConfigContractTests(unittest.TestCase):
         """Ids must be short, printable and unique; the device skips anything else."""
         from server.live import channel_list
         entries = channel_list()
-        from server.live import AV_CHANNEL_MAX
-        self.assertLessEqual(len(entries), AV_CHANNEL_MAX)
+        from server.live import TV_CHANNEL_MAX
+        self.assertLessEqual(len(entries), TV_CHANNEL_MAX)
         seen = set()
         for entry in entries:
             cid = entry["id"]
-            self.assertTrue(cid and len(cid) < 16, cid)  # AV_CHANNEL_ID_MAX
+            self.assertTrue(cid and len(cid) < 16, cid)  # TV_CHANNEL_ID_MAX
             self.assertTrue(cid.isascii() and cid.isprintable(), cid)
             self.assertNotIn(cid, seen)
             seen.add(cid)
@@ -190,7 +190,7 @@ class ConfigContractTests(unittest.TestCase):
     def test_every_line_of_the_channel_file_reaches_the_table(self):
         """The file must be read whole, not up to some packet-sized limit.
 
-        The read used to be capped at AV_CONTROL_MAX, which is a wire limit for
+        The read used to be capped at TV_CONTROL_MAX, which is a wire limit for
         one control packet. Once the table outgrew that number the file was cut
         mid-line, the half line parsed as a single field and parse_channels
         raised: the server then failed at import while channels.txt was fine, so
@@ -215,7 +215,7 @@ class ConfigContractTests(unittest.TestCase):
             # One byte past the ceiling, built from legal lines so only the
             # total size can be what fails.
             line = "ch%03d | n | http://x/" % 0
-            path.write_text(line * (live.AV_CHANNEL_MAX *
+            path.write_text(line * (live.TV_CHANNEL_MAX *
                                     live.MAX_CHANNEL_LINE_BYTES // len(line) + 2),
                             encoding="utf-8")
             with self.assertRaises(ValueError):
@@ -226,7 +226,7 @@ class ConfigContractTests(unittest.TestCase):
         import server.live as live
         source = Path(live.__file__).resolve().parent.parent / live.CHANNELS_FILE
         size = source.stat().st_size
-        ceiling = live.AV_CHANNEL_MAX * live.MAX_CHANNEL_LINE_BYTES
+        ceiling = live.TV_CHANNEL_MAX * live.MAX_CHANNEL_LINE_BYTES
         self.assertGreater(ceiling, size,
                            f"read ceiling {ceiling} is below the {size}-byte table")
 
@@ -261,7 +261,7 @@ class LiveSenderTests(unittest.TestCase):
              server_channel=""):
         """Run the real accept loop so listener-dependent pacing is covered."""
         import socket
-        from server.av_server import AVServer
+        from server.tv_server import AVServer
         from server.protocol import Kind, Packet, json_bytes, send_packet, receive_packet
         token = b"t" * 32
         failures = []
@@ -356,9 +356,9 @@ class LiveSenderTests(unittest.TestCase):
         never read, so Ctrl-C left the listener running until SIGKILL.
         """
         import signal
-        from server import av_server
+        from server import tv_server
         seen = {}
-        original = av_server.AVServer.serve
+        original = tv_server.AVServer.serve
 
         def fake_serve(self):
             seen["server"] = self
@@ -373,15 +373,15 @@ class LiveSenderTests(unittest.TestCase):
             token_file = Path(directory) / "token"
             token_file.write_bytes(b"t" * 32)
             os.chmod(token_file, 0o600)
-            av_server.AVServer.serve = fake_serve
+            tv_server.AVServer.serve = fake_serve
             try:
                 with mock.patch.object(sys, "argv",
-                                       ["av_server", "live", "--channel", chosen,
+                                       ["tv_server", "live", "--channel", chosen,
                                         "--bind", "127.0.0.1",
                                         "--token-file", str(token_file)]):
-                    code = av_server.main()
+                    code = tv_server.main()
             finally:
-                av_server.AVServer.serve = original
+                tv_server.AVServer.serve = original
                 for signum in (signal.SIGINT, signal.SIGTERM):
                     signal.signal(signum, signal.SIG_DFL)
         self.assertEqual(code, 0)

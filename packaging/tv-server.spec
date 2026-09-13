@@ -32,7 +32,7 @@ datas = [
 # "No module named 'server'" in the user's hands, not at build time.
 hiddenimports = [
     "server",
-    "server.av_server",
+    "server.tv_server",
     "server.live",
     "server.media",
     "server.netident",
@@ -77,7 +77,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="av-server",
+    name="tv-server",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

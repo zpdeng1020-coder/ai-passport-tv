@@ -20,7 +20,7 @@ does not recognise.
 ## Import a video file
 
 ```sh
-python3 -m server.av_server import-video --input /path/to/video.mp4 \
+python3 -m server.tv_server import-video --input /path/to/video.mp4 \
   --media-dir server/.local/my-video --seconds 60 --start 0
 ```
 
@@ -54,7 +54,7 @@ missing it says so and how to install it, rather than failing obscurely.
 The individual commands, when you want to run one without the other:
 
 ```sh
-python3 -m server.av_server live --channel ch000      # media server, port 8096
+python3 -m server.tv_server live --channel ch000      # media server, port 8096
 python3 tools/channel_config.py                       # channel page, port 8097
 ```
 
@@ -65,7 +65,7 @@ handing out a different address. Supplying `--bind` by hand is still supported
 for a machine with several interfaces.
 
 ```sh
-python3 -m server.av_server live --channel ch000 \
+python3 -m server.tv_server live --channel ch000 \
   --bind 192.168.1.20 --port 8096 --token-file <owner-only file>
 ```
 
@@ -84,7 +84,7 @@ not establish any device FPS improvement. Protocol timing and PCM are unchanged.
 ## Prepare once, copy, then run
 
 ```sh
-python3 -m server.av_server prepare --media-dir server/.local/media
+python3 -m server.tv_server prepare --media-dir server/.local/media
 # Optional: --ffmpeg /absolute/path/to/ffmpeg
 ```
 
@@ -117,7 +117,7 @@ fd = os.open(folder / 'token', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 with os.fdopen(fd, 'w') as stream:
     stream.write(secrets.token_hex(32) + '\n')
 PY
-python3 -m server.av_server run --media-dir server/.local/media \
+python3 -m server.tv_server run --media-dir server/.local/media \
   --bind 127.0.0.1 --port 8096 --token-file server/.local/token \
   --duration-seconds 1800
 ```
@@ -213,7 +213,7 @@ appended after a partially sent packet.
 ## Host validation
 
 ```sh
-python3 tests/test_av_server.py -v
+python3 tests/test_tv_server.py -v
 python3 tests/test_video_import.py -v
 ```
 
@@ -236,6 +236,6 @@ The required unequal prefetch leads are retained; only the interpretation of
 cross-type PTS ordering is made explicit. Closing rather than replying ERROR on
 invalid input avoids framing ambiguity. Extra CONFIG fields are advisory.
 Documentation is kept beside this server because this implementation's edit
-scope is `server/` and `tests/test_av_server.py`; documentation-index/changelog
+scope is `server/` and `tests/test_tv_server.py`; documentation-index/changelog
 integration belongs to the coordinating change. No firmware or deployment
 configuration is changed by this module.

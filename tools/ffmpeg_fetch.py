@@ -281,7 +281,7 @@ def fetch(data_dir: Path, on_announce=None, on_progress=None) -> Path:
     except OSError as error:
         raise FetchError(
             f"无法写入数据目录 {data_dir}：{error}\n"
-            "  可以设置环境变量 AV_DATA_DIR 指向一个可写目录后重试。") from error
+            "  可以设置环境变量 TV_DATA_DIR 指向一个可写目录后重试。") from error
 
     if on_announce:
         on_announce(expected_size)

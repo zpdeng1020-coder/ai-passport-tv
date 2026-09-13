@@ -60,7 +60,7 @@ run_static_checks() {
         -o "${test_dir}/test_av_provision_policy"
     "${test_dir}/test_av_provision_policy"
     python3 tests/test_verify_firmware.py
-    python3 tests/test_av_server.py
+    python3 tests/test_tv_server.py
     python3 tests/test_video_import.py
     # Where the writable data lives, and how the two answers it used to give --
     # code location and data location -- are kept apart. Getting that wrong is

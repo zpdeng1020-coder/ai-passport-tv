@@ -1,4 +1,4 @@
-English | [简体中文](local-av-prototype.zh_CN.md)
+English | [简体中文](local-tv-prototype.zh_CN.md)
 
 # Standalone local audio/video prototype
 

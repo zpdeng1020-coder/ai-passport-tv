@@ -63,9 +63,9 @@ DEFAULT_SOURCE = "https://live.zhoujie218.top/tv/iptv4.m3u"
 # times the truth -- while a comment here claimed they mirrored the firmware. A
 # page that shows the wrong ceiling does not protect anyone from it: it reports
 # a selection as fine that the device cannot accept at all.
-AV_CHANNEL_MAX = 128
-AV_CHANNEL_ID_MAX = 16
-AV_CONTROL_MAX = 7168
+TV_CHANNEL_MAX = 128
+TV_CHANNEL_ID_MAX = 16
+TV_CONTROL_MAX = 7168
 FOLLOW_TIMEOUT_S = 20
 MAX_PLAYLIST_BYTES = 4 * 1024 * 1024
 # `http-user-agent="..."` on an #EXTINF line. Quoted with either kind of quote;
@@ -578,8 +578,8 @@ class Handler(BaseHTTPRequestHandler):
         path, _, query = self.path.partition("?")
         if path in ("/", "/index.html"):
             page = (PAGE.replace("__SOURCE__", html.escape(DEFAULT_SOURCE, quote=True))
-                        .replace("__MAX__", str(AV_CHANNEL_MAX))
-                        .replace("__CONTROL__", str(AV_CONTROL_MAX)))
+                        .replace("__MAX__", str(TV_CHANNEL_MAX))
+                        .replace("__CONTROL__", str(TV_CONTROL_MAX)))
             self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
         elif path == "/current":
             self._json({"channels": read_selection()})
