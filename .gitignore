@@ -33,6 +33,20 @@ FoloToy-AI-Passport*.bin
 # secrets. Must follow the blanket rule above to be re-included.
 !main/ui_font_cjk.bin
 
+# ...and the copy the flashing page serves. The page cannot fetch the image from
+# the GitHub release: that URL redirects to a host which sends no CORS header, so
+# the browser blocks it. Serving it from this same origin is the only thing that
+# works in a browser, and it has to be tracked for Pages to publish it.
+#
+# This one is published to the whole internet, so it must be the public build --
+# the one produced by `tools/validate.sh --prototype`, which compiles with
+# AV_PUBLIC_BUILD and therefore never reads main/av_private_config.h. Verified
+# for the current file by rebuilding that way with sentinel values in the private
+# header: none of them reached the image. Re-verify whenever this file changes;
+# publishing a firmware built with the private header would put the WiFi
+# credentials and the pairing token on a public web page.
+!docs/firmware/FoloToy-AI-Passport-tv.bin
+
 # macOS folder metadata. Written by Finder whenever a directory is opened,
 # so it appears without anyone creating it and carries no project content.
 .DS_Store

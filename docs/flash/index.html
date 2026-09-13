@@ -108,11 +108,18 @@
 <script type="module">
 import { ESPLoader, Transport } from 'https://unpkg.com/esptool-js@0.6.1/bundle.js';
 
-// The firmware lives in the GitHub release rather than in the repository, so a
-// new build is published by uploading it there and bumping this constant, and
-// the repository does not grow by 1.5 MB per version.
-const FIRMWARE_URL =
-  'https://github.com/zpdeng1020-coder/ai-passport-tv/releases/download/v1.0.0/FoloToy-AI-Passport-tv.bin';
+// Fetched from this same site, not from the GitHub release. The release URL
+// looks like it should work and does not: it redirects to
+// release-assets.githubusercontent.com, which sends no
+// Access-Control-Allow-Origin header, so the browser refuses the response and
+// fetch() fails. Measured, not assumed -- the same fetch from this page against
+// the release URL throws "Failed to fetch", while a file served from this origin
+// comes back with `access-control-allow-origin: *`.
+//
+// This is why the image is committed under docs/firmware/. It costs the
+// repository 1.5 MB per release, which is the price of a page that works in a
+// browser at all. Keep the name in step with the release asset when publishing.
+const FIRMWARE_URL = '../firmware/FoloToy-AI-Passport-tv.bin';
 
 // Where the application area ends and the protected identity region begins.
 // Taken from partitions.csv in the repository: `cardid` starts at 0x356000. The
