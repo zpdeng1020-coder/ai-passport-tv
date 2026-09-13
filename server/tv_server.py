@@ -571,20 +571,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Imported {media.duration_ms // 1000} seconds; {WIDTH}x{HEIGHT} at {FPS} FPS; 16 kHz mono.")
             return 0
         token = load_token(args.token_file)
-        if token is None:
-            # Said once, plainly, at start-up. Without a token the only thing
-            # standing between this stream and anyone who can reach the port is
-            # the network it is bound to, and that is worth knowing before the
-            # port is forwarded rather than after.
-            #
-            # In Chinese like every other message this program prints: the reader
-            # has just been told in Chinese what to type on the device, and this
-            # is a caution about the same thing. A different language here would
-            # read as boilerplate and get skipped, which is the opposite of what
-            # a warning is for.
-            print("没有设置配对令牌：本机网络上任何设备都能连上来收看。", flush=True)
-            print(f"需要限制的话，用 --token-file 或环境变量 {TOKEN_ENV} 指定一个。",
-                  flush=True)
         if args.command == "live":
             server = AVServer(None, token, args.bind, args.port, args.duration_seconds * 1000,
                               logger=lambda message: print(message, flush=True))
@@ -600,16 +586,26 @@ def main(argv: list[str] | None = None) -> int:
             # Each device connection starts its own transcode process, so a
             # channel switch is a new session and a dead ffmpeg only ends that
             # session. The accept loop itself never needs restarting.
-            # Listing every channel would print hundreds of names for a large
-            # table, so the count matters more than the names.
-            print(f"Default channel {args.channel}; {len(CHANNELS)} channels available.",
-                  flush=True)
+            #
+            # No channel count here. It said "Default channel ch000; 127
+            # channels available", which is a line about the program's internal
+            # state: the reader never chose ch000 and cannot act on the number.
+            # What they need is the address below, and it was competing with
+            # this for attention.
             # What to type on the device, printed rather than left to be looked
             # up. This is the one value the reader has to carry across by hand,
             # and it is the step people get wrong -- an address typed with a
             # mistake looks identical to a server that is not running.
             for line in netident.describe(args.bind, args.port):
                 print(line, flush=True)
+            # After the address, not before it. This is a caveat, and a caveat
+            # printed ahead of the instruction delays the one thing the reader
+            # opened the window to find. One line, and about what it means
+            # rather than the name of a setting: whoever wants a token will look
+            # for how, and everyone else has just been told something true about
+            # their own network.
+            if token is None:
+                print("提示：本网络上的其他设备也能收看这台电脑转发的频道。", flush=True)
             server.serve()
             print(f"Stopped: completed={server.completed}, failed={server.failed}, "
                   f"rejected={server.rejected}, dropped_video={server.dropped_video}.")

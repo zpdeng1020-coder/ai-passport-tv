@@ -354,7 +354,7 @@ def start_config_page() -> subprocess.Popen:
         command = subprocess_command(PACKAGED_CONFIG_COMMAND)
     else:
         command = subprocess_command(None) + [str(CONFIG_ROOT / "tools" / "channel_config.py")]
-    return spawn(command + ["--port", str(CONFIG_PORT)])
+    return spawn(command + ["--port", str(CONFIG_PORT), "--quiet"])
 
 
 def channels_mtime() -> float | None:
@@ -453,29 +453,54 @@ def main(argv: list[str] | None = None) -> int:
         print(f"可用的前几个：{', '.join(list(CHANNELS)[:5])}", file=sys.stderr)
         return 1
 
-    # Printed before the children start, so it is not buried by their output.
-    # The location is not predictable from the outside -- it is beside the
-    # program when that directory can be written to and in the user's own
-    # application directory when it cannot -- so a channel list that went
-    # somewhere unexpected is otherwise indistinguishable from one that was never
-    # saved.
-    print(datadir.describe(datadir.data_dir()), flush=True)
+    # Only the surprising case is announced, and only to the reader it would
+    # surprise.
+    #
+    # Where the data lives is normally the folder the program sits in, which the
+    # reader can see. It stops being obvious when that folder cannot be written
+    # to, because the channel list then goes to a per-user location nobody would
+    # think to look in -- and that reader never asked for it and has no way to
+    # guess. Whoever set TV_DATA_DIR chose the location themselves and does not
+    # need telling; announcing it to them was the first version of this, and it
+    # announced the wrong reason as well.
+    if not os.environ.get(datadir.ENV_DATA_DIR):
+        data = datadir.data_dir()
+        if data != datadir.program_dir():
+            print(f"频道表保存在：{data}", flush=True)
+            print("（程序所在的文件夹不可写，所以改到了这里）", flush=True)
+            print(flush=True)
 
-    if not datadir.channels_file().is_file():
-        print("还没有 channels.txt，将使用内置的默认频道。", flush=True)
-        print("在下面的频道配置页里挑选并保存，就会生成它。", flush=True)
-        print()
-
+    # Everything else this script used to print here has gone. It announced the
+    # data directory, explained the missing channel file, named the channel page,
+    # and promised the children would print more -- after which the children
+    # printed most of it again, and the reader had to find the two lines that
+    # matter inside a block where every line looked equally urgent. Each part now
+    # says only what it alone knows.
+    #
+    # Started in order, with a wait between them, because both children write
+    # straight to this terminal and each announces its own address. Started
+    # together they raced: whichever the scheduler ran first printed first, so
+    # the channel page appeared above the device address in one build and below
+    # it in another, a few lines apart, on identical code. Waiting for the
+    # server to listen before starting the page fixes the order at its source
+    # rather than collecting and re-emitting the output, which would be a second
+    # copy of everything the children already say.
+    # The channel page's address is printed here rather than by the page
+    # itself, and printed before either child starts.
+    #
+    # Both children announce their own address as they come up, and started
+    # together they raced: whichever the scheduler ran first printed first, so
+    # the two addresses swapped places between builds and even between runs.
+    # This one the parent can state accurately -- the page listens on loopback
+    # at a port the parent chose -- so stating it here puts it first every time.
+    # The device address cannot move up here: only the server knows which
+    # interface it bound, and the parent would be guessing.
+    #
+    # The page is told not to repeat it. Two lines saying the same thing a few
+    # lines apart is what this whole pass is removing.
     if not args.no_config_page:
-        # Prints before the children start, so it is not buried by their logs --
-        # which is the one thing this script adds that the children do not do
-        # for themselves.
-        print(f"频道配置页：http://127.0.0.1:{CONFIG_PORT}", flush=True)
-        print("  在这台电脑的浏览器里打开它，挑选频道、调整顺序。", flush=True)
-        print()
-
-    print("按 Ctrl-C 结束。下面媒体服务器会打印设备上要填的地址。", flush=True)
-    print()
+        print(f"挑频道：在浏览器里打开 http://127.0.0.1:{CONFIG_PORT}", flush=True)
+        print(flush=True)
 
     server = start_media_server(channel)
     page = None if args.no_config_page else start_config_page()

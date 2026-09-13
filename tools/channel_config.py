@@ -718,6 +718,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bind", default="127.0.0.1",
                         help="listen address (default: loopback only)")
     parser.add_argument("--port", type=int, default=8097)
+    # Suppresses the start-up line. Used when something else starts this page
+    # and prints the address itself: two lines saying the same thing a few
+    # lines apart is what the reader least needs. Running this file directly
+    # leaves the flag off, and then it does announce where it is.
+    parser.add_argument("--quiet", action="store_true",
+                        help="do not print the address (the caller prints it)")
     args = parser.parse_args(argv)
 
     if not is_private(args.bind) and args.bind != "0.0.0.0":
@@ -726,9 +732,13 @@ def main(argv: list[str] | None = None) -> int:
 
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
     shown = "127.0.0.1" if args.bind in ("0.0.0.0", "::") else args.bind
-    print(f"频道配置页：http://{shown}:{args.port}")
-    print(f"写入目标：{channels_file()}")
-    print("按 Ctrl-C 结束。这个页面没有口令，只在本网使用。")
+    # Nothing is printed when the caller is going to say it. The save path used
+    # to appear here as well, which is where the file lives rather than
+    # something the reader acts on, and it appeared again a few lines away in
+    # the parent process's output.
+    if not args.quiet:
+        print(f"挑频道：在浏览器里打开 http://{shown}:{args.port}", flush=True)
+        print(flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

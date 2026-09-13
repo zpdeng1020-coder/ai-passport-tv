@@ -132,11 +132,15 @@ def describe(bind: str | None = None, port: int = 8096) -> list[str]:
     address = bind or lan_address()
     name = local_name()
 
+    # The address being listened on is not printed. It was the first line here,
+    # and it is the machine's own IP -- useful to whoever is running the server
+    # and needed by nobody else: the device is given the name, not the number,
+    # and the number appears below as the fallback when the name fails. As a
+    # leading line it pushed the thing to copy down the output.
     lines: list[str] = []
-    if address:
-        lines.append(f"正在监听 {address}:{port}")
-    else:
+    if not address:
         lines.append("没有找到网络地址。这台电脑连上网络了吗？")
+        return lines
 
     # Nothing outside this machine can reach a loopback address, so the advice
     # below would be wrong for it: the name would resolve to the real interface,
@@ -144,24 +148,28 @@ def describe(bind: str | None = None, port: int = 8096) -> list[str]:
     # the instructions looked correct. Whoever bound to loopback did so on
     # purpose -- a test, or a deliberate local-only run -- and is told what that
     # means rather than handed an address that cannot work.
-    if address and address.startswith("127."):
-        lines.append("")
+    if address.startswith("127."):
         lines.append("这是一个本机地址（127 开头），只有这台电脑自己能访问，")
         lines.append("局域网里的设备连接不上。")
         return lines
 
-    if name and address:
-        lines.append("")
-        lines.append("设备配网页上要填的服务器地址：")
+    # One value to copy, and at most one line of explanation under it.
+    #
+    # This block used to spend four lines on the address and three more
+    # explaining when to use which, which reads as a decision to make rather
+    # than an instruction to follow. The reader is holding a phone and about to
+    # type one string into a form; the fallback matters only if the first one
+    # fails, so it is stated as the fallback in a single line.
+    if name:
+        lines.append("设备上要填的地址：")
         lines.append(f"    {name}:{port}")
-        lines.append("")
-        lines.append(f"（这个名字用不了时，改用 {address}:{port}。建议优先用名字：")
-        lines.append("  路由器换 IP 之后，名字不用改。）")
-    elif address:
-        lines.append("")
-        lines.append("设备配网页上要填的服务器地址：")
+        lines.append(f"（连不上就换成 {address}:{port}）")
+    else:
+        lines.append("设备上要填的地址：")
         lines.append(f"    {address}:{port}")
-        lines.append("")
-        lines.append("（读不到这台电脑的名字，所以网络给它换 IP 之后，")
-        lines.append("  这个地址需要重新填一次。）")
+        lines.append("（读不到这台电脑的名字；路由器换 IP 后要重新填一次）")
+    # A blank line after, so whatever the server prints next -- the courtesy
+    # note about the network -- is visibly a separate remark rather than another
+    # line of the instruction.
+    lines.append("")
     return lines
