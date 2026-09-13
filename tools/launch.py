@@ -50,7 +50,7 @@ _BOOTSTRAP_ROOT = Path(__file__).resolve().parents[1]
 if str(_BOOTSTRAP_ROOT) not in sys.path:
     sys.path.insert(0, str(_BOOTSTRAP_ROOT))
 
-from tools import datadir  # noqa: E402  (resolves only after the path above)
+from tools import datadir, ffmpeg_fetch  # noqa: E402  (after the path above)
 
 # Where the code lives. Importing `server` is the only thing this is for, and it
 # is not where anything is written -- see `data_dir` below for that. The two used
@@ -79,6 +79,11 @@ CONFIG_PORT = 8097
 # the page feels immediate, slow enough to be free: one stat() per second.
 CHANNELS_POLL_S = 1.0
 
+# Where ffmpeg was found or fetched, once that has been decided. A module-level
+# setting rather than a parameter threaded through every call: both places that
+# start the media server need it, and neither has anything else to say about it.
+FFMPEG: str | None = None
+
 
 def python_is_new_enough() -> bool:
     return sys.version_info >= MIN_PYTHON
@@ -90,12 +95,57 @@ def find_ffmpeg() -> str | None:
     AV_FFMPEG first, then whatever is on PATH. One setting for people who have
     it installed somewhere unusual, and no configuration at all for everyone
     else -- which is the common case, since every platform's package manager
-    puts it on PATH.
+    puts it on PATH. Both are checked before anything is fetched, so a machine
+    that already has ffmpeg never downloads one.
     """
     override = os.environ.get("AV_FFMPEG")
     if override:
         return override if Path(override).is_file() else None
     return shutil.which("ffmpeg")
+
+
+def resolve_ffmpeg() -> str | None:
+    """The ffmpeg to use, fetching one if this machine has none.
+
+    Three questions in the order that costs the least to answer: did someone name
+    one, is one already installed, has one been fetched before. Only when all
+    three come back empty does anything go over the network -- and only once,
+    because the answer is kept in the data directory.
+
+    Returns None when the download failed, having already explained why. The
+    caller prints the same guidance it always did, so a machine that cannot reach
+    the index is no worse off than before this existed.
+    """
+    found = find_ffmpeg()
+    if found:
+        return found
+
+    data = datadir.data_dir()
+    cached = ffmpeg_fetch.cached_path(data)
+    if ffmpeg_fetch.is_usable(cached):
+        return str(cached)
+
+    def announce(size: int) -> None:
+        print(f"本机没有 ffmpeg，正在获取（约 {size / 1e6:.0f} MB，仅此一次）…", flush=True)
+
+    def progress(done: int, total: int) -> None:
+        # Overwritten in place rather than printed line by line: this runs while
+        # the reader is waiting, and a wall of percentages is not progress.
+        if total:
+            sys.stdout.write(f"\r  {done / total * 100:5.1f}%  "
+                             f"{done / 1e6:.1f}/{total / 1e6:.1f} MB")
+            sys.stdout.flush()
+
+    try:
+        path = ffmpeg_fetch.ensure(data, on_announce=announce, on_progress=progress)
+    except ffmpeg_fetch.FetchError as error:
+        # The output above ended mid-line with a percentage, so start a fresh one
+        # before the explanation.
+        print()
+        print(str(error), file=sys.stderr)
+        return None
+    print(f"\r  已就绪：{path}", flush=True)
+    return str(path)
 
 
 def ffmpeg_advice() -> list[str]:
@@ -112,16 +162,17 @@ def ffmpeg_advice() -> list[str]:
         if shutil.which("brew"):
             return ["    brew install ffmpeg"]
         return [
-            "    This computer has no Homebrew, so install it first (one command,",
-            "    from https://brew.sh), then: brew install ffmpeg",
+            "    这台电脑上没有 Homebrew，先装它（一条命令，见 https://brew.sh），",
+            "    再执行：brew install ffmpeg",
         ]
     if system == "Windows":
         if shutil.which("winget"):
             return ["    winget install ffmpeg"]
         if shutil.which("scoop"):
-            return ["    scoop install ffmpeg", "    (or install winget and use: winget install ffmpeg)"]
+            return ["    scoop install ffmpeg",
+                    "    （或者装 winget 后执行：winget install ffmpeg）"]
         return [
-            "    Install ffmpeg with winget (built into Windows 10 and later):",
+            "    用 winget 安装（Windows 10 及以后自带）：",
             "        winget install ffmpeg",
         ]
     # Linux and the BSDs: name the manager that is actually present.
@@ -135,7 +186,7 @@ def ffmpeg_advice() -> list[str]:
     ):
         if shutil.which(manager):
             return [f"    {command}"]
-    return ["    Install ffmpeg with this system's package manager."]
+    return ["    用本系统的软件包管理器安装 ffmpeg。"]
 
 
 def report_missing_ffmpeg() -> None:
@@ -231,9 +282,20 @@ def start_media_server(channel: str) -> subprocess.Popen:
     and reads it as "stop listening and shut down cleanly". In a thread it would
     never receive that signal, and Ctrl-C would leave it unable to close its
     socket or end an in-flight transcode.
+
+    The ffmpeg path is passed on the command line rather than through the
+    environment, because the server reads it from `--ffmpeg` and nowhere else --
+    it defaults to the bare name "ffmpeg" and looks it up on PATH. Setting
+    AV_FFMPEG alone left the child searching for a program that is not there: the
+    media server started, accepted a connection, and then failed to begin
+    transcoding. Caught by running the whole thing with ffmpeg hidden, which is
+    the case this feature exists for and the only one that shows it.
     """
-    return spawn([sys.executable, "-u", "-m", "server.av_server", "live",
-                  "--channel", channel, "--port", str(MEDIA_PORT)])
+    command = [sys.executable, "-u", "-m", "server.av_server", "live",
+               "--channel", channel, "--port", str(MEDIA_PORT)]
+    if FFMPEG:
+        command += ["--ffmpeg", FFMPEG]
+    return spawn(command)
 
 
 def start_config_page() -> subprocess.Popen:
@@ -293,7 +355,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"当前用的是：{sys.executable}", file=sys.stderr)
         return 1
 
-    if find_ffmpeg() is None:
+    # Resolved once, at the top, and recorded where the media server can be told
+    # about it. A fetched copy is not on PATH, so the child has to be given the
+    # path explicitly -- see start_media_server.
+    global FFMPEG
+    FFMPEG = resolve_ffmpeg()
+    if FFMPEG is None:
         report_missing_ffmpeg()
         return 1
 
