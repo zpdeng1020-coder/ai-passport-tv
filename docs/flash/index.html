@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>刷入 AI Passport 电视固件</title>
+<style>
+  :root {
+    --bg: #f7f8fa; --surface: #fff; --line: #e2e6ec;
+    --text: #16181d; --muted: #6b7280;
+    --accent: #2563eb; --accent-hover: #1d4ed8;
+    --ok: #15803d; --bad: #b91c1c; --warn: #b45309;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --surface: #1a1d23; --line: #2c313a;
+      --text: #e8eaed; --muted: #9aa1ad;
+      --accent: #60a5fa; --accent-hover: #93c5fd;
+      --ok: #4ade80; --bad: #f87171; --warn: #fbbf24;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px 64px;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    line-height: 1.7; color: var(--text); background: var(--bg);
+  }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 26px; margin: 0 0 8px; }
+  h2 { font-size: 17px; margin: 32px 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+  p { margin: 12px 0; }
+  .lede { color: var(--muted); margin-bottom: 28px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 12px; padding: 20px; margin: 20px 0;
+  }
+  .steps { padding-left: 22px; margin: 12px 0; }
+  .steps li { margin: 10px 0; }
+  code {
+    background: var(--bg); border: 1px solid var(--line);
+    padding: 1px 6px; border-radius: 5px; font-size: 13px;
+  }
+  button {
+    font: inherit; font-weight: 600; cursor: pointer;
+    padding: 12px 28px; border: none; border-radius: 999px;
+    background: var(--accent); color: #fff; transition: background .15s;
+  }
+  button:hover:not(:disabled) { background: var(--accent-hover); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  #log {
+    margin-top: 16px; padding: 14px; border-radius: 8px;
+    background: var(--bg); border: 1px solid var(--line);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12.5px; line-height: 1.65; white-space: pre-wrap;
+    max-height: 300px; overflow-y: auto; display: none;
+  }
+  .note { color: var(--muted); font-size: 13.5px; }
+  .warnbox {
+    border-left: 3px solid var(--warn); background: rgba(180,83,9,.07);
+    padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 16px 0;
+  }
+  .safe {
+    border-left: 3px solid var(--ok); background: rgba(21,128,61,.07);
+    padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 16px 0;
+  }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 14px; display: none; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>刷入 AI Passport 电视固件</h1>
+<p class="lede">用浏览器直接写入设备，不需要安装任何软件。整个过程在这台电脑上完成，固件不会经过任何第三方服务器。</p>
+
+<div class="safe">
+  <strong>这个页面不会擦除你的设备。</strong>
+  它只写入固件占用的那一段地址（约 1.5 MB），设备的出厂身份信息在更靠后的位置，不在写入范围内。页面在写入前会自己核对这一点，范围不对就拒绝开始。
+</div>
+
+<h2>准备工作</h2>
+<ol class="steps">
+  <li>用数据线把设备连到这台电脑。</li>
+  <li>确认浏览器是 <strong>Chrome</strong> 或 <strong>Edge</strong>（Safari 和 Firefox 不支持，手机浏览器也不支持）。</li>
+  <li>如果设备开不了机、或者之前刷坏过，可能需要<em>按住设备上的某个键再插线</em>才能进入可刷写状态。具体按哪个键见设备说明。</li>
+</ol>
+
+<h2>开始</h2>
+<div class="card">
+  <button id="go" disabled>正在准备…</button>
+  <div class="bar" id="bar"><div id="fill"></div></div>
+  <div id="log"></div>
+</div>
+
+<h2>刷完之后</h2>
+<ol class="steps">
+  <li>拔掉数据线，设备会自己重启。</li>
+  <li>屏幕显示彩条和一个形如 <code>FoloToy-XXXX</code> 的网络名——说明它在等你配置。</li>
+  <li>电脑装好服务端，拿到要填的地址。见<a href="../../">仓库首页</a>的说明。</li>
+  <li>用手机连上那个网络，打开 <code>192.168.4.1</code>，填 WiFi 和服务器地址。</li>
+</ol>
+
+<div class="warnbox">
+  <strong>不要用其他工具对这个设备执行「整片擦除」。</strong>
+  <code>esptool.py erase_flash</code>、或者任何写着「Erase Device」「清除设备数据」的按钮，都会抹掉设备的出厂身份信息，而且找不回来。这个页面刻意不提供那个功能。
+</div>
+
+<script type="module">
+import { ESPLoader, Transport } from 'https://unpkg.com/esptool-js@0.6.1/bundle.js';
+
+// The firmware lives in the GitHub release rather than in the repository, so a
+// new build is published by uploading it there and bumping this constant, and
+// the repository does not grow by 1.5 MB per version.
+const FIRMWARE_URL =
+  'https://github.com/zpdeng1020-coder/ai-passport-tv/releases/download/v1.0.0/FoloToy-AI-Passport-tv.bin';
+
+// Where the application area ends and the protected identity region begins.
+// Taken from partitions.csv in the repository: `cardid` starts at 0x356000. The
+// firmware is written from address 0 and must finish before this, or the write
+// would land on top of the one part of the flash that cannot be recreated.
+const CARDID_START = 0x356000;
+
+// What the firmware is expected to be. A mismatch means an upload went wrong,
+// and writing it would leave a device that does not boot -- worse than not
+// writing at all, because the old firmware is gone by then.
+const EXPECTED_SHA256 =
+  'd573a1ffab0189a224f53af6734fab920d7a566aca2845367770cfb5224aaa1b';
+
+const $ = (id) => document.getElementById(id);
+const button = $('go');
+const logBox = $('log');
+
+const sha256Hex = async (buf) => {
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, '0')).join('');
+};
+
+// Written as it happens, because the interesting part of a failure is what came
+// just before it and a spinner showing nothing says only that something broke.
+const log = (message) => {
+  logBox.style.display = 'block';
+  logBox.textContent += message + '\n';
+  logBox.scrollTop = logBox.scrollHeight;
+};
+
+const progress = (fraction) => {
+  $('bar').style.display = 'block';
+  $('fill').style.width = Math.round(fraction * 100) + '%';
+};
+
+const setBusy = (busy, label) => {
+  button.disabled = busy;
+  if (label) button.textContent = label;
+};
+
+// ---- Check the browser before offering anything ----------------------------
+if (!('serial' in navigator)) {
+  button.textContent = '这个浏览器不支持';
+  log('这个浏览器没有提供串口功能。请换用 Chrome 或 Edge 打开本页面。');
+  log('（Safari、Firefox，以及手机上的浏览器都不支持。）');
+} else if (!window.isSecureContext) {
+  button.textContent = '需要 HTTPS';
+  log('浏览器只允许在 HTTPS 页面上使用串口。请通过 https:// 打开本页面。');
+} else {
+  button.disabled = false;
+  button.textContent = '连接设备并刷入';
+}
+
+// ---- The actual install ----------------------------------------------------
+button.addEventListener('click', async () => {
+  setBusy(true, '进行中…');
+  logBox.textContent = '';
+  let transport;
+  try {
+    // 1. Fetch the firmware and check it before touching the device.
+    log('正在下载固件…');
+    const response = await fetch(FIRMWARE_URL);
+    if (!response.ok) throw new Error(`下载失败：HTTP ${response.status}`);
+    const firmware = await response.arrayBuffer();
+    log(`已下载 ${firmware.byteLength.toLocaleString()} 字节`);
+
+    const digest = await sha256Hex(firmware);
+    if (digest !== EXPECTED_SHA256) {
+      throw new Error(
+        '固件校验值不符，已停止。\n' +
+        `  期望 ${EXPECTED_SHA256}\n` +
+        `  实际 ${digest}\n` +
+        '可能是下载不完整或文件被替换。请刷新页面重试。');
+    }
+    log('校验值正确');
+
+    // 2. Refuse to write if it would reach the identity region.
+    const end = firmware.byteLength; // written from address 0
+    if (end > CARDID_START) {
+      throw new Error(
+        `固件会写到 0x${end.toString(16)}，超过设备身份信息所在的 ` +
+        `0x${CARDID_START.toString(16)}，已停止。`);
+    }
+    log(`写入范围 0x0 ~ 0x${end.toString(16)}，未触及身份信息区 ` +
+        `(0x${CARDID_START.toString(16)})`);
+
+    // 3. Talk to the device.
+    log('请在弹出的窗口里选择设备对应的串口…');
+    const port = await navigator.serial.requestPort();
+    transport = new Transport(port, true);
+    const loader = new ESPLoader({ transport, baudrate: 115200, terminal: {
+      clean: () => {}, writeLine: (d) => log(d), write: (d) => log(d),
+    }});
+
+    log('正在识别芯片…');
+    const description = await loader.main();
+    log(`识别到：${description}`);
+
+    // CHIP_NAME is the bare identifier ("ESP32-C3"); the value main() returns
+    // is a descriptive string that also carries the package and revision. The
+    // exact identifier is what the manifest declares, so comparing against it
+    // is the check that matches what the firmware was built for.
+    const chipName = loader.chip && loader.chip.CHIP_NAME;
+    if (chipName !== 'ESP32-C3') {
+      throw new Error(
+        `这个固件只适用于 ESP32-C3，检测到的是 ${chipName || description}。` +
+        '已停止，没有写入任何内容。');
+    }
+
+    // 4. Write. eraseAll is false -- that is the whole safety story. Each flash
+    //    sector is erased as it is written, so only the region this image covers
+    //    is affected. eraseAll: true would run a chip-wide erase instead and take
+    //    the identity region with it.
+    log('正在写入…');
+    await loader.writeFlash({
+      fileArray: [{ data: new Uint8Array(firmware), address: 0 }],
+      flashSize: 'keep',
+      flashMode: 'keep',
+      flashFreq: 'keep',
+      eraseAll: false,
+      compress: true,
+      reportProgress: (_i, written, total) => progress(written / total),
+    });
+    progress(1);
+    log('写入完成');
+
+    await loader.after();
+    log('设备已重启。可以拔掉数据线了。');
+    setBusy(false, '完成');
+  } catch (error) {
+    // Cancelling the port chooser is an ordinary thing to do, not a fault, and
+    // reporting it as an error teaches people to distrust the messages.
+    if (error && error.name === 'NotFoundError') {
+      log('已取消，没有写入任何内容。');
+    } else {
+      log('出错了：' + (error && error.message ? error.message : error));
+      log('设备没有被改动，或只写入了固件区域。可以重新插拔后重试。');
+    }
+    setBusy(false, '重试');
+  } finally {
+    try { if (transport) await transport.disconnect(); } catch (_) {}
+  }
+});
+</script>
+
+</main>
+</body>
+</html>

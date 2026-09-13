@@ -29,6 +29,18 @@ That explains a few things:
 
 ## Step 1: Flash the firmware
 
+**The easy way needs no software installed** — it runs in the browser:
+
+1. Open <https://zpdeng1020-coder.github.io/ai-passport-tv/flash/> in **Chrome or Edge**
+2. Plug the device in
+3. Press the button and pick the device's serial port when asked
+
+That page writes only the region the firmware occupies and **never erases the device**; it checks the write range itself and refuses to start if the range would reach the identity data.
+
+---
+
+Or flash it by hand — same result:
+
 1. Download **`FoloToy-AI-Passport-tv.bin`** from this repository's **Releases** page.
 
    It contains the bootloader, the partition table and the application, and is written in one go from address `0` — you do not have to work out offsets.
