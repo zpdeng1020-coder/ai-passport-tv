@@ -71,9 +71,11 @@
 
 | 你的电脑 | 下载这个 |
 | --- | --- |
-| Windows | `tv-server-windows-amd64.exe` |
-| macOS（M 系列芯片） | `tv-server-darwin-arm64` |
-| Linux | `tv-server-linux-x86_64` |
+| **Windows** | `tv-server-windows-amd64.exe` |
+| **Mac**（M 系列芯片） | `tv-server-macos-arm64.zip` |
+| **Linux** | `tv-server-linux-x86_64.zip` |
+
+Mac 和 Linux 下载的是压缩包，**解压后再运行**。压缩包是为了保住"可执行"这个标记——直接传程序文件的话，那个标记会在下载途中丢掉，双击会被系统拒绝。
 
 > **Intel 芯片的 Mac 没有现成文件**，请用下面"从源码跑"那条路。构建机器只有 M 系列芯片的，造不出 Intel 版本——这一点宁可说清楚，也不要让你下载一个跑不起来的文件。
 

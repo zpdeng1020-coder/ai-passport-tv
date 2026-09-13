@@ -82,9 +82,22 @@ jobs:
           name: ${{ needs.build.outputs.artifact_name }}
           path: release
 
+      # Renamed to the name the documentation tells people to download. The
+      # build calls it FoloToy-AI-Passport-prototype-public.bin, which describes
+      # how it was built rather than what it is; the README, the manual flashing
+      # command and the browser flashing page all say
+      # FoloToy-AI-Passport-tv.bin. Publishing under the build's name would send
+      # readers looking for a file that is not on the page -- and the page tells
+      # them to verify it by name.
+      - name: Rename for release
+        run: |
+          mv release/FoloToy-AI-Passport-prototype-public.bin \
+             release/FoloToy-AI-Passport-tv.bin
+          ls -la release/
+
       - name: Create release (tag push)
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: "${{ github.ref_name }}"
-          files: release/FoloToy-AI-Passport-prototype-public.bin
+          files: release/FoloToy-AI-Passport-tv.bin
           fail_on_unmatched_files: true

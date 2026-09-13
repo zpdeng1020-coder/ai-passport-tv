@@ -71,9 +71,11 @@ Go to this repository's **Releases** page and take the one for your computer:
 
 | Your computer | Download |
 | --- | --- |
-| Windows | `tv-server-windows-amd64.exe` |
-| macOS (M-series chip) | `tv-server-darwin-arm64` |
-| Linux | `tv-server-linux-x86_64` |
+| **Windows** | `tv-server-windows-amd64.exe` |
+| **Mac** (M-series chip) | `tv-server-macos-arm64.zip` |
+| **Linux** | `tv-server-linux-x86_64.zip` |
+
+The Mac and Linux downloads are archives -- **unzip them before running**. The archive is what keeps the "executable" marking on the file: sent as a bare download that marking is lost on the way, and the system refuses to open it.
 
 > **Intel Macs have no ready-made file** — use the "run it from the source" route below. The build machines are all Apple silicon and cannot produce an Intel binary. Saying so is better than offering a download that will not start.
 

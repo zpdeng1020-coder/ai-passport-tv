@@ -26,6 +26,15 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# What each system is called on the release page. Python reports the name the
+# operating system uses for itself, and one of those is an internal name that
+# readers do not recognise: a macOS download called "darwin" is one a visitor
+# cannot tell is theirs. Only names that need translating appear here; anything
+# absent keeps whatever `platform` says.
+PLATFORM_NAMES = {
+    "Darwin": "macos",
+}
 SPEC = ROOT / "packaging" / "tv-server.spec"
 OUTPUT = ROOT / "build-server"
 WORK = ROOT / "build-server-work"
@@ -70,8 +79,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # An executable from a different platform cannot be run, so the artifact
-    # records where it was built. The name is what the release page shows.
-    system = platform.system().lower()
+    # records where it was built. The name is what the release page shows, so it
+    # is written for the person choosing a download rather than in the operating
+    # system's own vocabulary: `darwin` is what the kernel calls macOS and means
+    # nothing to someone looking for their Mac's version.
+    system = PLATFORM_NAMES.get(platform.system(), platform.system().lower())
     machine = platform.machine().lower()
 
     if args.clean:
