@@ -41,6 +41,14 @@ _CODE_ROOT = Path(__file__).resolve().parents[1]
 if str(_CODE_ROOT) not in sys.path:
     sys.path.insert(0, str(_CODE_ROOT))
 
+# Before anything is printed. On Windows the console's default encoding cannot
+# represent Chinese, so the first message this program writes would end it with
+# a UnicodeEncodeError -- every message it writes is in Chinese. See
+# tools/console.py.
+from tools.console import use_utf8  # noqa: E402  (needs the path above)
+
+use_utf8()
+
 # Imported for PyInstaller's analysis as much as for use: it walks imports it can
 # see, and one it cannot resolve is left out of the bundle.
 #

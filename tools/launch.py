@@ -51,6 +51,12 @@ if str(_BOOTSTRAP_ROOT) not in sys.path:
     sys.path.insert(0, str(_BOOTSTRAP_ROOT))
 
 from tools import datadir, ffmpeg_fetch  # noqa: E402  (after the path above)
+from tools.console import use_utf8  # noqa: E402
+
+# Every message this program prints for a person is Chinese, and on Windows the
+# console's default encoding cannot represent it -- the first one would end the
+# process with a UnicodeEncodeError. Set before anything is written.
+use_utf8()
 
 # Where the code lives. Importing `server` is the only thing this is for, and it
 # is not where anything is written -- see `data_dir` below for that. The two used

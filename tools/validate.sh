@@ -75,6 +75,10 @@ run_static_checks() {
     # This is the part that only exists when packaged, and where four separate
     # failures were found by hand.
     python3 tests/test_subcommands.py
+    # Chinese output on a console whose encoding cannot represent it. Invisible
+    # on macOS and Linux, where the console is already UTF-8, and fatal on
+    # Windows at the first line the program prints.
+    python3 tests/test_console.py
     # Live transcoding and the device/server CONFIG contract. Networked cases
     # skip themselves unless AV_LIVE_TEST=1, so this stays offline by default.
     python3 tests/test_live_transcode.py

@@ -30,6 +30,16 @@ SPEC = ROOT / "packaging" / "av-server.spec"
 OUTPUT = ROOT / "build-server"
 WORK = ROOT / "build-server-work"
 
+# This script prints progress in Chinese, and on a Windows runner the console's
+# default code page cannot represent it: the build died on its first line with a
+# UnicodeEncodeError, before compiling anything. Imported by path rather than
+# through the package, because this file is run as a script and the repository
+# root is not on the search path yet.
+sys.path.insert(0, str(ROOT))
+from tools.console import use_utf8  # noqa: E402
+
+use_utf8()
+
 
 def pyinstaller_available() -> bool:
     """Whether PyInstaller can be run.

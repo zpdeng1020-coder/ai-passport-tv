@@ -38,6 +38,11 @@ if str(_BOOTSTRAP_ROOT) not in sys.path:
     sys.path.insert(0, str(_BOOTSTRAP_ROOT))
 
 from tools import datadir  # noqa: E402  (resolves only after the path above)
+from tools.console import use_utf8  # noqa: E402
+
+# This page's messages are Chinese too, and on Windows the console's default
+# encoding cannot represent them. See tools/console.py.
+use_utf8()
 
 # Resolved on each use rather than once at import. It used to be a module-level
 # constant, which fixes the path at whatever moment this module happens to be
