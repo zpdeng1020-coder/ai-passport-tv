@@ -48,6 +48,7 @@ class DataDirTests(unittest.TestCase):
                     os.environ.pop(datadir.ENV_DATA_DIR, None)
                     self.assertEqual(datadir.data_dir(), Path(directory))
 
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
     def test_read_only_program_directory_falls_back_to_the_user_directory(self):
         """Rule 3, and the reason the write test is a real write.
 
@@ -55,6 +56,13 @@ class DataDirTests(unittest.TestCase):
         a macOS disk image or from somewhere under Program Files. Permission bits
         are not consulted, so this asserts the behaviour that matters: the
         fallback is reached, and the data still lands somewhere.
+
+        Skipped as root, like the check below and for the same reason: root can
+        write to a directory whose mode says it cannot, so the fallback never
+        happens and the test fails on correct code. It passed on macOS and failed
+        in the firmware CI container, which builds as root -- the same test, one
+        environment able to exercise it and one not. Nothing about the code
+        differed; only who was running it.
         """
         with tempfile.TemporaryDirectory() as read_only, \
                 tempfile.TemporaryDirectory() as elsewhere:
