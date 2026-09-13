@@ -16,6 +16,7 @@ authentication and no TLS, so do not expose it to the internet.
 from __future__ import annotations
 
 import argparse
+import errno
 import html
 import ipaddress
 import json
@@ -730,7 +731,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"拒绝监听 {args.bind}：只允许回环或本网地址", file=sys.stderr)
         return 1
 
-    server = ThreadingHTTPServer((args.bind, args.port), Handler)
+    # A port already in use is an ordinary thing -- the previous run was not
+    # closed, most often -- and it produced a twenty-line Python traceback
+    # ending in "OSError: [Errno 48] Address already in use". That is the wrong
+    # language for the reader and the wrong length for the message: what
+    # happened, and what to do, is one sentence.
+    try:
+        server = ThreadingHTTPServer((args.bind, args.port), Handler)
+    except OSError as error:
+        if error.errno == errno.EADDRINUSE:
+            print(f"端口 {args.port} 已被占用——多半是上一次的程序还没关干净。",
+                  file=sys.stderr)
+            print("把之前的窗口关掉，或重启电脑后再试。", file=sys.stderr)
+        else:
+            print(f"配置页打不开（errno={error.errno}）。", file=sys.stderr)
+        return 1
     shown = "127.0.0.1" if args.bind in ("0.0.0.0", "::") else args.bind
     # Nothing is printed when the caller is going to say it. The save path used
     # to appear here as well, which is where the file lives rather than

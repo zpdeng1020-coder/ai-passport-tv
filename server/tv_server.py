@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hmac
 import ipaddress
 import os
@@ -557,9 +558,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in ("live", "run") and args.bind is None:
         args.bind = netident.lan_address()
         if args.bind is None:
-            print("No network address found. Connect this computer to a network and "
-                  "try again, or pass --bind with the address to serve on.",
-                  file=sys.stderr)
+            print("这台电脑好像没连上网络。接上网络再运行本程序。", file=sys.stderr)
             return 1
     try:
         if args.command == "prepare":
@@ -607,31 +606,48 @@ def main(argv: list[str] | None = None) -> int:
             if token is None:
                 print("提示：本网络上的其他设备也能收看这台电脑转发的频道。", flush=True)
             server.serve()
-            print(f"Stopped: completed={server.completed}, failed={server.failed}, "
-                  f"rejected={server.rejected}, dropped_video={server.dropped_video}.")
+            # Was "Stopped: completed=0, failed=0, rejected=0, dropped_video=0." --
+            # four counters that mean nothing to whoever just pressed Ctrl-C,
+            # and it is the last thing the program says. The counts are still
+            # worth keeping for diagnosis, so they are printed only when
+            # something actually went wrong; a clean exit says so in plain
+            # words.
+            if server.failed or server.rejected or server.dropped_video:
+                print(f"已停止。失败 {server.failed} 次，拒绝 {server.rejected} 次，"
+                      f"丢帧 {server.dropped_video} 次。", flush=True)
+            else:
+                print("已停止。", flush=True)
             return 0
         server = AVServer(Media.load(args.media_dir), token, args.bind, args.port,
                           args.duration_seconds * 1000, logger=lambda message: print(message, flush=True))
         for signum in (signal.SIGINT, signal.SIGTERM):
             signal.signal(signum, lambda *_: server.stop.set())
-        print("Single client; pre-generated media only.", flush=True)
         for line in netident.describe(args.bind, args.port):
             print(line, flush=True)
         server.serve()
-        print(f"Stopped: completed={server.completed}, failed={server.failed}, "
-              f"rejected={server.rejected}, dropped_video={server.dropped_video}.")
+        if server.failed or server.rejected or server.dropped_video:
+            print(f"Stopped: completed={server.completed}, failed={server.failed}, "
+                  f"rejected={server.rejected}, dropped_video={server.dropped_video}.")
+        else:
+            print("已停止。", flush=True)
         return 0
     except OSError as error:
         # Bind failures are otherwise indistinguishable from a token or media
         # problem, and a stale listener on the same port looks like a silent
         # no-op. errno carries no paths or credentials.
-        print(f"Socket failure (errno={error.errno}); is another server already "
-              f"listening on this port?", file=sys.stderr)
+        # errno.EADDRINUSE rather than the numbers: it is 48 on macOS and 98 on
+        # Linux, and writing those out is how a check ends up covering one
+        # platform and silently not the other.
+        if error.errno == errno.EADDRINUSE:
+            print("端口 8096 已被占用——多半是上一次的程序还没关干净。", file=sys.stderr)
+            print("把之前的窗口关掉，或重启电脑后再试。", file=sys.stderr)
+        else:
+            print(f"网络端口打不开（errno={error.errno}）。", file=sys.stderr)
         return 1
     except Exception:
         # Subprocess errors/file paths/environment may carry sensitive values.
-        print("Operation failed; check local media, token permissions, bind address and ffmpeg availability.",
-              file=sys.stderr)
+        print("程序没能启动。常见原因是 ffmpeg 缺失或频道表有问题；", file=sys.stderr)
+        print("把上面最后几行输出发给项目的维护者可以定位。", file=sys.stderr)
         return 1
 
 
