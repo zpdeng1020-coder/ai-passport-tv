@@ -7,16 +7,14 @@
 <style>
   :root {
     --bg: #f7f8fa; --surface: #fff; --line: #e2e6ec;
-    --text: #16181d; --muted: #6b7280;
+    --text: #16181d;
     --accent: #2563eb; --accent-hover: #1d4ed8;
-    --ok: #15803d; --bad: #b91c1c; --warn: #b45309;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #0f1115; --surface: #1a1d23; --line: #2c313a;
-      --text: #e8eaed; --muted: #9aa1ad;
+      --text: #e8eaed;
       --accent: #60a5fa; --accent-hover: #93c5fd;
-      --ok: #4ade80; --bad: #f87171; --warn: #fbbf24;
     }
   }
   * { box-sizing: border-box; }
@@ -29,7 +27,6 @@
   h1 { font-size: 26px; margin: 0 0 8px; }
   h2 { font-size: 17px; margin: 32px 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
   p { margin: 12px 0; }
-  .lede { color: var(--muted); margin-bottom: 28px; }
   .card {
     background: var(--surface); border: 1px solid var(--line);
     border-radius: 12px; padding: 20px; margin: 20px 0;
@@ -54,15 +51,6 @@
     font-size: 12.5px; line-height: 1.65; white-space: pre-wrap;
     max-height: 300px; overflow-y: auto; display: none;
   }
-  .note { color: var(--muted); font-size: 13.5px; }
-  .warnbox {
-    border-left: 3px solid var(--warn); background: rgba(180,83,9,.07);
-    padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 16px 0;
-  }
-  .safe {
-    border-left: 3px solid var(--ok); background: rgba(21,128,61,.07);
-    padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 16px 0;
-  }
   .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 14px; display: none; }
   .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
 </style>
@@ -71,18 +59,12 @@
 <main>
 
 <h1>刷入 AI Passport 电视固件</h1>
-<p class="lede">用浏览器直接写入设备，不需要安装任何软件。整个过程在这台电脑上完成，固件不会经过任何第三方服务器。</p>
-
-<div class="safe">
-  <strong>这个页面不会擦除你的设备。</strong>
-  它只写入固件占用的那一段地址（约 1.5 MB），设备的出厂身份信息在更靠后的位置，不在写入范围内。页面在写入前会自己核对这一点，范围不对就拒绝开始。
-</div>
 
 <h2>准备工作</h2>
 <ol class="steps">
   <li>用数据线把设备连到这台电脑。</li>
   <li>确认浏览器是 <strong>Chrome</strong> 或 <strong>Edge</strong>（Safari 和 Firefox 不支持，手机浏览器也不支持）。</li>
-  <li>设备要处在<strong>可刷写状态</strong>才会出现在列表里。能正常开机时它就是这个状态；开不了机的话，按住一枚按键再开机试试。哪一枚我们没验证过，三枚都试一遍即可。</li>
+  <li>保持设备开机状态。</li>
 </ol>
 
 <h2>开始</h2>
@@ -94,16 +76,11 @@
 
 <h2>刷完之后</h2>
 <ol class="steps">
-  <li><strong>按住电源键约 2 秒关机，再按约 0.5 秒开机。</strong>设备内置电池，拔数据线不会重启它。不做这一步，屏幕是黑的。</li>
+  <li>完成后请重启设备。</li>
   <li>屏幕显示彩条和一个形如 <code>FoloToy-XXXX</code> 的网络名——说明它在等你配置。</li>
   <li>到 <a href="https://github.com/zpdeng1020-coder/ai-passport-tv/releases">Releases 页面</a> 下载服务端，在电脑上运行。它会显示一个地址，下一步要填。</li>
   <li>用手机连上那个网络，打开 <code>192.168.4.1</code>，填 WiFi 和服务器地址。</li>
 </ol>
-
-<div class="warnbox">
-  <strong>不要用其他工具对这个设备执行「整片擦除」。</strong>
-  <code>esptool.py erase_flash</code>、或者任何写着「Erase Device」「清除设备数据」的按钮，都会抹掉设备的出厂身份信息，而且找不回来。这个页面刻意不提供那个功能。
-</div>
 
 <script type="module">
 import { ESPLoader, Transport } from 'https://unpkg.com/esptool-js@0.6.1/bundle.js';
@@ -195,8 +172,11 @@ button.addEventListener('click', async () => {
         `  实际 ${digest}\n` +
         '可能是下载不完整或文件被替换。请刷新页面重试。');
     }
-    log('校验值正确');
-
+    // Neither the digest nor the write range is printed. Both are internal
+    // facts the page checks for itself and refuses on, so passing them on hands
+    // the reader a hexadecimal number and nothing to do with it. What they need
+    // is that it worked, and the next line says where.
+    //
     // 2. Refuse to write if it would reach the identity region.
     const end = firmware.byteLength; // written from address 0
     if (end > CARDID_START) {
@@ -204,16 +184,21 @@ button.addEventListener('click', async () => {
         `固件会写到 0x${end.toString(16)}，超过设备身份信息所在的 ` +
         `0x${CARDID_START.toString(16)}，已停止。`);
     }
-    log(`写入范围 0x0 ~ 0x${end.toString(16)}，未触及身份信息区 ` +
-        `(0x${CARDID_START.toString(16)})`);
 
     // 3. Talk to the device.
     log('请在弹出的窗口里选择设备对应的串口…');
     const port = await navigator.serial.requestPort();
     transport = new Transport(port, true);
-    const loader = new ESPLoader({ transport, baudrate: 115200, terminal: {
-      clean: () => {}, writeLine: (d) => log(d), write: (d) => log(d),
-    }});
+    // esptool's own output goes nowhere. Every one of its lines was forwarded
+    // into the box below, which filled it with fifty "Writing at 0x... (n%)"
+    // rows plus the chip-detection chatter, and left the reader scrolling to
+    // find the two lines that were actually meant for them. The progress bar
+    // above already shows the same thing the percentage rows did.
+    //
+    // A no-op sink rather than no `terminal` at all: without one esptool falls
+    // back to console.log, which is the same noise in a worse place.
+    const quiet = { clean: () => {}, writeLine: () => {}, write: () => {} };
+    const loader = new ESPLoader({ transport, baudrate: 115200, terminal: quiet });
 
     log('正在识别芯片…');
     const description = await loader.main();
@@ -260,7 +245,7 @@ button.addEventListener('click', async () => {
     // action is due. Leaving it unsaid produced exactly the confusion the
     // steps above were rewritten to fix.
     log('写入完成。');
-    log('按住电源键约 2 秒关机，再按约 0.5 秒开机。');
+    log('请重启设备。');
     log('接下来：电脑上还要装服务端，见项目 Releases 页面。');
     setBusy(false, '完成');
   } catch (error) {

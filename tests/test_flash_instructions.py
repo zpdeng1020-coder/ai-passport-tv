@@ -32,11 +32,22 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# The page and the two READMEs, each with the phrase that tells the reader to
-# power-cycle the device. Different words, because they are written for
-# different places -- a page read mid-task and a README read beforehand.
+# The page and the two READMEs, each with the phrase that tells the reader the
+# device has to be restarted. Different words, because they are written for
+# different places with different amounts of room:
+#
+#   * the page says only what to do -- "完成后请重启设备" -- because someone
+#     reading it has already decided to flash and wants the step, not the
+#     reason;
+#   * the READMEs are read beforehand, when there is room to say which button
+#     and for how long.
+#
+# The property being checked is that all three still ask for a restart. Not
+# that they say it alike: pinning the wording would fail on every improvement
+# to it, and it is the missing step, not the phrasing, that leaves a dark
+# screen.
 PLACES = {
-    "docs/flash/index.html": ("按住电源键", "关机"),
+    "docs/flash/index.html": ("重启设备",),
     "README.zh_CN.md": ("按住电源键", "关机"),
     "README.md": ("power button", "switch off"),
 }
@@ -68,7 +79,7 @@ class PowerCycleStepTests(unittest.TestCase):
     # pin to travel along. Telling them apart requires looking at where the
     # sentence is, not only at what it says.
     SECTIONS = {
-        "docs/flash/index.html": ("<h2>刷完之后</h2>", '<div class="warnbox">'),
+        "docs/flash/index.html": ("<h2>刷完之后</h2>", '<script type="module">'),
         "README.zh_CN.md": ("## 第一步：刷固件", "## 第二步"),
         "README.md": ("## Step 1", "## Step 2"),
     }
@@ -119,9 +130,9 @@ class PowerCycleStepTests(unittest.TestCase):
         """
         page = self._text("docs/flash/index.html")
         self.assertRegex(
-            page, r"log\('[^']*电源键[^']*'\)",
-            "the page no longer tells the reader to power-cycle the device in the "
-            "log, which is where they are looking when the write finishes")
+            page, r"log\('[^']*重启[^']*'\)",
+            "the page no longer tells the reader to restart the device in the log, "
+            "which is where they are looking when the write finishes")
 
     def test_the_page_links_to_the_releases_it_mentions(self):
         """The log names Releases; the page has to offer a way to get there.
@@ -136,6 +147,30 @@ class PowerCycleStepTests(unittest.TestCase):
         self.assertRegex(
             page, r'href="[^"]*/releases"',
             "the page mentions Releases but nothing on it links there")
+
+    def test_esptool_output_is_not_forwarded_to_the_log(self):
+        """The library's own chatter stays out of the box the user reads.
+
+        Every line esptool writes -- fifty "Writing at 0x... (n%)" rows, the
+        chip-detection dump, the stub upload -- was piped straight into the log
+        by wiring `writeLine` to `log`. The result was a wall in which the two
+        lines meant for the reader were somewhere in the middle, and the
+        progress bar above already showed the same thing the percentages did.
+
+        A no-op sink rather than no terminal at all: without one, esptool falls
+        back to console.log, which is the same noise somewhere worse.
+        """
+        page = self._text("docs/flash/index.html")
+        body = re.sub(r"(?m)^\s*//.*$", "", page)
+        for wiring in (r"writeLine:\s*\([^)]*\)\s*=>\s*log",
+                       r"write:\s*\([^)]*\)\s*=>\s*log"):
+            with self.subTest(wiring=wiring):
+                self.assertNotRegex(
+                    body, wiring,
+                    "esptool's terminal is wired to log() again; its output will "
+                    "fill the box the reader is looking at")
+        self.assertIn("terminal: quiet", body,
+                      "the loader is no longer given a silent terminal")
 
     def test_the_log_does_not_report_the_write_twice(self):
         """One write, one line saying so.
