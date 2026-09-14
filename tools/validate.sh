@@ -84,6 +84,11 @@ run_static_checks() {
     # JavaScript reads and the names the server writes are connected by
     # nothing, so a typo in one is invisible until someone tries to use it.
     python3 tests/test_channel_config.py
+    # The flashing instructions, which are written down three times -- the page,
+    # the English README and the Chinese one -- and had drifted together onto a
+    # step that does not work on this hardware. Nothing connected the three, so
+    # this does.
+    python3 tests/test_flash_instructions.py
     # Certificate authorities on a machine that is not the build machine. The
     # same shape as the console problem above -- invisible where the code was
     # written, fatal in the hands of whoever downloaded it -- and this one was
