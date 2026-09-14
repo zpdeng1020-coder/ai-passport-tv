@@ -446,8 +446,17 @@ async function probeAll() {
   async function one(i) {
     const c = selected[i];
     try {
+      // `c.agent`, which is what the field is called everywhere else -- the
+      // playlist parser emits it, the table stores it, the saver writes it out.
+      // This line read `c.ua`, which is undefined on every channel, so the
+      // request always carried an empty user agent. That is not a small
+      // mistake here: a source that only answers a particular player refuses
+      // everyone else, the comment in channels.txt says so, and 22 of the
+      // entries in the table this was found in are like that. The check
+      // therefore reported working channels as dead, and the user -- who
+      // tested one and watched it play -- was right and the page was wrong.
       const r = await fetch('/probe?url=' + encodeURIComponent(c.url)
-                            + '&ua=' + encodeURIComponent(c.ua || ''));
+                            + '&ua=' + encodeURIComponent(c.agent || ''));
       const d = await r.json();
       health.set(i, d.state || (d.ok ? 'ok' : 'dead'));
     } catch {

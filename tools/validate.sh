@@ -79,6 +79,11 @@ run_static_checks() {
     # on macOS and Linux, where the console is already UTF-8, and fatal on
     # Windows at the first line the program prints.
     python3 tests/test_console.py
+    # The channel page, which had no tests until a user found that its
+    # availability check called working channels dead. The names the page's
+    # JavaScript reads and the names the server writes are connected by
+    # nothing, so a typo in one is invisible until someone tries to use it.
+    python3 tests/test_channel_config.py
     # Certificate authorities on a machine that is not the build machine. The
     # same shape as the console problem above -- invisible where the code was
     # written, fatal in the hands of whoever downloaded it -- and this one was
