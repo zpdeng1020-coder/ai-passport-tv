@@ -239,6 +239,11 @@ GRACEFUL_EXIT_TIMEOUT_S = 10
 WATCH_EXIT_TIMEOUT_S = 5
 
 
+# Whether a stop has already been asked for. Set by the first signal that means
+# "stop" and never cleared: the only thing that follows is this process ending.
+_stopping = False
+
+
 def _treat_as_interrupt(_signum, _frame) -> None:
     """Turn a termination signal into the same path Ctrl-C takes.
 
@@ -263,7 +268,24 @@ def _treat_as_interrupt(_signum, _frame) -> None:
     the handler in main catches it, prints one line, and the cleanup in the
     `finally` block runs with it. This is the documented way for a signal
     handler to leave the normal control flow intact.
+
+    Only the first one, though, and that is not a refinement. Closing a
+    terminal window delivers SIGHUP more than once -- measured, by closing a
+    window under a pty and watching what arrived -- and the second lands while
+    the cleanup is running. Raising from there is a KeyboardInterrupt thrown
+    inside the `except KeyboardInterrupt` that is already handling the first:
+    nothing catches it, so the user is shown a Python traceback in exchange for
+    having closed a window. The shutdown completed correctly throughout; the
+    stack was the only thing wrong, and it is the kind of wrong that leaves
+    someone thinking the program is broken.
+
+    A second request to stop is not a second thing to do. The decision has been
+    taken and is being carried out; repeating it can only interrupt that.
     """
+    global _stopping
+    if _stopping:
+        return
+    _stopping = True
     raise KeyboardInterrupt
 
 
@@ -545,6 +567,32 @@ class _Parser(argparse.ArgumentParser):
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Start everything, and never leave an exception as the last word.
+
+    A thin wrapper, because the signal handler raises KeyboardInterrupt and
+    only part of what follows is inside the block that catches it. Everything
+    before the children exist -- checking the Python version, fetching ffmpeg,
+    which can take half a minute -- runs outside it, so closing the window
+    during the download would print a traceback instead of stopping. That is
+    the same complaint as the double SIGHUP and the same fix in spirit: a
+    person ending the program should see a sentence, whatever stage it had
+    reached.
+
+    Nothing is cleaned up here. There are no children yet on the paths this
+    catches -- the ones that matter are wrapped where they are started -- and
+    inventing a second cleanup route would be a second thing to keep correct.
+    """
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:
+        # The same words the ordinary path uses, so the two cannot be told
+        # apart in a terminal -- which is the point: from outside, stopping
+        # early and stopping normally are the same event.
+        print("\n正在停止…", flush=True)
+        return 0
+
+
+def _main(argv: list[str] | None = None) -> int:
     parser = _Parser(description="启动媒体服务器和频道配置页。")
     parser.add_argument("--channel", default=None,
                         help="开机先打开哪个频道（默认用媒体服务器自带的频道）")
