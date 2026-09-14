@@ -96,7 +96,7 @@
 <ol class="steps">
   <li><strong>按住电源键约 2 秒关机，再按约 0.5 秒开机。</strong>设备内置电池，拔数据线不会重启它。不做这一步，屏幕是黑的。</li>
   <li>屏幕显示彩条和一个形如 <code>FoloToy-XXXX</code> 的网络名——说明它在等你配置。</li>
-  <li>电脑装好服务端，拿到要填的地址。见<a href="https://github.com/zpdeng1020-coder/ai-passport-tv#readme">项目说明</a>。</li>
+  <li>到<a href="https://github.com/zpdeng1020-coder/ai-passport-tv/releases">Releases 页面</a>下载服务端，在电脑上运行。它会显示一个地址，下一步要填。</li>
   <li>用手机连上那个网络，打开 <code>192.168.4.1</code>，填 WiFi 和服务器地址。</li>
 </ol>
 
@@ -245,18 +245,23 @@ button.addEventListener('click', async () => {
       reportProgress: (_i, written, total) => progress(written / total),
     });
     progress(1);
-    log('写入完成');
 
     // No reset call. loader.after() defaults to pulling the RTS line, which is
     // how an external USB-to-serial chip is wired; this device uses the
     // ESP32-C3's built-in USB peripheral (esptool product id 0x1001) and has no
     // such pin, so the call logs "Hard resetting via RTS pin..." and resets
-    // nothing. The method that works, usbJTAGSerialReset, is reachable only
-    // through esptool's internal constructResetSequence.
+    // nothing -- the device stays in download mode with a dark screen. The
+    // method that works, usbJTAGSerialReset, is reachable only through
+    // esptool's internal constructResetSequence.
     //
-    // Telling the reader what to do beats calling something that does nothing:
-    // the steps below say to switch the device off and on.
+    // So the reader is told instead. It belongs here rather than only in the
+    // steps above, because this is where they are looking: the log is the last
+    // thing that moved, and the moment flashing ends is the moment the next
+    // action is due. Leaving it unsaid produced exactly the confusion the
+    // steps above were rewritten to fix.
     log('写入完成。');
+    log('按住电源键约 2 秒关机，再按约 0.5 秒开机。');
+    log('接下来：电脑上还要装服务端，见项目 Releases 页面。');
     setBusy(false, '完成');
   } catch (error) {
     // Cancelling the port chooser is an ordinary thing to do, not a fault, and

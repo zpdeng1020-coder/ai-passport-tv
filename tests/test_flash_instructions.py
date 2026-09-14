@@ -108,6 +108,64 @@ class PowerCycleStepTests(unittest.TestCase):
                       "the setup flow no longer says the device restarts after the "
                       "credentials are saved, which it does")
 
+    def test_the_page_says_it_in_the_log_as_well(self):
+        """Where the reader is actually looking when it matters.
+
+        The section above the button is read before starting. The moment
+        flashing ends, the thing that has just moved is the log, and that is
+        where the next action is due. Saying it only in the steps was the
+        original shape of this bug: correct advice, in a place nobody reads at
+        the moment they need it.
+        """
+        page = self._text("docs/flash/index.html")
+        self.assertRegex(
+            page, r"log\('[^']*电源键[^']*'\)",
+            "the page no longer tells the reader to power-cycle the device in the "
+            "log, which is where they are looking when the write finishes")
+
+    def test_the_page_links_to_the_releases_it_mentions(self):
+        """The log names Releases; the page has to offer a way to get there.
+
+        Text in a log box cannot be clicked, so telling the reader to visit a
+        page without giving them a link -- on the one page they are already
+        looking at -- leaves them to retype a URL they have only seen as prose.
+        The instruction and the affordance have to be in the same place.
+        """
+        page = self._text("docs/flash/index.html")
+        self.assertIn("Releases", page)
+        self.assertRegex(
+            page, r'href="[^"]*/releases"',
+            "the page mentions Releases but nothing on it links there")
+
+    def test_the_log_does_not_report_the_write_twice(self):
+        """One write, one line saying so.
+
+        It said "写入完成" twice -- once before the reset call and once after --
+        which reads as two writes having happened. Found by a user reading their
+        own flash log.
+        """
+        page = self._text("docs/flash/index.html")
+        body = re.sub(r"(?m)^\s*//.*$", "", page)
+        self.assertEqual(
+            body.count("log('写入完成"), 1,
+            "the log reports the write finishing more than once")
+
+    def test_every_log_line_is_a_single_sentence(self):
+        """A log is read at a glance while waiting, not studied.
+
+        Not a style rule for its own sake: the failure this file exists for was
+        a log that said something untrue, and the way it survived was being
+        plausible enough to skim past. Short lines are what make skimming work.
+        """
+        page = self._text("docs/flash/index.html")
+        for match in re.finditer(r"log\('([^']*)'", page):
+            line = match.group(1)
+            with self.subTest(line=line):
+                self.assertLessEqual(
+                    len(line), 60,
+                    f"this log line is {len(line)} characters; it is read at a "
+                    f"glance while the reader waits, not studied")
+
     def test_the_page_does_not_run_a_reset_that_cannot_work(self):
         """`loader.after()` defaults to a reset this hardware ignores.
 
