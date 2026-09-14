@@ -542,6 +542,41 @@ class AVServer:
             send_packet(connection, Packet(Kind.END, session, seq, self.duration_ms))
 
 
+def print_where_to_connect(bind: str, port: int, token: bytes | None) -> None:
+    """The last thing printed before serving: the address, then the caveats.
+
+    Together because they are one block and their order is the whole point of
+    it. This lived inline in two branches, which is why the third line below
+    was easy to leave out of both.
+
+    The first line is the address to type on the device, and it is the one
+    value the reader has to carry across by hand -- an address typed with a
+    mistake looks exactly like a server that is not running.
+
+    Then the two things worth knowing that the address itself does not say.
+    Both come after it, because both are caveats and a caveat printed ahead of
+    the instruction delays the thing the reader opened the window to find.
+    """
+    for line in netident.describe(bind, port):
+        print(line, flush=True)
+
+    # Whether anything on this network can watch, which is about their network
+    # rather than about a setting. Whoever wants a token will look for how, and
+    # everyone else has just been told something true.
+    if token is None:
+        print("提示：本网络上的其他设备也能收看这台电脑转发的频道。", flush=True)
+
+    # And that closing this window ends the stream. It is not obvious, it costs
+    # the reader a television picture to get wrong, and there was nothing
+    # anywhere that said it -- the window looks like a log, and a log is
+    # something you close when you have finished reading it.
+    #
+    # A black screen on the device and a window that was tidied away are two
+    # events a person has no reason to connect. Saying it here costs one line
+    # and is the only place it can be said while the reader is still looking.
+    print("提示：关掉这个窗口，服务就停止了，电视会中断。", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -613,20 +648,9 @@ def main(argv: list[str] | None = None) -> int:
             # state: the reader never chose ch000 and cannot act on the number.
             # What they need is the address below, and it was competing with
             # this for attention.
-            # What to type on the device, printed rather than left to be looked
-            # up. This is the one value the reader has to carry across by hand,
-            # and it is the step people get wrong -- an address typed with a
-            # mistake looks identical to a server that is not running.
-            for line in netident.describe(args.bind, args.port):
-                print(line, flush=True)
-            # After the address, not before it. This is a caveat, and a caveat
-            # printed ahead of the instruction delays the one thing the reader
-            # opened the window to find. One line, and about what it means
-            # rather than the name of a setting: whoever wants a token will look
-            # for how, and everyone else has just been told something true about
-            # their own network.
-            if token is None:
-                print("提示：本网络上的其他设备也能收看这台电脑转发的频道。", flush=True)
+            # What to type on the device, then the two things the address does
+            # not say. See print_where_to_connect.
+            print_where_to_connect(args.bind, args.port, token)
             server.serve()
             # Was "Stopped: completed=0, failed=0, rejected=0, dropped_video=0."
             # -- four counters that mean nothing to whoever just pressed Ctrl-C,
@@ -650,8 +674,7 @@ def main(argv: list[str] | None = None) -> int:
                           args.duration_seconds * 1000, logger=lambda message: print(message, flush=True))
         for signum in (signal.SIGINT, signal.SIGTERM):
             signal.signal(signum, lambda *_: server.stop.set())
-        for line in netident.describe(args.bind, args.port):
-            print(line, flush=True)
+        print_where_to_connect(args.bind, args.port, token)
         server.serve()
         if server.failed or server.rejected or server.dropped_video:
             print(f"已停止：正常结束 {server.completed} 次，出错 {server.failed} 次，"
