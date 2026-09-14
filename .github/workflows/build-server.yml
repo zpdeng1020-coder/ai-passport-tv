@@ -166,9 +166,13 @@ jobs:
             New-NetFirewallRule -DisplayName "AI Passport TV" -Direction Inbound -Protocol TCP -LocalPort 8096 -Action Allow -Profile Private
             ```
 
-            **Mac 上双击提示"来自身份不明的开发者"**
+            **Mac 上双击被拦下：「未打开"tv-server-macos-arm64"」**
 
-            不是文件坏了——本项目没有购买代码签名证书，系统认不出来。右键点这个文件，选"打开"，再确认一次即可。
+            不是文件坏了——本项目没有购买代码签名证书，系统认不出来。按这三步走：
+
+            1. 点 **完成**。**不要点「移到废纸篓」**，那是把程序删掉。
+            2. 打开 **系统设置 → 隐私与安全性**，往下滑，找到「已阻止"tv-server-macos-arm64"以保护 Mac」。
+            3. 点 **仍要打开**，再确认一次。
 
             **换台要等几秒**
 

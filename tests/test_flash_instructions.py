@@ -223,5 +223,86 @@ class PowerCycleStepTests(unittest.TestCase):
         self.assertIn("会自己重启", text)
 
 
+class MacGatekeeperTests(unittest.TestCase):
+    """Getting past macOS's block, which is three steps and easy to get wrong.
+
+    The advice here was "right-click the file, choose Open, and confirm once".
+    That was correct for older versions of macOS and is not any more: on
+    macOS 15 double-clicking an unsigned program raises a two-button dialog
+    whose right-hand button deletes the program, and the way through is
+    Settings → Privacy & Security → Open Anyway.
+
+    Which makes the wrong advice worse than useless. Someone told to look for
+    "Open" in a right-click menu finds nothing, and the dialog in front of them
+    offers exactly one prominent button -- the one that throws the download
+    away. Reported by a user who hit it.
+
+    Both READMEs and both release bodies, because the same paragraph is written
+    four times and they have to agree.
+    """
+
+    PLACES = (
+        "README.zh_CN.md",
+        "README.md",
+        ".github/workflows/build-server.yml",
+        ".github/workflows/build-firmware.yml",
+    )
+
+    # The step that was missing, and the one that sends the reader the wrong way.
+    REQUIREMENTS = {
+        "Privacy & Security": "隐私与安全性",
+        "Open Anyway": "仍要打开",
+        "Move to Trash": "废纸篓",
+    }
+
+    def test_every_copy_says_where_the_way_through_is(self):
+        for place in self.PLACES:
+            text = (ROOT / place).read_text(encoding="utf-8")
+            with self.subTest(place=place):
+                for english, chinese in self.REQUIREMENTS.items():
+                    self.assertTrue(
+                        english in text or chinese in text,
+                        f"{place} no longer tells the Mac user where to allow the "
+                        f"program; the dialog in front of them offers Move to Trash "
+                        f"and no way through")
+
+    def test_none_of_them_says_right_click_and_open(self):
+        """The instruction that no longer matches the system.
+
+        Checked as a phrase rather than as words, because "right-click" appears
+        legitimately elsewhere in the repository for other purposes.
+        """
+        for place in self.PLACES:
+            text = (ROOT / place).read_text(encoding="utf-8")
+            with self.subTest(place=place):
+                self.assertNotIn(
+                    "右键点这个文件，选", text,
+                    f"{place} still tells the Mac user to right-click and choose "
+                    f"Open; that menu does not offer it on macOS 15, and the dialog "
+                    f"that does appear has a button that deletes the program")
+                self.assertNotIn(
+                    'right-click the file, choose "Open"', text,
+                    f"{place} still carries the right-click instruction")
+
+    def test_the_two_release_bodies_are_identical(self):
+        """Both workflows publish the same release; whichever runs second wins.
+
+        They must therefore say the same thing, and the way they drift is one
+        being edited and the other not -- which is what nearly happened here.
+        """
+        import re as _re
+
+        def body_of(name: str) -> str:
+            text = (ROOT / name).read_text(encoding="utf-8")
+            match = _re.search(r"^\s*body: \|\n(.*?)^\s*files:", text, _re.S | _re.M)
+            return _re.sub(r"^ {12}", "", match.group(1), flags=_re.M).rstrip()
+
+        self.assertEqual(
+            body_of(".github/workflows/build-server.yml"),
+            body_of(".github/workflows/build-firmware.yml"),
+            "the two release bodies differ; the job that runs second rewrites the "
+            "release, so one of them is wrong and nobody would know which")
+
+
 if __name__ == "__main__":
     unittest.main()

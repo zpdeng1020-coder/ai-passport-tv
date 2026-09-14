@@ -84,10 +84,15 @@ The Mac and Linux downloads are archives -- **unzip them before running**. The a
 
 Put it in an empty folder and double-click it. **Nothing needs to be installed first** — the first run fetches the video converter it needs (about 21–31 MB, once, and never again).
 
-The first time you open it, the system may stop you with a warning that the file is from an unidentified developer. That is not a sign of a damaged file: this project has no code-signing certificate, so the system cannot identify it. To get past it:
+The first time you open it, the system stops it. That is not a sign of a damaged file: this project has no code-signing certificate, so the system cannot identify it. To get past it:
 
-- **Windows**: click "More info", then "Run anyway"
-- **macOS**: right-click the file, choose "Open", and confirm once
+**Windows**: click "More info", then "Run anyway".
+
+**macOS**: a dialog appears saying "tv-server-macos-arm64" was not opened. The buttons are in your system language; the labels below are the English ones, and the left-hand and right-hand buttons are the same two whichever language they are in.
+
+1. Click the **left-hand** of the two buttons ("Done"). **Do not click the right-hand one** ("Move to Trash"): that deletes the program, it does not get past the block.
+2. Open **System Settings → Privacy & Security**, scroll down, and find the entry saying "tv-server-macos-arm64" was blocked to protect the Mac.
+3. Click **Open Anyway** — the only button on that row — and confirm once.
 
 You only have to do this the first time; after that it opens normally.
 
