@@ -82,7 +82,7 @@
 <ol class="steps">
   <li>用数据线把设备连到这台电脑。</li>
   <li>确认浏览器是 <strong>Chrome</strong> 或 <strong>Edge</strong>（Safari 和 Firefox 不支持，手机浏览器也不支持）。</li>
-  <li>设备需要处在<strong>可刷写状态</strong>才会出现在下面的列表里。设备能正常开机时，它会自己进入这个状态——直接插线即可。如果它开不了机、或者之前刷坏过，那就先按住某一枚按键再开机；<em>试哪一枚我们说不准</em>，这台设备的三个键走到同一个电阻梯上，规格里也没有单列刷写键。三枚都试一遍，多花不了半分钟。</li>
+  <li>设备要处在<strong>可刷写状态</strong>才会出现在列表里。能正常开机时它就是这个状态；开不了机的话，按住一枚按键再开机试试。哪一枚我们没验证过，三枚都试一遍即可。</li>
 </ol>
 
 <h2>开始</h2>
@@ -94,7 +94,7 @@
 
 <h2>刷完之后</h2>
 <ol class="steps">
-  <li><strong>按住电源键约 2 秒关机，再按住约 0.5 秒开机。</strong>也可以先拔掉数据线——那道手续什么时候做都行，它只是断开充电。<em>但要紧的是这个开机动作</em>：设备内置电池，拔线不会让它重启；刷完之后它停在写入状态，屏幕是黑的，不重启的话看起来就像刷失败了。</li>
+  <li><strong>按住电源键约 2 秒关机，再按约 0.5 秒开机。</strong>设备内置电池，拔数据线不会重启它。不做这一步，屏幕是黑的。</li>
   <li>屏幕显示彩条和一个形如 <code>FoloToy-XXXX</code> 的网络名——说明它在等你配置。</li>
   <li>电脑装好服务端，拿到要填的地址。见<a href="https://github.com/zpdeng1020-coder/ai-passport-tv#readme">项目说明</a>。</li>
   <li>用手机连上那个网络，打开 <code>192.168.4.1</code>，填 WiFi 和服务器地址。</li>
@@ -247,24 +247,15 @@ button.addEventListener('click', async () => {
     progress(1);
     log('写入完成');
 
-    // No reset is attempted, and saying so is more useful than guessing.
+    // No reset call. loader.after() defaults to pulling the RTS line, which is
+    // how an external USB-to-serial chip is wired; this device uses the
+    // ESP32-C3's built-in USB peripheral (esptool product id 0x1001) and has no
+    // such pin, so the call logs "Hard resetting via RTS pin..." and resets
+    // nothing. The method that works, usbJTAGSerialReset, is reachable only
+    // through esptool's internal constructResetSequence.
     //
-    // `loader.after()` defaults to "hard_reset", which pulls the RTS line low
-    // and expects it to be wired to the chip's reset pin. That is how an
-    // external USB-to-serial chip works, and this device does not have one: it
-    // talks over the ESP32-C3's built-in USB peripheral, which esptool
-    // recognises by product id 0x1001. A line with no pin to pull does
-    // nothing. The method that does work on this hardware is
-    // `usbJTAGSerialReset`, reachable only through esptool's own
-    // constructResetSequence -- not through any parameter of after().
-    //
-    // It was left out rather than reached for through an internal API, and
-    // because it does not matter: unplugging the cable achieves the same thing
-    // and is the step the reader is about to take anyway. What did matter was
-    // the page claiming a restart had happened. It had not, and the sentence
-    // said so in the past tense about a device still sitting in download mode
-    // -- where the screen stays dark and looks, to anyone who does not know
-    // what download mode is, exactly like a failed flash.
+    // Telling the reader what to do beats calling something that does nothing:
+    // the steps below say to switch the device off and on.
     log('写入完成。');
     setBusy(false, '完成');
   } catch (error) {
@@ -278,7 +269,7 @@ button.addEventListener('click', async () => {
       // does not do what it says: there is a battery, so unplugging neither
       // resets the chip nor takes it out of download mode. The action that
       // works is the power button, the same one step one of 刷完之后 asks for.
-      log('设备没有被改动，或只写入了固件区域。按住电源键约 2 秒关机，再按住约 0.5 秒开机，然后重试。');
+      log('设备没有被改动，或只写入了固件区域。关机再开机后重试。');
     }
     setBusy(false, '重试');
   } finally {

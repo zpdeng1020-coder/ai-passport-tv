@@ -36,7 +36,7 @@ That explains a few things:
 3. Press the button and pick the device's serial port when asked
 4. **Hold the power button for about 2 seconds to switch off, then hold it for about half a second to switch on again**
 
-Step 4 is not optional. The device has a battery, so unplugging the cable only stops the charging and does not restart it; the chip is left in flash mode with a dark screen, which looks exactly like a failed write.
+The device has a battery, so unplugging the cable will not restart it. Skip step 4 and the screen stays dark.
 
 That page writes only the region the firmware occupies and **never erases the device**; it checks the write range itself and refuses to start if the range would reach the identity data.
 
