@@ -22,7 +22,10 @@ fixed CHANNELS table, the stream is not recorded, and no credentials are used.
 from __future__ import annotations
 
 import collections
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import json
 import os
 import queue
@@ -881,11 +884,12 @@ class LiveChannel:
             audio_r, audio_w = os.pipe()
             # On Linux, default anonymous pipe buffer is only 64KB (holding only
             # 1.1 frames of 320x180 RGB8 at 57.6KB). Expand to 1MB if OS supports it.
-            for fd in (video_r, video_w, audio_r, audio_w):
-                try:
-                    fcntl.fcntl(fd, 1031, 1048576)
-                except (AttributeError, OSError):
-                    pass
+            if fcntl is not None:
+                for fd in (video_r, video_w, audio_r, audio_w):
+                    try:
+                        fcntl.fcntl(fd, 1031, 1048576)
+                    except (AttributeError, OSError):
+                        pass
             for fd in (video_w, audio_w):
                 os.set_inheritable(fd, True)
             # stderr is a pipe rather than a file now, because the decoder's

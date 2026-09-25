@@ -50,7 +50,8 @@ class LifecycleContractsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.ffmpeg = shutil.which("ffmpeg")
-        assert cls.ffmpeg, "ffmpeg must be available in PATH"
+        if not cls.ffmpeg:
+            raise unittest.SkipTest("ffmpeg must be available in PATH")
 
     def test_real_ffmpeg_start_then_close(self):
         """Real FFmpeg starts, feeds, and close() cleanly reaps the child."""
