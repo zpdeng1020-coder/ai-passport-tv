@@ -19,6 +19,25 @@
 #define WIFI_EVENT_SCAN_DONE_BIT BIT2
 #define MAX_RECONNECT_COUNT 5
 
+// Whether to pin to one access point, read fresh each time it is asked for.
+//
+// It used to be read once in the constructor, and that made the setting depend
+// on something outside its own control: the constructor runs inside
+// WifiManager::Initialize(), which is also the first thing that initializes
+// NVS, so there is no point in the application's own startup where the value
+// can be written and be seen. Reading it here means a value stored at any time
+// takes effect at the next connect instead of waiting for a reboot.
+bool WifiStation::RememberBssid() {
+    uint8_t value = 0;
+    nvs_handle_t nvs;
+    if (nvs_open("wifi", NVS_READONLY, &nvs) != ESP_OK) {
+        return false;
+    }
+    nvs_get_u8(nvs, "remember_bssid", &value);
+    nvs_close(nvs);
+    return value != 0;
+}
+
 WifiStation::WifiStation() {
     // Create the event group
     event_group_ = xEventGroupCreate();
@@ -28,15 +47,10 @@ WifiStation::WifiStation() {
     esp_err_t err = nvs_open("wifi", NVS_READONLY, &nvs);
     if (err != ESP_OK) {
         max_tx_power_ = 0;
-        remember_bssid_ = 0;
     } else {
         err = nvs_get_i8(nvs, "max_tx_power", &max_tx_power_);
         if (err != ESP_OK) {
             max_tx_power_ = 0;
-        }
-        err = nvs_get_u8(nvs, "remember_bssid", &remember_bssid_);
-        if (err != ESP_OK) {
-            remember_bssid_ = 0;
         }
         nvs_close(nvs);
     }
@@ -306,7 +320,7 @@ void WifiStation::StartConnect() {
         wifi_config.sta.channel = ap_record.channel;
     }
 
-    if (remember_bssid_) {
+    if (RememberBssid()) {
         // Explicit opt-in: pin to this exact AP (BSSID + channel) for the fastest
         // reconnect. This intentionally disables roaming between same-SSID APs.
         memcpy(wifi_config.sta.bssid, ap_record.bssid, 6);

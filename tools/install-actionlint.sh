@@ -49,12 +49,17 @@ if ! curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
     gh release download "v${version}" --repo rhysd/actionlint \
         --pattern "${archive_name}" --dir "${destination}"
 fi
-if command -v sha256sum >/dev/null 2>&1; then
-    printf '%s  %s\n' "${checksum}" "${archive_path}" | sha256sum --check --status
-elif command -v shasum >/dev/null 2>&1; then
+# shasum first, and sha256sum only as the fallback. macOS ships a sha256sum in
+# /sbin that exists, answers `command -v`, and then rejects every option it is
+# given -- "usage: sha256sum [-bctwz] [files ...]" and nothing else, `--check`
+# included. Testing for the command is therefore not enough to know it can do
+# the job, and the version that works everywhere is the one to prefer.
+if command -v shasum >/dev/null 2>&1; then
     [[ "$(shasum -a 256 "${archive_path}" | awk '{print $1}')" == "${checksum}" ]]
+elif printf '%s  %s\n' "${checksum}" "${archive_path}" | sha256sum --check --status 2>/dev/null; then
+    :
 else
-    echo "No SHA-256 verification tool is available" >&2
+    echo "No usable SHA-256 verification tool is available" >&2
     exit 1
 fi
 tar -xzf "${archive_path}" -C "${destination}" actionlint

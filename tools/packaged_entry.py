@@ -81,7 +81,10 @@ from tools.subcommands import CERTS_COMMAND, CONFIG_COMMAND, MEDIA_COMMAND  # no
 
 # Named in packaging/tv-server.spec's hiddenimports, and imported here only as
 # the names are actually needed -- see _load_server_modules below.
-SERVER_MODULES = ("tv_server", "live", "media", "netident", "protocol")
+SERVER_MODULES = (
+    "tv_server", "live", "live_sender", "media", "netident", "protocol",
+    "pts", "rate", "timeline", "usb_link",
+)
 
 
 def _load_server_modules():

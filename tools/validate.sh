@@ -59,6 +59,13 @@ run_static_checks() {
         tests/test_av_provision_policy.c main/av_provision_policy.c \
         -o "${test_dir}/test_av_provision_policy"
     "${test_dir}/test_av_provision_policy"
+    # When to give up on a channel. Pure logic, and both answers look the same
+    # on a device: a channel abandoned while it was merely stuttering reads
+    # exactly like a channel whose source has gone down.
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_av_channel_policy.c main/av_channel_policy.c \
+        -o "${test_dir}/test_av_channel_policy"
+    "${test_dir}/test_av_channel_policy"
     python3 tests/test_verify_firmware.py
     python3 tests/test_tv_server.py
     python3 tests/test_video_import.py
@@ -97,6 +104,28 @@ run_static_checks() {
     # Live transcoding and the device/server CONFIG contract. Networked cases
     # skip themselves unless AV_LIVE_TEST=1, so this stays offline by default.
     python3 tests/test_live_transcode.py
+    # **Everything else in tests/ that Python can run, discovered rather than
+    # listed.**
+    #
+    # The list above is explicit and that is how it came to be incomplete: two
+    # files added in the last two rounds -- test_config_agreement.py and
+    # test_timeline.py -- were never run by this gate, while a person running
+    # `unittest discover` saw them pass and reported them as covered. An
+    # external review caught it. A test that the gate does not run is a test
+    # that will silently rot, and the failure mode is the worst kind: the
+    # person who added it believes it is protecting something.
+    #
+    # Discovery is additive on purpose. The explicit lines above stay, because
+    # each carries the note explaining what it protects; this only ensures
+    # nothing is *missing*. `discover` would run them all anyway, but the
+    # per-file comments are worth keeping and the duplication costs a second.
+    python3 -m unittest discover -s tests -p 'test_*.py' -q
+    # Whether the firmware would accept the CONFIG this server sends, field by
+    # field. The device ends the session on any mismatch, and the symptom -- a
+    # device that connects and drops within a second sending nothing -- reads as
+    # a network fault rather than as a rejected configuration. It cost an
+    # evening. Nothing else connects these two files, so this does.
+    python3 tools/check_config_agreement.py
     rm -rf "${test_dir}"
     echo "Host tests: PASS"
 }

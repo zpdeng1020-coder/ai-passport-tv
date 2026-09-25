@@ -27,6 +27,24 @@ esp_err_t bsp_display_raw_submit(int y, int rows, const void *rgb565_be, uint32_
 esp_err_t bsp_display_raw_wait(uint32_t timeout_ms);
 esp_err_t bsp_display_raw_release(void);
 bool bsp_display_raw_active(void);
+
+// Start a transfer without waiting for the one before it, and wait for several
+// at once. Only the measurement build uses these; submit()/wait() above are the
+// product's pair and are unchanged.
+//
+// They exist because submit() waits for any outstanding transfer first, which
+// makes the panel strictly serial with whatever the caller does between
+// stripes -- and the bus is not the reason. `trans_queue_depth` is 10, so the
+// controller will hold ten transfers; the serialisation is this driver
+// tracking exactly one (`s_raw_pending`, one binary semaphore). Until that is
+// measured, "a second stripe buffer did not help" cannot be told apart from
+// "a second stripe buffer could not help here", and the two want opposite
+// decisions.
+//
+// The caller owns the ordering and must not overwrite a buffer until drain()
+// has accounted for the transfer that read it.
+esp_err_t bsp_display_raw_submit_nowait(int y, int rows, const void *rgb565_be);
+esp_err_t bsp_display_raw_drain(unsigned transfers, uint32_t timeout_ms);
 // Internal LVGL ownership guard (initialization only; not concurrent calls).
 bool bsp_display_lvgl_claim(void);
 void bsp_display_lvgl_unclaim(void);

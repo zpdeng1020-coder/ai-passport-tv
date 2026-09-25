@@ -150,6 +150,40 @@ bool av_provision_init(bool *has_stored_network)
     }
     manager.SetEventCallback(handle_event);
 
+    // Stay on one access point rather than roaming between the two boxes that
+    // carry this network's name.
+    //
+    // The house has a mesh, so a scan finds one SSID advertised by two access
+    // points and the device is free to move between them. Moving means leaving
+    // and rejoining, and a video stream does not survive that: measured before
+    // this was set, the signal swung between -29 and -68 dBm inside a minute and
+    // the link carried about 35 kB/s while reporting -30 dBm, two orders of
+    // magnitude below what that signal should support. The tell was jitter
+    // larger than the average latency, which is what a client that keeps
+    // changing its mind looks like from the outside.
+    //
+    // Written here because this is the first point at which NVS exists: the
+    // component initializes it inside Initialize() above. The component reads
+    // the key when it connects rather than when it is constructed, so setting it
+    // once is enough and it is re-read on every reconnect.
+    //
+    // The write is best-effort. A device that cannot store it still plays; it
+    // only loses the protection against roaming.
+    {
+        nvs_handle_t nvs;
+        if (nvs_open("wifi", NVS_READWRITE, &nvs) == ESP_OK) {
+            esp_err_t err = nvs_set_u8(nvs, "remember_bssid", 1);
+            if (err == ESP_OK) {
+                err = nvs_commit(nvs);
+            }
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Could not pin the access point: %s",
+                         esp_err_to_name(err));
+            }
+            nvs_close(nvs);
+        }
+    }
+
     // Credentials that were compiled into this build are the local fallback.
     // They are written into the same store the setup page writes to, so there is
     // one place a network is kept and one code path that reads it. A build

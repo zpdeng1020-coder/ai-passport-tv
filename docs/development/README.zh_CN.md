@@ -15,6 +15,14 @@
 - 可以由 lint、测试或脚本强制的要求，应同时落实到自动化检查，不能只靠 agent 阅读文字。
 - 新增规约时在本文件更新索引。
 
+## 项目状态
+
+- [state-20260916.zh_CN.md](state-20260916.zh_CN.md)：**先读这个。**已修什么、坏着什么、量到了什么、什么还没有结论，以及下一步的顺序。动手改代码之前先拿它跟代码核对。
+- [metrics-dictionary.zh_CN.md](metrics-dictionary.zh_CN.md)：两端每个计数器到底在数什么，以及不能把它读成什么。
+
+
+- [state-20260916.zh_CN.md](state-20260916.zh_CN.md)：**先读这个。**已修什么、坏着什么、量到了什么、什么还没有结论，以及下一步的顺序。动手改代码之前先拿它跟代码核对。
+
 ## AI 工作流
 
 - [ai-guide.zh_CN.md](ai-guide.zh_CN.md)：AI 开发工作流（面向 AI 编程助手：上下文建立、需求拆解、BSP 边界、验收交付格式）。
@@ -37,3 +45,5 @@
 - [publish-to-community.zh_CN.md](release/publish-to-community.zh_CN.md)：发布到社区说明（把当前固件发布到 AI Passport 社区市场）。
 - [project-completion.zh_CN.md](release/project-completion.zh_CN.md)：项目开发完成流程说明（一组可选收尾动作）。
 - [file-issues.zh_CN.md](release/file-issues.zh_CN.md)：提交 issue 说明（把建议作为上游 GitHub issue 提交）。
+
+- [直播发送引擎 v2 候选版：操作、边界与验证](live-sender-v2.zh_CN.md)

@@ -4,11 +4,48 @@ CONFIG_AV_RAW_PROTOTYPE=y
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # 160MHz CPU; smaller bounded Wi-Fi pools leave room for two JPEG buffers.
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+# The receive pool has to be at least as large as the window the device
+# advertises, or the sender is allowed to put more on the air than the receiver
+# can hold and the surplus is dropped in the driver.
+#
+# Measured with the pool at 4+8 buffers (19200 bytes) against a 32768-byte
+# window: the server sent 150 data segments and 22 were lost, the congestion
+# window collapsed to a single segment and the retransmission timer backed off
+# to 26 seconds. A write that was given a 250 ms deadline could therefore never
+# complete, and every session ended part way through one packet -- which reads
+# from outside as "the picture is too heavy for this link" rather than as loss.
+# The socket's own counters said otherwise: rwnd_limited for 98.8% of the time.
+#
+# Sized to cover the window with room for management traffic, and no larger.
+# Each static buffer is 1600 bytes of DMA-capable internal RAM, which this chip
+# does not have to spare; the dynamic ones come from the heap as they are
+# needed, so raising that number costs nothing while the link is idle.
+#
+# Doubling this to 32 was tried on 2026-09-15 for the audio the device was
+# losing while the picture ran, on the theory that the extra would cover the
+# stretches when nothing drains the socket. It made no difference at all --
+# 7 healthy intervals of 25 against 11 of 33 before -- and the reason is that
+# the loss is not a shortage of storage. It is that no task was reading: the
+# receiver sat below the video task and did not run during an inflate. That is
+# fixed in the task priorities, and the pool is back to the figure that was
+# measured to work.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
 CONFIG_ESP_WIFI_RX_BA_WIN=4
 CONFIG_I2S_ISR_IRAM_SAFE=y
 
 # 让看门狗报警时能打印完整调用栈，否则只有寄存器无从定位
 CONFIG_ESP_SYSTEM_USE_FRAME_POINTER=y
+
+# Screen capture: OFF.
+#
+# It was left on after the colour investigation, which means every measurement
+# taken since was taken on a build carrying a diagnostic. The cost is not small
+# and it lands at the worst moment: sixty frames into a session it allocates
+# 9600 bytes and prints sixty lines of hex -- about 10 KB, which at 115200 baud
+# blocks the device for roughly 0.9 s. That is the first six seconds of playback
+# and the stretch where a session is most likely to be lost.
+#
+# Turn it on with -DCONFIG_AV_SCREEN_CAPTURE=y when a capture is actually wanted.
+CONFIG_AV_SCREEN_CAPTURE=n

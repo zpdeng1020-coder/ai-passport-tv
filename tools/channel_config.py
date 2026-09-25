@@ -75,10 +75,10 @@ TV_CHANNEL_ID_MAX = 16
 TV_CONTROL_MAX = 7168
 FOLLOW_TIMEOUT_S = 20
 MAX_PLAYLIST_BYTES = 4 * 1024 * 1024
-# `http-user-agent="..."` on an #EXTINF line. Quoted with either kind of quote;
-# the value is taken verbatim, since a User-Agent is sent as-is and mangling it
-# is the same as sending none.
-USER_AGENT_RE = re.compile(r"""http-user-agent\s*=\s*["']([^"']*)["']""")
+DEFAULT_USER_AGENT = "AptvPlayer-UA"
+# `http-user-agent="..."` on an #EXTINF line or `#EXTVLCOPT:http-user-agent=...`.
+USER_AGENT_RE = re.compile(r"""http-user-agent\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+EXTVLCOPT_UA_RE = re.compile(r"""#EXTVLCOPT:http-user-agent\s*=\s*([^\r\n]*)""", re.IGNORECASE)
 # Where ffmpeg lives, and the two do-not-wait-past times used when checking a
 # channel.
 #
@@ -123,14 +123,13 @@ def parse_playlist(text: str) -> list[dict]:
             _, _, tail = line.partition(",")
             name = tail.strip() or "unnamed"
             pending = name
-            # The User-Agent is an attribute on this line, and for many
-            # community sources it is not optional: the address answers only to
-            # the player it was captured from and returns 403 to anything else.
-            # Read here because this is the only place it appears -- dropping it
-            # produces a channel that looks fine in every listing and plays
-            # nothing.
             match = USER_AGENT_RE.search(line)
             pending_agent = match.group(1) if match else ""
+            continue
+        if line.startswith("#EXTVLCOPT:http-user-agent"):
+            match = EXTVLCOPT_UA_RE.search(line)
+            if match:
+                pending_agent = match.group(1).strip()
             continue
         if line.startswith("#"):
             continue
@@ -216,6 +215,8 @@ def write_selection(entries: list[dict]) -> None:
         # channel that looks alive in every listing -- which is worse than a
         # channel that is obviously missing.
         agent = str(entry.get("agent", "")).strip()
+        if not agent and url.startswith(("http://", "https://")):
+            agent = DEFAULT_USER_AGENT
         if not name:
             raise ValueError(f"第 {index + 1} 项缺少频道名")
         if not url.startswith(("http://", "https://")):
@@ -658,7 +659,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "缺少 url 参数"}, 400)
             return
         url = values[0]
-        agent = parse_qs(query).get("ua", [""])[0]
+        raw_agent = parse_qs(query).get("ua", [""])[0]
+        agent = raw_agent or (DEFAULT_USER_AGENT if url.startswith(("http://", "https://")) else "")
         if not url.startswith(("http://", "https://")):
             self._json({"error": "地址无效"}, 400)
             return

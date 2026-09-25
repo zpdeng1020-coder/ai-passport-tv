@@ -22,11 +22,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from server.tv_server import (AVServer, TOKEN_ENV, authenticate, load_token,
                             local_ipv4)
-from server.media import (AUDIO_CHUNK_MS, AUDIO_LEAD_MS, FPS, FRAME_COUNT, HEIGHT,
-                          Media, START_DELAY_MS, VIDEO_LEAD_MS, WIDTH, prepare,
-                          schedule, synthetic_frame, validate_jpeg)
-from server.protocol import (HEADER, Kind, Packet, ProtocolError, json_bytes,
-                             json_object, receive_packet, send_packet)
+from server import frames
+from server.media import (AUDIO_BYTES, AUDIO_CHUNK_MS, AUDIO_LEAD_MS, DURATION_MS, FPS, FRAME_COUNT, HEIGHT, Media, START_DELAY_MS, VIDEO_LEAD_MS, WIDTH, prepare, schedule, synthetic_frame, validate_frame)
+from server.protocol import (HEADER, Kind, Packet, ProtocolError, VIDEO_MAX,
+                             json_bytes, json_object, receive_packet, send_packet)
+from server.rate import RateController
+from server.timeline import SessionClock
 
 # Synthetic test-only credential, never a deployment credential.
 TEST_TOKEN = b"host-test-only-not-a-real-secret"
@@ -45,21 +46,32 @@ def socket_pair():
         yield left, right
 
 
-def jpeg_metadata():
-    # Deliberately metadata-only fixture, not claimed as an entropy-decodable JPEG.
-    sof = b"\x08\x00\x78\x00\xa0\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01"
-    return b"\xff\xd8\xff\xc0" + struct.pack("!H", len(sof) + 2) + sof + b"\xff\xda\x00\x02\xff\xd9"
+def indexed_frame(fill=0):
+    """A frame of one index value: the smallest thing that is still a frame.
+
+    There is no header to forge and no marker to get wrong -- an indexed frame
+    is exactly one byte a pixel -- so a fixture is just the right number of
+    bytes, and a test that wants a different picture changes the byte.
+    """
+    return bytes((fill,)) * frames.FRAME_PIXELS
 
 
 class ProtocolTests(unittest.TestCase):
     def test_header_is_exact_network_order_24_bytes(self):
-        packet = Packet(Kind.PCM, 0x10203040, 2, 20, bytes(640))
+        packet = Packet(Kind.PCM, 0x10203040, 2, 20, bytes(AUDIO_BYTES))
         raw = packet.encode()
         self.assertEqual(HEADER.size, 24)
-        self.assertEqual(raw[:24], bytes.fromhex("464156310103000010203040000000020000001400000280"))
+        # The magic, the version, the kind, the reserved byte and the flags are
+        # literals because they are the wire format and must not drift. The
+        # length is built from the definition instead: writing it out as a
+        # constant makes this test fail whenever a payload size changes, which
+        # says nothing about whether the header is still in network order --
+        # the property it exists to check.
+        self.assertEqual(raw[:20], bytes.fromhex("4641563101030000102030400000000200000014"))
+        self.assertEqual(int.from_bytes(raw[20:24], "big"), AUDIO_BYTES)
 
     def test_fragmented_and_coalesced_stream(self):
-        packets = [hello(), Packet(Kind.PCM, 3, 1, 0, bytes(640)), Packet(Kind.END, 3, 2, 20)]
+        packets = [hello(), Packet(Kind.PCM, 3, 1, 0, bytes(AUDIO_BYTES)), Packet(Kind.END, 3, 2, 20)]
         raw = b"".join(packet.encode() for packet in packets)
         with socket_pair() as (sender, receiver):
             def fragment():
@@ -74,15 +86,30 @@ class ProtocolTests(unittest.TestCase):
                 thread.join()
 
     def test_rejects_invalid_headers_before_body(self):
+        # position 3 is the flags byte. The baseline kind is 4, which is the
+        # only kind allowed to carry a flag -- and only the value 1 -- so a
+        # flag on any other kind, or any other value, is refused before the
+        # body is read. A zero flag is the ordinary case and is not an error.
         baseline = [b"FAV1", 1, 4, 0, 1, 0, 0, 12]
-        for position, value in ((0, b"NOPE"), (1, 2), (2, 99), (3, 1),
-                                (7, 24577), (7, 0), (7, 0xFFFFFFFF)):
+        for position, value in ((0, b"NOPE"), (1, 2), (2, 99),
+                                (7, 24577), (7, 0xFFFFFFFF)):
             with self.subTest(position=position, value=value), socket_pair() as (sender, receiver):
                 fields = baseline.copy()
                 fields[position] = value
                 sender.sendall(HEADER.pack(*fields))
                 with self.assertRaises(ProtocolError):
                     receive_packet(receiver)
+        # A flag on a kind that has no flags is refused.
+        for kind in (2, 3, 5, 6):
+            with self.subTest(kind=kind), socket_pair() as (sender, receiver):
+                sender.sendall(HEADER.pack(b"FAV1", 1, kind, 1, 1, 0, 0, 0))
+                with self.assertRaises(ProtocolError):
+                    receive_packet(receiver)
+        # An undefined flag bit on video is refused too.
+        with socket_pair() as (sender, receiver):
+            sender.sendall(HEADER.pack(b"FAV1", 1, 4, 0x80, 1, 0, 0, 12))
+            with self.assertRaises(ProtocolError):
+                receive_packet(receiver)
         with socket_pair() as (sender, receiver):
             sender.sendall(HEADER.pack(b"FAV1", 1, 4, 0, 2, 0, 0, 10))
             with self.assertRaisesRegex(ProtocolError, "session"):
@@ -93,7 +120,7 @@ class ProtocolTests(unittest.TestCase):
         # channel list does not leave this test asserting the old boundary.
         from server.protocol import CONTROL_MAX, VIDEO_MAX
         for kind, length in ((Kind.HELLO, CONTROL_MAX), (Kind.CONFIG, CONTROL_MAX),
-                             (Kind.ERROR, CONTROL_MAX), (Kind.PCM, 640),
+                             (Kind.ERROR, CONTROL_MAX), (Kind.PCM, AUDIO_BYTES),
                              (Kind.JPEG, VIDEO_MAX), (Kind.END, 0)):
             Packet(kind, 1, 1, 1, bytes(length)).encode()
         for kind, length in ((Kind.HELLO, CONTROL_MAX + 1), (Kind.ERROR, 0),
@@ -148,7 +175,7 @@ class ProtocolTests(unittest.TestCase):
                 pass
             before = time.monotonic()
             with self.assertRaises(TimeoutError):
-                send_packet(sender, Packet(Kind.JPEG, 1, 1, 0, bytes(24576)), 0.04)
+                send_packet(sender, Packet(Kind.JPEG, 1, 1, 0, bytes(VIDEO_MAX)), 0.04)
             self.assertLess(time.monotonic() - before, 0.2)
 
 
@@ -244,7 +271,13 @@ class ScheduleTests(unittest.TestCase):
             self.assertGreaterEqual(due, last_due)
             self.assertGreater(pts, previous[kind])
             self.assertEqual(pts - due, AUDIO_LEAD_MS if kind == 3 else VIDEO_LEAD_MS)
-            self.assertEqual(index, counts[kind] % (FRAME_COUNT if kind == 4 else 500))
+            # The index is the slot's position within one loop of the media, so
+            # its period is the media's own length in chunks -- not a second's
+            # worth. Deriving it from the same constants the scheduler uses is
+            # what keeps this test about the schedule rather than about 20 ms.
+            audio_cycle = DURATION_MS // AUDIO_CHUNK_MS
+            self.assertEqual(
+                index, counts[kind] % (FRAME_COUNT if kind == 4 else audio_cycle))
             counts[kind] += 1
             previous[kind], last_due = pts, due
         self.assertEqual(counts, {3: audio_count, 4: video_count})
@@ -265,30 +298,34 @@ class ScheduleTests(unittest.TestCase):
                                 for _, k, pts, index in events))
         audio = sum(1 for _, k, _, _ in events if k == 3)
         video = sum(1 for _, k, _, _ in events if k == 4)
-        # Both streams run to the end of the 10100 ms window: one 20 ms chunk
-        # more than 10 s of audio, and the frame whose slot starts at 10000 ms.
-        self.assertEqual(audio, 10100 // AUDIO_CHUNK_MS)
+        # Both streams run to the end of the 10100 ms window: every chunk whose
+        # slot starts inside it, and the frame whose slot starts at 10000 ms.
+        # Rounded up rather than down, because the window is 10100 ms and the
+        # chunk is not a divisor of it -- a chunk starting at 10080 is inside.
+        self.assertEqual(audio, -(-10100 // AUDIO_CHUNK_MS))
         # A frame slot exists whenever its timestamp is under the window, so
         # count slots rather than scaling the window by the frame rate.
         self.assertEqual(video, sum(1 for i in range(10000)
                                     if i * 1000 // FPS < 10100))
 
-    def test_jpeg_metadata_boundary_validation(self):
-        raw = jpeg_metadata()
-        validate_jpeg(raw)
-        for invalid in (raw.replace(b"\xff\xc0", b"\xff\xc2"), raw[:-1],
-                        raw.replace(b"\x01\x22", b"\x01\x21"),
-                        raw.replace(b"\x00\x78\x00\xa0", b"\x00\xf0\x01\x40"),
-                        raw.replace(b"\x00\x78\x00\xa0", b"\x00\x79\x00\xa0"),
-                        raw.replace(b"\x00\x78\x00\xa0", b"\x00\x78\x00\xa1"),
-                        raw + bytes(24576)):
+    def test_frame_length_is_the_whole_validation(self):
+        """A frame is one byte a pixel; anything else is refused.
+
+        There is no structure to walk, so the length is the entire check -- and
+        it has to be exact, because a short frame would be drawn as a torn
+        picture rather than rejected somewhere downstream.
+        """
+        raw = indexed_frame(7)
+        validate_frame(raw)
+        for invalid in (raw[:-1], raw + bytes(1), bytes(frames.FRAME_PIXELS - 1),
+                        bytes(frames.FRAME_PIXELS + 1), b""):
             with self.assertRaises(ValueError):
-                validate_jpeg(invalid)
+                validate_frame(invalid)
 
 
 class LiveServerTests(unittest.TestCase):
     def setUp(self):
-        self.server = AVServer(Media(bytes(320000), (jpeg_metadata(),) * FRAME_COUNT),
+        self.server = AVServer(Media(bytes(320000), (indexed_frame(9),) * FRAME_COUNT),
                                TEST_TOKEN, port=0, duration_ms=250)
         self.errors = []
         def serve():
@@ -320,7 +357,9 @@ class LiveServerTests(unittest.TestCase):
         config_json = json_object(config.payload)
         self.assertEqual(config_json["session"], config.session)
         for key, value in {"width": WIDTH, "height": HEIGHT, "fps": FPS,
-                           "video_max_bytes": 24576, "sample_rate": 16000,
+                           "video_max_bytes": frames.VIDEO_MAX,
+                           "stripe_rows": frames.STRIPE_ROWS,
+                           "sample_rate": 16000,
                            "channels": 1, "sample_bits": 16,
                            "audio_chunk_ms": AUDIO_CHUNK_MS,
                            "start_delay_ms": START_DELAY_MS,
@@ -341,8 +380,19 @@ class LiveServerTests(unittest.TestCase):
         # because the first chunk starts at 0.
         self.assertEqual(sum(p.kind == Kind.PCM for p in packets),
                          sum(1 for i in range(1000) if i * AUDIO_CHUNK_MS < 250))
+        # One frame is several packets, so the count is the frame slots times
+        # the packets a frame takes. Derived from the frame that is actually
+        # streamed rather than from a constant: how many packets a frame needs
+        # depends on how well it compressed, which is a property of the picture
+        # and not of any number set in this repository.
+        frame_slots = sum(1 for i in range(1000) if i * 1000 // FPS < 250)
+        packets_per_frame = len(frames.frame_packets(indexed_frame(9)))
         self.assertEqual(sum(p.kind == Kind.JPEG for p in packets),
-                         sum(1 for i in range(1000) if i * 1000 // FPS < 250))
+                         frame_slots * packets_per_frame)
+        # Every packet of a frame but the first is marked as continuing it, and
+        # each frame starts a new one.
+        video = [p for p in packets if p.kind == Kind.JPEG]
+        self.assertEqual(sum(p.flags == 0 for p in video), frame_slots)
 
     def test_bad_authentication_never_receives_config(self):
         connection = self.connect()
@@ -418,8 +468,16 @@ class LiveServerTests(unittest.TestCase):
             send_packet(connection, hello())
             config = receive_packet(connection, 1)
             send_packet(connection, Packet(Kind.END, config.session, 1, 0))
-            connection.close()
+            # Let the END be read before dropping the connection, which is what
+            # the device does: it sends END and waits to be let go. Closing the
+            # instant after sending puts the END and the FIN in the same
+            # instant, and the server may then be part way through a frame --
+            # several writes now, not one -- and see the departure as a broken
+            # pipe rather than as the request it was. That race exists in the
+            # server too and is handled there; the test should not manufacture
+            # it five times over and then complain that the count is wrong.
             time.sleep(0.05)
+            connection.close()
 
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and self.server.completed < 5:
@@ -455,32 +513,129 @@ class PreparationTests(unittest.TestCase):
             media = prepare(destination)
             self.assertEqual(len(media.frames), FRAME_COUNT)
             self.assertEqual(len(media.pcm), 320000)
-            self.assertLessEqual(max(map(len, media.frames)), 24576)
+            # Every frame is exactly one byte a pixel; there is no quality to
+            # trade and no ceiling to stay under.
+            self.assertTrue(all(len(f) == frames.FRAME_PIXELS for f in media.frames))
             for second in range(10):
                 samples = struct.unpack("<16000h", media.pcm[second * 32000:(second + 1) * 32000])
                 self.assertGreater(max(abs(value) for value in samples[:800]), 2000)
                 self.assertEqual(max(abs(value) for value in samples[810:]), 0)
             self.assertEqual(media, Media.load(destination))
             manifest = json.loads((destination / "manifest.json").read_text())
-            self.assertEqual((manifest["width"], manifest["height"]), (160, 120))
+            self.assertEqual((manifest["width"], manifest["height"]),
+                             (frames.WIDTH, frames.HEIGHT))
             for index in range(FRAME_COUNT):
-                self.assertEqual(len(synthetic_frame(index)), 160 * 120 * 3)
-            decoded = subprocess.run(
-                ["ffmpeg", "-v", "error", "-i", str(destination / "frame-000.jpg"),
-                 "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
-                capture_output=True, check=True, timeout=20).stdout
-            self.assertEqual(len(decoded), 160 * 120 * 3)
-            manifest.update(width=320, height=240)
+                self.assertEqual(len(synthetic_frame(index)), frames.FRAME_PIXELS)
+            # The stored frame is what the device draws: indices, one a pixel.
+            stored = (destination / "frame-000.idx").read_bytes()
+            self.assertEqual(len(stored), frames.FRAME_PIXELS)
+            # Two different counts must differ on screen, or the generator is
+            # drawing the same picture every frame and the test is looking at
+            # something that would never move.
+            self.assertNotEqual(synthetic_frame(0), synthetic_frame(1))
+            manifest.update(width=16, height=16)
             (destination / "manifest.json").write_text(json.dumps(manifest))
             with self.assertRaises(ValueError):
                 Media.load(destination)
-            manifest.update(width=160, height=120)
+            manifest.update(width=frames.WIDTH, height=frames.HEIGHT)
             (destination / "manifest.json").write_text(json.dumps(manifest))
             with self.assertRaises(FileExistsError):
                 prepare(destination)
-            (destination / "frame-000.jpg").write_bytes(bytes(24577))
+            # A frame of the wrong length is refused at load, so a truncated
+            # file is an error rather than a torn picture on the panel.
+            (destination / "frame-000.idx").write_bytes(bytes(frames.FRAME_PIXELS + 1))
             with self.assertRaises(ValueError):
                 Media.load(destination)
+
+
+class WaitingForTheSoundTests(unittest.TestCase):
+    """What the send loop does while there is a picture queue but no frame due.
+
+    `pop_video()` answers "the frame whose content matches the sound at the head
+    of the queue", so on a channel whose decoder is behind the audio there are
+    passes with a non-empty video queue and nothing to send. That is a normal
+    state, and the loop has to keep doing everything else while it lasts: wait,
+    update the controller, and print its periodic report. The three are exactly
+    what notices a stream going wrong, and they were the three being skipped.
+
+    The defect this covers was found from outside with a controlled clock: 500
+    attempts to take a frame, and **zero** waits, zero controller updates and
+    zero reports over more than five seconds.
+    """
+
+    def test_no_frame_due_still_updates_the_controller_and_waits(self):
+        server = AVServer(Media(bytes(320000), (indexed_frame(9),) * FRAME_COUNT),
+                          TEST_TOKEN, port=0, duration_ms=250)
+        sent = []
+
+        class WaitingChannel:
+            """A picture queue that is never ready, and a sound that always is.
+
+            Frames are `pending` so the loop takes the `send_video` branch and
+            reaches `pop_video`; `pop_video` then answers None, which is the
+            state under test. Audio is held back so the branch that sends it is
+            not what keeps the loop busy.
+            """
+            video = [1, 2, 3]
+            audio = []
+            # The pop interface changed shape: a pop now answers with the
+            # payload AND the session timestamp it goes on the wire with, since
+            # the timestamp is decided where the item is chosen. A stub that
+            # still returned a bare payload would be exercising last round's
+            # sender.
+            session_clock = SessionClock(chunk_ms=AUDIO_CHUNK_MS)
+
+            def pop_video(self, keep=0):
+                return None
+
+            def video_pending(self):
+                return True
+
+            def audio_pending(self):
+                return False
+
+            def pop_audio(self):
+                return b"\x00" * AUDIO_BYTES, self.session_clock.audio(0.0)
+
+            def has_data(self):
+                return True
+
+            def failure(self):
+                return None
+
+            def picture_lag_s(self):
+                return 0.0
+
+            dropped_video = 0
+
+        server.stop = threading.Event()
+        observes = []
+        real_observe = RateController.observe
+
+        def counting_observe(controller, *args, **kwargs):
+            observes.append(1)
+            return real_observe(controller, *args, **kwargs)
+
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        left.setblocking(False)
+
+        def stop_after_a_while():
+            time.sleep(1.2)
+            server.stop.set()
+
+        threading.Thread(target=stop_after_a_while, daemon=True).start()
+        with patch.object(RateController, "observe", counting_observe):
+            started = time.monotonic()
+            server._pace_live(left, WaitingChannel(), 1)
+            elapsed = time.monotonic() - started
+        # The loop ran for the whole second and a bit rather than returning at
+        # once, so the wait is real and not a spin that falls out on the first
+        # pass.
+        self.assertGreater(elapsed, 1.0)
+        # And the controller was consulted, which is what was not happening.
+        self.assertGreaterEqual(len(observes), 1)
 
 
 if __name__ == "__main__":

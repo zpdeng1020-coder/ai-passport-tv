@@ -6,6 +6,10 @@ Turns a FoloToy AI Passport into a small network television. Three buttons on th
 
 As with the official firmware, the device's factory identity is preserved; flashing does not touch it.
 
+> ⚡ **Image Quality & Smoothness Upgrades & Compatibility Notice**:
+> - **Noticeably Improved Picture Quality & Smoothness**: Upgraded to 320×180 native 1:1 widescreen presentation, with 12kB dual-packet transmission, intelligent edge filtering, and adaptive streaming for sharper visuals, smoother playback, and greater resistance to network jitter.
+> - ⚠️ **Firmware and Server Must Be Updated Together**: The protocol and video pipeline have been completely upgraded in tandem. **After flashing the new firmware, you must download and run the matching new version of the server program.** Older server versions and new firmware are not compatible.
+
 ## What you need
 
 | Thing | Notes |
@@ -63,6 +67,8 @@ Or flash it by hand — same result:
    On macOS `<your serial port>` looks like `/dev/cu.usbmodem101`, on Windows like `COM3`, on Linux like `/dev/ttyUSB0`. List the serial ports before and after plugging the device in; the new one is it.
 
 > **Never use `erase-flash`.** The device holds factory-written identity data that cannot be recovered once erased. The command above writes from `0` to about `0x182000` (1.5 MB), while that identity data sits at `0x356000` — the distance between them is what makes it safe. `erase-flash` clears the whole chip, including that region.
+>
+> ⚠️ **Important Reminder**: After flashing the new firmware, be sure to download and run the **matching new version of the server program** in Step 2. The new firmware and older server versions are not compatible.
 
 ## Step 2: Start the service
 
@@ -191,9 +197,11 @@ The service is not running, or the address is wrong. Double-click ↑, then hold
 
 Look at the service window on the computer for an error. Streams do go dead — use the channel page's check button, or try another channel.
 
-**The screen flickers and the channel name jumps rapidly**
+**The device leaves a channel you were watching**
 
-The current channel has gone dead and the device is working through the list. It settles after a moment, or you can change channel by hand.
+It only does this to a channel that has never shown a picture since it was switched on — an entry that is dead rather than one having a bad moment. A channel that has played once stays where it is and keeps retrying, however long the stutter lasts. Pick it again from the channel list when you want it; if it plays, it is protected from then on.
+
+If a channel leaves and nothing better arrives, the streams in the list have gone stale. Use the channel page's check button to drop the dead ones.
 
 **The setup page will not open**
 

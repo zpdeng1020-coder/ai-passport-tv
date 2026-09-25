@@ -32,11 +32,22 @@ datas = [
 # "No module named 'server'" in the user's hands, not at build time.
 hiddenimports = [
     "server",
+    # The picture format: stripe cutting, compression, packet packing. Imported
+    # by live.py and media.py rather than by the entry point, so PyInstaller's
+    # analysis can miss it and the packaged server then dies at start-up on a
+    # machine with no Python on it.
+    "server.frames",
     "server.tv_server",
     "server.live",
+    "server.live_sender",
     "server.media",
     "server.netident",
     "server.protocol",
+    "server.pts",
+    "server.rate",
+    "server.timeline",
+    "server.usb_link",
+    "server.fault",
     "tools",
     "tools.certs",
     "tools.datadir",

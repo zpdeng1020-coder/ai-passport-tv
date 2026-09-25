@@ -6,6 +6,14 @@
 
 This directory contains AI Passport engineering rules and reusable workflows, grouped by purpose: the AI-assisted development workflow (`ai-guide.md`), engineering conventions (`engineering/`), CI documents (`ci/`), and the release/completion flow (`release/`). Rules should identify their trigger, required action, prohibited action, validation, and exceptions. Hardware facts belong in `docs/hardware-design/`; automatable requirements must also be enforced by tooling or CI.
 
+## Project state
+
+- [state-20260916.md](state-20260916.md): **read this first.** What is fixed, what is broken, what is measured, what is not established, and the next steps in order. Check it against the code before editing.
+- [metrics-dictionary.md](metrics-dictionary.md): what every counter on both ends actually counts, and what it must not be read as.
+
+
+- [state-20260916.md](state-20260916.md): **read this first.** What is fixed, what is broken, what is measured, what is not established, and the next steps in order. Check it against the code before editing.
+
 ## AI workflow
 
 - [ai-guide.md](ai-guide.md): AI-assisted development workflow.
@@ -28,3 +36,5 @@ This directory contains AI Passport engineering rules and reusable workflows, gr
 - [publish-to-community.md](release/publish-to-community.md): publishing firmware to the AI Passport community market.
 - [project-completion.md](release/project-completion.md): project completion flow — a menu of optional closing actions.
 - [file-issues.md](release/file-issues.md): filing a suggestion as an upstream GitHub issue.
+
+- [Live sender v2 candidate: operation, limits and validation](live-sender-v2.md)

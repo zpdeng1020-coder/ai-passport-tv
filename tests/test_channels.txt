@@ -1,0 +1,2 @@
+baseline | 基线测试 | http://192.168.123.185:8097/baseline_media_240s.mkv
+sync | 同步校准 | http://192.168.123.185:8097/sync_media_120s.mkv

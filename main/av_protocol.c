@@ -7,20 +7,32 @@ static void put32(uint8_t *p, uint32_t n) {
     p[0]=n>>24; p[1]=n>>16; p[2]=n>>8; p[3]=n;
 }
 bool av_header_decode(const uint8_t p[AV_HEADER_BYTES], av_header_t *h) {
-    if (!p || !h || memcmp(p,"FAV1",4) || p[4]!=1 || p[6] || p[7]) return false;
-    h->type=p[5]; h->session=get32(p+8); h->seq=get32(p+12);
+    // p[6] is the high half of the reserved field and stays zero. p[7] carries
+    // the flags, which only AV_VIDEO has any use for.
+    if (!p || !h || memcmp(p,"FAV1",4) || p[4]!=1 || p[6]) return false;
+    h->type=p[5]; h->flags=p[7]; h->session=get32(p+8); h->seq=get32(p+12);
     h->pts_ms=get32(p+16); h->length=get32(p+20);
     switch(h->type) {
     case AV_HELLO: case AV_CONFIG: case AV_ERROR:
+        if (h->flags) return false;
         return h->length>0 && h->length<=AV_CONTROL_MAX;
-    case AV_END: return h->length==0;
-    case AV_AUDIO: return h->length==AV_AUDIO_BYTES;
-    case AV_VIDEO: return h->length>0 && h->length<=AV_VIDEO_MAX;
+    case AV_END:
+        if (h->flags) return false;
+        return h->length==0;
+    case AV_AUDIO:
+        if (h->flags) return false;
+        return h->length==AV_AUDIO_BYTES;
+    case AV_PALETTE:
+        if (h->flags) return false;
+        return h->length==AV_PALETTE_BYTES;
+    case AV_VIDEO:
+        if (h->flags & ~AV_VIDEO_CONTINUES) return false;
+        return h->length>0 && h->length<=AV_VIDEO_MAX;
     default: return false;
     }
 }
 void av_header_encode(uint8_t p[AV_HEADER_BYTES], const av_header_t *h) {
-    memcpy(p,"FAV1",4); p[4]=1; p[5]=h->type; p[6]=p[7]=0;
+    memcpy(p,"FAV1",4); p[4]=1; p[5]=h->type; p[6]=0; p[7]=h->flags;
     put32(p+8,h->session); put32(p+12,h->seq);
     put32(p+16,h->pts_ms); put32(p+20,h->length);
 }
@@ -36,8 +48,23 @@ bool av_stream_accept(av_stream_t *s, const av_header_t *h) {
         if (h->pts_ms!=s->audio_next_pts || h->pts_ms>UINT32_MAX-AV_AUDIO_MS) return false;
         s->audio_seen=true; s->audio_next_pts=h->pts_ms+AV_AUDIO_MS; break;
     case AV_VIDEO:
-        if (s->video_seen && h->pts_ms<=s->video_pts) return false;
-        s->video_seen=true; s->video_pts=h->pts_ms; break;
+        // A frame cut across several packets sends them all under one
+        // timestamp, so only the packet that begins a frame moves the clock
+        // forward. A continuation is refused when no frame is under way: there
+        // would be nothing for it to continue, and accepting it would let a
+        // stream whose first packet was lost look like a valid one.
+        if (h->flags & AV_VIDEO_CONTINUES) {
+            if (!s->video_seen) return false;
+        } else {
+            if (s->video_seen && h->pts_ms<=s->video_pts) return false;
+            s->video_seen=true; s->video_pts=h->pts_ms;
+        }
+        break;
+    case AV_PALETTE:
+        // No timeline of its own; it takes its place in the sequence and
+        // nothing else. The server sends one before the first frame, and may
+        // send another at any point to retune the colours.
+        break;
     case AV_END: case AV_ERROR: s->ended=true; break;
     default: return false;
     }
@@ -85,33 +112,68 @@ bool av_channel_step(const char *const *ids, unsigned count, unsigned *index,
     *index = next;
     return true;
 }
-bool av_pack_rgb888_x2(uint8_t *stripe, unsigned sy, unsigned l, unsigned t,
-                       unsigned r, unsigned b, const uint8_t *rgb) {
-    if (!stripe || !rgb || sy%AV_STRIPE_ROWS || sy>=AV_HEIGHT || l>r || t>b ||
-        r>=AV_VIDEO_WIDTH || b>=AV_VIDEO_HEIGHT) return false;
-    unsigned first=sy/2, end=(sy+AV_STRIPE_ROWS)/2;
-    if (b<first || t>=end) return false;
-    if (first<t) first=t;
-    if (end>b+1) end=b+1;
-    // Skip whole source rows, NOT destination-width rows. This also handles
-    // the lower half of an MCU and the clipped 8-row MCU at source y=112.
-    rgb+=(size_t)(first-t)*(r-l+1)*3;
-    for (unsigned y=first;y<end;y++) for (unsigned x=l;x<=r;x++) {
-        uint16_t c=((uint16_t)(rgb[0]&0xf8)<<8) | ((uint16_t)(rgb[1]&0xfc)<<3) | (rgb[2]>>3);
-        size_t i=((y*2-sy)*AV_WIDTH+x*2)*2;
-        stripe[i]=stripe[i+2]=stripe[i+AV_WIDTH*2]=stripe[i+AV_WIDTH*2+2]=c>>8;
-        stripe[i+1]=stripe[i+3]=stripe[i+AV_WIDTH*2+1]=stripe[i+AV_WIDTH*2+3]=c;
-        rgb+=3;
+bool av_video_decode(const uint8_t *payload, size_t length, av_video_t *v) {
+    if (!payload || !v || length < 2u) return false;
+    unsigned first=payload[0], count=payload[1];
+    // count==0 is not "an empty packet", it is a payload that says nothing;
+    // refusing it keeps a stalled sender from looking like a silent one.
+    if (!count || count>AV_STRIPES_PER_PACKET) return false;
+    if (first>=AV_STRIPES || first+count>AV_STRIPES) return false;
+    size_t table=2u+2u*(size_t)count;
+    if (length<table) return false;
+    size_t total=0;
+    for (unsigned i=0;i<count;i++) {
+        total += ((size_t)payload[2+2*i]<<8) | (size_t)payload[3+2*i];
     }
+    // The lengths must account for the payload exactly. A short one would leave
+    // bytes nobody reads and a long one would run off the end; either way the
+    // frame being described is not the frame that was sent.
+    if (total!=length-table) return false;
+    v->first=first; v->count=count;
+    v->table=payload+2; v->data=payload+table; v->data_length=total;
     return true;
 }
-bool av_pack_rgb888(uint8_t *stripe, unsigned sy, unsigned l, unsigned t,
-                    unsigned r, unsigned b, const uint8_t *rgb) {
-    if (!stripe || !rgb || sy%16 || sy>=AV_HEIGHT || l>r || t>b ||
-        r>=AV_WIDTH || t<sy || b>=sy+16 || b>=AV_HEIGHT) return false;
-    for (unsigned y=t;y<=b;y++) for (unsigned x=l;x<=r;x++) {
-        uint16_t c=((uint16_t)(rgb[0]&0xf8)<<8) | ((uint16_t)(rgb[1]&0xfc)<<3) | (rgb[2]>>3);
-        size_t i=((y-sy)*AV_WIDTH+x)*2; stripe[i]=c>>8; stripe[i+1]=c; rgb+=3;
+bool av_video_stripe(const av_video_t *v, unsigned n,
+                     const uint8_t **data, size_t *length) {
+    if (!v || !data || !length || n>=v->count) return false;
+    // The table sits in the payload before the data, so the lengths are read
+    // from `table` and the bytes they describe from `data`. Reading them from
+    // `data` would take the first stripe's own first bytes as a length.
+    const uint8_t *table=v->table;
+    size_t at=0;
+    for (unsigned i=0;i<n;i++) {
+        at += ((size_t)table[2*i]<<8) | (size_t)table[2*i+1];
     }
-    return true;
+    if (at>v->data_length) return false;
+    *data=v->data+at;
+    *length=((size_t)table[2*n]<<8) | (size_t)table[2*n+1];
+    return *length<=v->data_length-at;
+}
+void av_palette_decode(const uint8_t raw[AV_PALETTE_BYTES],
+                       uint16_t out[AV_PALETTE_ENTRIES]) {
+    for (unsigned i=0;i<AV_PALETTE_ENTRIES;i++) {
+        out[i]=(uint16_t)(((uint16_t)raw[2*i]<<8) | raw[2*i+1]);
+    }
+}
+uint16_t av_palette_rgb565(uint8_t index) {
+    uint16_t r3=(index>>5)&0x7u, g3=(index>>2)&0x7u, b2=index&0x3u;
+    // Each field is replicated to fill its slot so that full scale in maps to
+    // full scale out: 3 bits into 5, 3 into 6, 2 into 5. Multiplying by 255/7
+    // instead would differ by one count in 220 of the 256 entries and then
+    // agree again once quantised to RGB565 -- checked against the palette read
+    // back out of ffmpeg, which matched for all 256. Shifts, not multiplies.
+    uint16_t r5=(uint16_t)((r3<<2)|(r3>>1));
+    uint16_t g6=(uint16_t)((g3<<3)|g3);
+    uint16_t b5=(uint16_t)((b2<<3)|(b2<<1)|(b2>>1));
+    return (uint16_t)((r5<<11)|(g6<<5)|b5);
+}
+void av_expand_indexed(uint8_t *buf, size_t pixels, const uint16_t *palette) {
+    // Backwards: see the note on the declaration. Walking forwards would
+    // overwrite the index at buf[1] on the very first step.
+    size_t i=pixels;
+    while (i-- > 0) {
+        uint16_t colour=palette[buf[i]];
+        buf[2*i]=(uint8_t)(colour>>8);
+        buf[2*i+1]=(uint8_t)(colour&0xffu);
+    }
 }

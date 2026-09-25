@@ -499,12 +499,14 @@ def start_media_server(channel: str) -> subprocess.Popen:
 
 
 def start_config_page() -> subprocess.Popen:
-    """Launch the channel page. Bound to loopback, which is where it is opened."""
+    """Launch the channel page. Bound to loopback by default, or TV_CONFIG_BIND if set."""
     if datadir.is_frozen():
         command = subprocess_command(PACKAGED_CONFIG_COMMAND)
     else:
         command = subprocess_command(None) + [str(CONFIG_ROOT / "tools" / "channel_config.py")]
-    return spawn(command + ["--port", str(CONFIG_PORT), "--quiet"])
+    bind = os.environ.get("TV_CONFIG_BIND")
+    extra = ["--bind", bind] if bind else []
+    return spawn(command + ["--port", str(CONFIG_PORT), "--quiet"] + extra)
 
 
 def channels_mtime() -> float | None:

@@ -29,6 +29,19 @@ CONFIG_LV_MEM_SIZE_KILOBYTES=24
 # --- 系统 ---
 CONFIG_FREERTOS_HZ=1000
 
+# --- TCP 接收窗口 ---
+# 默认 5760 字节，而一个视频包最大 16 KB：窗口装不下一个包，链路因此被限在
+# 每往返一次只能推进一个窗口，实测设备侧视频入流只有 26–31 KB/s，而 12 fps 的
+# 索引画面需要约 420 KB/s。表现是音频欠载、每 8 秒左右断一次会话，看起来像
+# Wi-Fi 信号差，实际是窗口太小。
+#
+# 调到 32 KB：足以容纳两个最大视频包，给重传留出余量，又远小于这块芯片的可用
+# 堆（会话期约 105 KB）。发送缓冲一并调大，设备发出的只是控制包，但两者用同一
+# 份默认值，分开调容易只改一半。
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
+
 # --- Bluetooth LE / NimBLE ---
 # ESP32-C3 仅支持 BLE；示例只启用单连接 peripheral 所需的最小 host 配置。
 CONFIG_BT_ENABLED=y

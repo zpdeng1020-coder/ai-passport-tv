@@ -13,7 +13,12 @@
 #include "freertos/semphr.h"
 
 static SemaphoreHandle_t s_raw_done;
-static bool s_raw, s_raw_pending, s_lvgl_owned;
+// `s_raw_outstanding` counts transfers queued but not yet drained. It is a
+// count rather than a flag because the controller's queue holds ten and the
+// measurement build uses more than one; the product's submit()/wait() pair
+// keeps it at zero or one at all times, so the two behave identically there.
+static bool s_raw, s_lvgl_owned;
+static unsigned s_raw_outstanding;
 static bool raw_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *event, void *ctx) {
     (void)io; (void)event;
     BaseType_t wake = pdFALSE;
@@ -154,7 +159,16 @@ bool bsp_display_lvgl_claim(void) {
 void bsp_display_lvgl_unclaim(void) { s_lvgl_owned = false; }
 esp_err_t bsp_display_raw_claim(void) {
     if (!s_panel || s_raw || s_lvgl_owned) return ESP_ERR_INVALID_STATE;
-    s_raw_done = xSemaphoreCreateBinary();
+    // Counting, not binary, so that several transfers can be outstanding at
+    // once. It behaves exactly as a binary semaphore does while the caller
+    // keeps to one at a time, which is what submit()/wait() do; the depth only
+    // matters to submit_nowait()/drain(), which exist to measure whether the
+    // panel can be fed without waiting for each stripe in turn.
+    //
+    // The depth is well above a frame's stripe count: a give on a full
+    // counting semaphore is dropped, and a dropped give is a drain that never
+    // returns.
+    s_raw_done = xSemaphoreCreateCounting(32, 0);
     if (!s_raw_done) return ESP_ERR_NO_MEM;
     esp_lcd_panel_io_callbacks_t cb = { .on_color_trans_done = raw_done };
     esp_err_t e = esp_lcd_panel_io_register_event_callbacks(s_io, &cb, s_raw_done);
@@ -171,9 +185,9 @@ esp_err_t bsp_display_raw_claim(void) {
 }
 esp_err_t bsp_display_raw_wait(uint32_t timeout_ms) {
     if (!s_raw) return ESP_ERR_INVALID_STATE;
-    if (!s_raw_pending) return ESP_OK;
+    if (!s_raw_outstanding) return ESP_OK;
     if (!xSemaphoreTake(s_raw_done, pdMS_TO_TICKS(timeout_ms))) return ESP_ERR_TIMEOUT;
-    s_raw_pending = false;
+    s_raw_outstanding--;
     return ESP_OK;
 }
 esp_err_t bsp_display_raw_submit(int y, int rows, const void *pixels, uint32_t timeout_ms) {
@@ -181,19 +195,39 @@ esp_err_t bsp_display_raw_submit(int y, int rows, const void *pixels, uint32_t t
     if (!pixels || y < 0 || rows <= 0 || y + rows > BSP_LCD_W) return ESP_ERR_INVALID_ARG;
     esp_err_t e = bsp_display_raw_wait(timeout_ms);
     if (e != ESP_OK) return e;
-    s_raw_pending = true;
     e = esp_lcd_panel_draw_bitmap(s_panel, 0, y, BSP_LCD_H, y + rows, pixels);
-    if (e != ESP_OK) s_raw_pending = false;
+    if (e == ESP_OK) s_raw_outstanding++;
     return e;
 }
+esp_err_t bsp_display_raw_submit_nowait(int y, int rows, const void *pixels) {
+    if (!s_raw) return ESP_ERR_INVALID_STATE;
+    if (!pixels || y < 0 || rows <= 0 || y + rows > BSP_LCD_W) return ESP_ERR_INVALID_ARG;
+    // No wait here, and that is the entire difference from submit(). The
+    // controller's own queue holds ten, so this returns once the transfer is
+    // queued rather than once the bus is free.
+    esp_err_t e = esp_lcd_panel_draw_bitmap(s_panel, 0, y, BSP_LCD_H, y + rows, pixels);
+    if (e == ESP_OK) s_raw_outstanding++;
+    return e;
+}
+esp_err_t bsp_display_raw_drain(unsigned transfers, uint32_t timeout_ms) {
+    if (!s_raw) return ESP_ERR_INVALID_STATE;
+    for (unsigned i = 0; i < transfers; i++) {
+        if (!s_raw_outstanding) break;
+        if (!xSemaphoreTake(s_raw_done, pdMS_TO_TICKS(timeout_ms))) return ESP_ERR_TIMEOUT;
+        s_raw_outstanding--;
+    }
+    return ESP_OK;
+}
+
 esp_err_t bsp_display_raw_release(void) {
-    if (!s_raw || s_raw_pending) return ESP_ERR_INVALID_STATE;
+    if (!s_raw || s_raw_outstanding) return ESP_ERR_INVALID_STATE;
     esp_lcd_panel_io_callbacks_t cb = {0};
     esp_err_t e = esp_lcd_panel_io_register_event_callbacks(s_io, &cb, NULL);
     if (e != ESP_OK) return e;
     esp_lcd_panel_swap_xy(s_panel, false);
     esp_lcd_panel_mirror(s_panel, false, false);
     vSemaphoreDelete(s_raw_done); s_raw_done = NULL; s_raw = false;
+    s_raw_outstanding = 0;
     return ESP_OK;
 }
 

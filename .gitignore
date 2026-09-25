@@ -56,3 +56,12 @@ FoloToy-AI-Passport*.bin
 # would not catch it anyway, since the file has no extension on macOS and Linux.
 build-server/
 build-server-work/
+*_runs/
+*.bak*
+*.patch
+docs/development/logs/
+AI-Passport-TV-ProfileD-InternalTest
+main/av_protocol.h.profile-*
+server/*.bak*
+tools/*.bak*
+

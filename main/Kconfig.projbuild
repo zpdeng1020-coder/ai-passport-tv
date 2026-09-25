@@ -5,4 +5,70 @@ config AV_RAW_PROTOTYPE
     help
         Exclusive landscape JPEG/PCM test; does not start LVGL or BLE.
         Supply ignored main/av_private_config.h. No flashing is performed.
+
+config AV_SCREEN_CAPTURE
+    bool "Take one screen capture per session and print it to the console"
+    depends on AV_RAW_PROTOTYPE
+    default n
+    help
+        Prints a 80x60 subsample of the panel's own input as hex between two
+        markers, which tools/screen_capture.py turns into a PNG.
+
+        This is the only way to see what the panel is actually given. Every
+        check that compares the server's output against itself, or against a
+        second rendering of the same frames, is blind to a fault on the
+        device's side of the wire -- and the screen cannot be read from a
+        distance. It cost three wrong hypotheses about the colour before this
+        existed.
+
+        Off by default: it holds 9600 bytes of heap for one session and prints
+        sixty lines of hex, neither of which belongs in an ordinary build.
+config AV_USB_TRANSPORT
+    bool "Also carry the media stream over the USB cable (measurement builds only)"
+    depends on AV_RAW_PROTOTYPE
+    default n
+    help
+        Adds a second transport: the same FAV1 packets down the USB cable
+        instead of over the network. Off by default, and the default is the
+        product: this device is a network set-top box, and a build that
+        prefers a cable whenever one is plugged in is a different product,
+        not a faster version of this one.
+
+        On, it exists so the two transports can be measured against each
+        other on the same hardware -- which is the only way to say what the
+        network path is actually giving up. The reference implementation
+        reaches 20 frames a second over this same USB peripheral, and the
+        number this build produces answers whether that gap is the transport
+        or something about this firmware.
+
+        It costs about 20 KB of internal RAM for the driver's ring buffers,
+        held for the life of the device, which is another reason it is not on.
+
+config AV_DISPLAY_BENCH
+    bool "Measure the display path in isolation, with the link frozen out"
+    depends on AV_RAW_PROTOTYPE
+    default n
+    help
+        Two things a normal build has no way to ask.
+
+        First, a bare panel benchmark: fill a stripe buffer with a constant
+        and submit it 15 times a frame for 60 frames, timing the whole run and
+        each part of it. It never decodes anything and never reads a socket.
+        This is the only measurement of the 4-wire SPI bus at its rated
+        40 MHz and therefore the only check on the 30.7 ms floor every other
+        figure in this project is compared against -- a floor that has so far
+        been arithmetic rather than an observation.
+
+        Second, a stop-the-world freeze. On a serial command the receive task
+        stops reading its socket while the picture task carries on consuming
+        whatever packets are already queued, and logs the rate it drains them
+        at. That rate is the device drawing with no network in the way at all:
+        no packet arrival times, no TCP window, no sender pacing. Every
+        previous attempt to measure the device's own drawing speed was taken
+        during a live session and was therefore measuring the link's supply
+        rate instead, which is how "the device is already at the hardware
+        floor" got written down twice on evidence that could not show it.
+
+        Off by default. Both measurements need the device quiet and a human
+        reading a console, which is not what a set-top box is doing.
 endmenu
