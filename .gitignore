@@ -4,6 +4,11 @@ sdkconfig.old
 managed_components/
 .vscode/
 .idea/
+# Local Claude Code skill discovery copy: Claude Code only scans .claude/skills/,
+# while this repo's own convention keeps the source of truth in skills/. This
+# directory is a local mirror for that discovery path, not a second source of
+# truth, so it stays untracked; re-copy from skills/ on a fresh clone if needed.
+.claude/
 # Local-only LAN prototype credentials; never publish credential-bearing binaries.
 main/av_private_config.h
 build-av/
