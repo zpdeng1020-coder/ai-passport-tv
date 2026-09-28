@@ -4,6 +4,11 @@
 
 # Changelog
 
+## v1.2.1
+
+- **Fix Windows server crash on stream launch (PR #1)**: `subprocess.Popen` enforces an assertion against `pass_fds` on Windows, causing immediate `AssertionError` crashes during playback. Fully upgraded video and audio piping to cross-platform loopback TCP sockets (`127.0.0.1`), configured with `TCP_NODELAY` and 1MB receive buffers, ensuring identical behavior across Windows, macOS, and Linux.
+- **Fix Web flasher firmware hash validation**: Updated `EXPECTED_SHA256` in `docs/flash/index.html` to match the actual SHA-256 of the new firmware release, eliminating false "checksum mismatch" errors in browser flashing, and added automated regression tests.
+
 ## Unreleased
 
 - Correct live-trial evidence: preserve per-session silence and final drop counters, distinguish observation from warm-up and deliberate shutdown, and report missing telemetry as unknown. Capture completion does not declare device acceptance.

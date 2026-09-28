@@ -4,7 +4,13 @@
 
 # Changelog
 
+## v1.2.1
+
+- **修复 Windows 服务端启动播放崩溃 (PR #1)**：`subprocess.Popen` 在 Windows 上对 `pass_fds` 有强硬断言导致播放即刻报 `AssertionError`。将视频与音频管道全面升级为跨平台回环 TCP 套接字（`127.0.0.1`），设置 `TCP_NODELAY` 与 1MB 接收缓冲，抹平操作系统差异，Windows、macOS 与 Linux 行为完全一致。
+- **修复 Web 网页端刷机固件哈希校验**：更新 `docs/flash/index.html` 中的 `EXPECTED_SHA256` 匹配新版固件真实 SHA-256，解决浏览器端刷机误报“校验值不符”的问题，并补充自动化回归测试。
+
 ## Unreleased
+
 
 - 修正直播试验记录：保留各会话补静音及最终丢帧计数，区分正式观察、暖机和主动停止，缺失遥测报告为未知。采集完成不代表设备验收通过。
 
