@@ -222,6 +222,28 @@ class PowerCycleStepTests(unittest.TestCase):
         text = "1. 拔掉数据线，设备会自己重启。"
         self.assertIn("会自己重启", text)
 
+    def test_expected_sha256_matches_committed_firmware(self):
+        """The hash constant in docs/flash/index.html must match the actual firmware binary.
+
+        If a new firmware binary is committed without updating EXPECTED_SHA256,
+        the browser-based web flasher fails with a checksum mismatch error.
+        """
+        import hashlib
+        page = self._text("docs/flash/index.html")
+        match = re.search(r"const EXPECTED_SHA256\s*=\s*['\"]([0-9a-fA-F]{64})['\"]", page)
+        self.assertIsNotNone(match, "EXPECTED_SHA256 constant not found in docs/flash/index.html")
+        expected_sha = match.group(1).lower()
+
+        firmware_path = ROOT / "docs/firmware/FoloToy-AI-Passport-tv.bin"
+        self.assertTrue(firmware_path.is_file(), f"Firmware binary not found at {firmware_path}")
+        real_sha = hashlib.sha256(firmware_path.read_bytes()).hexdigest().lower()
+
+        self.assertEqual(
+            expected_sha, real_sha,
+            f"docs/flash/index.html EXPECTED_SHA256 ({expected_sha}) does not match "
+            f"docs/firmware/FoloToy-AI-Passport-tv.bin actual SHA-256 ({real_sha})"
+        )
+
 
 class MacGatekeeperTests(unittest.TestCase):
     """Getting past macOS's block, which is three steps and easy to get wrong.
