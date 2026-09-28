@@ -26,8 +26,6 @@ sshpass -f "$password_file" ssh -o StrictHostKeyChecking=no "$host" \
     "rm -rf $remote/server/__pycache__ $remote/tools/__pycache__" >/dev/null 2>&1 || true
 sshpass -f "$password_file" scp -q -o StrictHostKeyChecking=no -r \
     "$root/server" "$root/tools" "$host:$remote/"
-sshpass -f "$password_file" scp -q -o StrictHostKeyChecking=no \
-    "$root/channels.txt" "$host:/opt/tv-server-data/channels.txt"
 
 sshpass -f "$password_file" ssh -o StrictHostKeyChecking=no "$host" \
     "systemctl restart tv-server && sleep 2 && systemctl is-active tv-server"
