@@ -22,15 +22,12 @@ fixed CHANNELS table, the stream is not recorded, and no credentials are used.
 from __future__ import annotations
 
 import collections
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
 import json
 import os
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -286,6 +283,14 @@ PREBUFFER_TIMEOUT_S = 60
 # it a channel change would hang instead of failing and letting the device
 # reconnect.
 PALETTE_TIMEOUT_S = 40
+
+# How long the parent waits for the decoder it just launched to connect back to
+# each loopback socket. ffmpeg opens both outputs within its first fraction of
+# a second -- well before it has read a single byte of the source -- so a slow
+# connection here means the process failed to start, not that the channel is
+# slow. Kept well under PALETTE_TIMEOUT_S so a decoder that never connects is
+# reported at start() rather than surfacing later as a silent, empty session.
+DECODER_CONNECT_TIMEOUT_S = 10
 
 # The 256 colours every live picture is drawn in, and the reason they are fixed.
 #
@@ -568,7 +573,7 @@ SOURCE_GRAPH = (
 )
 
 
-def source_command(url: str, video_fd: int, audio_fd: int, ffmpeg: str,
+def source_command(url: str, video_port: int, audio_port: int, ffmpeg: str,
                    user_agent: str = "") -> list[str]:
     """Read the source once and produce both payloads and both timestamps.
 
@@ -590,6 +595,19 @@ def source_command(url: str, video_fd: int, audio_fd: int, ffmpeg: str,
     channels, worst-case frames fell from about 31 KB to about 23 KB once it was
     off. It has to be given here, after the conversion, rather than before `-i`,
     where it parses without complaint and does nothing.
+
+    The two payloads leave over `tcp://127.0.0.1:<port>` rather than an
+    anonymous pipe. A pipe write end handed to the child by number
+    (`pipe:{fd}`, `pass_fds`) is a POSIX-only mechanism: Windows'
+    `subprocess.Popen` refuses any `pass_fds` outright
+    (`assert not pass_fds, "pass_fds not supported on Windows."`, CPython's own
+    `subprocess.py`), so that form cannot run there at all. A loopback TCP
+    connection is a socket on every platform this project targets, ffmpeg
+    already speaks it as an output URL, and the parent identifies each stream
+    by which port accepted the connection rather than by an inherited handle.
+    ffmpeg is the client here; the parent listens on both ports before this
+    command is launched, so the two connections it makes on startup have
+    something to reach.
     """
     return [
         ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "info", "-nostats",
@@ -597,8 +615,8 @@ def source_command(url: str, video_fd: int, audio_fd: int, ffmpeg: str,
         "-i", url,
         "-filter_complex", SOURCE_GRAPH,
         "-map", "[v]", "-pix_fmt", "rgb8", "-sws_dither", "none",
-        "-threads", "1", "-f", "rawvideo", f"pipe:{video_fd}",
-        "-map", "[a]", "-f", "s16le", f"pipe:{audio_fd}",
+        "-threads", "1", "-f", "rawvideo", f"tcp://127.0.0.1:{video_port}",
+        "-map", "[a]", "-f", "s16le", f"tcp://127.0.0.1:{audio_port}",
     ]
 
 
@@ -777,6 +795,13 @@ class LiveChannel:
         self.timestamps: pts.Timestamps | None = None
         self.pts_reader: pts.Reader | None = None
         self.threads: list[threading.Thread] = []
+        # The two loopback connections the decoder makes back to this process;
+        # see start(). File-object wrappers for reading, kept beside the
+        # sockets underneath them so close() can release both deterministically.
+        self._video: object | None = None
+        self._audio: object | None = None
+        self._video_sock: socket.socket | None = None
+        self._audio_sock: socket.socket | None = None
         self._raw_video: queue.Queue[bytes | None] = queue.Queue(maxsize=120)
         self._raw_audio: queue.Queue[bytes | None] = queue.Queue(maxsize=300)
         # The colours the device needs before it can draw anything. Filled in by
@@ -874,34 +899,46 @@ class LiveChannel:
             raise LiveError("start() before build_palette()")
         if self.palette is None:
             raise LiveError("start() before build_palette()")
-        # Picture and sound come from a single decoder process with separate pipes.
-        # Every resource is closed on failure: the device reconnects on error, so a
-        # leaking start() would exhaust descriptors after a few attempts.
-        video_r = audio_r = video_w = audio_w = -1
+        # Picture and sound come from a single decoder process, delivered over
+        # two loopback TCP connections rather than the anonymous pipes this
+        # used before. See source_command() for why: Windows' subprocess module
+        # refuses pass_fds outright, so a pipe handed to the child by number
+        # cannot be used on every platform this project targets, and a loopback
+        # socket can.
+        #
+        # The parent listens on both ports and only then launches ffmpeg, which
+        # connects out to them as a TCP client -- the reverse of the usual
+        # server role, chosen because it is the listener that must exist first
+        # for a connection to succeed, and the parent is running before the
+        # decoder is. Every resource is closed on failure: the device
+        # reconnects on error, so a leaking start() would exhaust sockets after
+        # a few attempts.
+        video_listener = audio_listener = None
+        video_sock = audio_sock = None
         success = False
         try:
-            video_r, video_w = os.pipe()
-            audio_r, audio_w = os.pipe()
-            # On Linux, default anonymous pipe buffer is only 64KB (holding only
-            # 1.1 frames of 320x180 RGB8 at 57.6KB). Expand to 1MB if OS supports it.
-            if fcntl is not None:
-                for fd in (video_r, video_w, audio_r, audio_w):
-                    try:
-                        fcntl.fcntl(fd, 1031, 1048576)
-                    except (AttributeError, OSError):
-                        pass
-            for fd in (video_w, audio_w):
-                os.set_inheritable(fd, True)
+            video_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            video_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            video_listener.bind(("127.0.0.1", 0))
+            video_listener.listen(1)
+            video_port = video_listener.getsockname()[1]
+
+            audio_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            audio_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            audio_listener.bind(("127.0.0.1", 0))
+            audio_listener.listen(1)
+            audio_port = audio_listener.getsockname()[1]
+
             # stderr is a pipe rather than a file now, because the decoder's
             # timestamps arrive on it. It is drained by a thread of its own: an
             # unread pipe blocks ffmpeg at the next log line, and a blocked
             # ffmpeg is indistinguishable from a stalled source.
             self.timestamps = pts.Timestamps()
             self.decoder = subprocess.Popen(
-                source_command(self.url, video_w, audio_w, self.ffmpeg,
+                source_command(self.url, video_port, audio_port, self.ffmpeg,
                                self.user_agent),
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE, pass_fds=(video_w, audio_w))
+                stderr=subprocess.PIPE)
             self.pts_reader = pts.Reader(self.decoder.stderr, self.timestamps)
             self.pts_reader.start()
             # One process, so there is one launch instant. Kept because the
@@ -909,19 +946,49 @@ class LiveChannel:
             self.video_epoch = self.audio_epoch = time.monotonic()
             self.calibrate_from_source()
 
-            # Close write ends in the parent as child now owns inherited write ends
-            for fd in (video_w, audio_w):
-                if fd >= 0:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-            video_w = audio_w = -1
+            # ffmpeg opens both outputs within a fraction of a second of
+            # starting, well before it has decoded anything from the source, so
+            # a timeout here catches a decoder that failed to launch rather
+            # than a slow channel.
+            video_listener.settimeout(DECODER_CONNECT_TIMEOUT_S)
+            audio_listener.settimeout(DECODER_CONNECT_TIMEOUT_S)
+            try:
+                video_sock, _ = video_listener.accept()
+                audio_sock, _ = audio_listener.accept()
+            except OSError as error:
+                raise LiveError(
+                    f"decoder did not connect: {type(error).__name__}") from None
+            # The listening sockets have done their one job -- accepting the
+            # decoder's two connections -- and are not needed again.
+            video_listener.close()
+            audio_listener.close()
+            video_listener = audio_listener = None
 
-            self._video = os.fdopen(video_r, "rb", buffering=0)
-            video_r = -1
-            self._audio = os.fdopen(audio_r, "rb", buffering=0)
-            audio_r = -1
+            # A pipe never delayed a write waiting for more bytes to batch; a
+            # TCP socket can, under Nagle's algorithm, hold a small write for up
+            # to 40 ms hoping for another to coalesce with it. That is exactly
+            # the audio chunk size on this link, so left on it would show up as
+            # sporadic extra latency the sender has no way to see. Disabling it
+            # keeps a socket behaving like the pipe it replaced.
+            for sock in (video_sock, audio_sock):
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+            # The default receive buffer on some platforms holds barely one
+            # 320x180 RGB8 frame (57.6 kB); the anonymous pipe this replaced
+            # was widened for the same reason. Widen the socket buffer the same
+            # way, best-effort: a platform that refuses the request still works,
+            # just with less slack against a burst.
+            try:
+                video_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
+            except OSError:
+                pass
+
+            self._video_sock = video_sock
+            self._audio_sock = audio_sock
+            self._video = video_sock.makefile("rb", buffering=0)
+            self._audio = audio_sock.makefile("rb", buffering=0)
 
             self.threads = [
                 threading.Thread(target=self._drain_video, daemon=True, name="live-video-drain"),
@@ -933,13 +1000,19 @@ class LiveChannel:
                 thread.start()
             success = True
         finally:
-            for fd in (video_w, audio_w, video_r, audio_r):
-                if fd >= 0:
+            for listener in (video_listener, audio_listener):
+                if listener is not None:
                     try:
-                        os.close(fd)
+                        listener.close()
                     except OSError:
                         pass
             if not success:
+                for sock in (video_sock, audio_sock):
+                    if sock is not None:
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
                 self.close()
 
     def _note(self, error: Exception) -> None:
@@ -1432,7 +1505,13 @@ class LiveChannel:
                 ts.close()
             except Exception:
                 pass
-        # Close pipe streams first so decoder is not blocked in write() and reader threads see EOF
+        # Close the file objects first so the decoder is not blocked writing
+        # and the reader threads see EOF, then the sockets underneath them.
+        # makefile()'s close() drops this object's own reference to the
+        # socket, and the fd is only released once every reference is gone --
+        # closing just the file object would leave the fd open for as long as
+        # the garbage collector takes to notice. Closing the socket explicitly
+        # here makes that deterministic rather than incidental.
         for stream in (getattr(self, "_video", None), getattr(self, "_audio", None)):
             if stream is not None:
                 try:
@@ -1441,6 +1520,14 @@ class LiveChannel:
                     pass
         self._video = None
         self._audio = None
+        for sock in (getattr(self, "_video_sock", None), getattr(self, "_audio_sock", None)):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        self._video_sock = None
+        self._audio_sock = None
         proc = getattr(self, "decoder", None)
         if proc is not None:
             if proc.poll() is None:

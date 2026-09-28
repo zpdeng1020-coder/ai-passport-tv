@@ -501,7 +501,7 @@ class CommandTests(unittest.TestCase):
     def test_transcode_is_paced_with_re(self):
         """Real-time pacing keeps the host queues from draining mid-session."""
         from server.live import source_command
-        command = source_command("http://example.invalid/x.m3u8", 1, 2, "ffmpeg")
+        command = source_command("http://example.invalid/x.m3u8", 25000, 25001, "ffmpeg")
         self.assertIn("-re", command)
         self.assertLess(command.index("-re"), command.index("-i"))
 
@@ -514,7 +514,7 @@ class CommandTests(unittest.TestCase):
         not a clock, and it cannot see a gap.
         """
         from server.live import source_command
-        command = source_command("http://example.invalid/x.m3u8", 1, 2, "ffmpeg")
+        command = source_command("http://example.invalid/x.m3u8", 25000, 25001, "ffmpeg")
         # One input.
         self.assertEqual(command.count("-i"), 1)
         # Two outputs, each mapped from a named graph output.
@@ -529,6 +529,24 @@ class CommandTests(unittest.TestCase):
         self.assertIn("channel_layouts=mono", graph)
         self.assertIn("asetnsamples=n=640", graph)
 
+    def test_outputs_are_loopback_tcp_not_a_pipe_fd(self):
+        """Windows refuses pass_fds outright, so the payloads leave over a
+        loopback socket instead of an inherited pipe write end.
+
+        `subprocess.py`'s own Windows `_execute_child` asserts `not pass_fds`
+        and fails every call that passes one -- measured directly against this
+        very command before this fix, where every connecting device's session
+        died at start() with exactly that AssertionError. `tcp://` is the
+        replacement, and each output must name a real port, not a bare file
+        descriptor number.
+        """
+        from server.live import source_command
+        command = source_command("http://example.invalid/x.m3u8", 25000, 25001, "ffmpeg")
+        joined = " ".join(command)
+        self.assertNotIn("pipe:", joined)
+        self.assertIn("tcp://127.0.0.1:25000", command)
+        self.assertIn("tcp://127.0.0.1:25001", command)
+
     def test_nobuffer_input_flag_is_not_reintroduced(self):
         """+nobuffer reads as a latency win and costs 9 s of startup on HLS.
 
@@ -538,7 +556,7 @@ class CommandTests(unittest.TestCase):
         edge of its deadline.
         """
         from server.live import source_command
-        joined = " ".join(source_command("http://example.invalid/x.m3u8", 1, 2,
+        joined = " ".join(source_command("http://example.invalid/x.m3u8", 25000, 25001,
                                          "ffmpeg"))
         self.assertNotIn("+nobuffer", joined)
         self.assertNotIn("nobuffer", joined)
@@ -557,7 +575,7 @@ class CommandTests(unittest.TestCase):
         roughly half the compression, silently.
         """
         from server.live import source_command
-        command = source_command("http://example.invalid/x.m3u8", 1, 2, "ffmpeg")
+        command = source_command("http://example.invalid/x.m3u8", 25000, 25001, "ffmpeg")
         # rgb8, and this assertion is the inverse of the one that stood here
         # before. rgb8 is ffmpeg's fixed 3-3-2 grid rather than a colour depth,
         # which made it wrong while the palette was adaptive -- the indices
