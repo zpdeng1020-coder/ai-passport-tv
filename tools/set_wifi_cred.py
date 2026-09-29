@@ -106,7 +106,7 @@ def main():
         work_dir = pathlib.Path(work)
         bin_path = work_dir / "nvs.bin"
 
-        read_cmd = cmd + ["--port", args.port, "read-flash", f"{NVS_OFFSET:#x}", f"{NVS_SIZE:#x}", str(bin_path)]
+        read_cmd = cmd + ["--port", args.port, "read_flash", f"{NVS_OFFSET:#x}", f"{NVS_SIZE:#x}", str(bin_path)]
         subprocess.run(read_cmd, check=True)
 
         data = bytearray(bin_path.read_bytes())
@@ -114,7 +114,8 @@ def main():
         if args.list:
             for k in (b"ssid", b"password", b"ota_url"):
                 for at, span, val, room in find_live_string_slots(data, k):
-                    print(f"  {k.decode()}: '{val.rstrip(bchr(0)).decode(errors='replace')}' (at {at:#06x}, room={room})")
+                    shown = val.rstrip(b"\x00").decode(errors="replace")
+                    print(f"  {k.decode()}: '{shown}' (at {at:#06x}, room={room})")
             return 0
 
         modified = False
@@ -133,7 +134,7 @@ def main():
 
         if modified:
             bin_path.write_bytes(data)
-            write_cmd = cmd + ["--port", args.port, "write-flash", f"{NVS_OFFSET:#x}", str(bin_path)]
+            write_cmd = cmd + ["--port", args.port, "write_flash", f"{NVS_OFFSET:#x}", str(bin_path)]
             subprocess.run(write_cmd, check=True)
             print("Successfully updated NVS on device!")
         else:

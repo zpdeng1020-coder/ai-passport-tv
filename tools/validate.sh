@@ -14,6 +14,14 @@ run_static_checks() {
 
     python3 tools/check_repo.py
 
+    # The hardware benchmark's compressed stripes are generated, and the C side
+    # regenerates the source they must inflate to. Nothing else connects the two:
+    # the generator writes a header, the mirror lives in av_player.c, and a drift
+    # between them would show up as a failed check on the device -- or worse, as
+    # a believable cycle count. Regenerating here is cheap and the comparison is
+    # exact.
+    python3 tools/make_bench_blobs.py --check
+
     actionlint_bin="${ACTIONLINT_BIN:-}"
     if [[ -z "${actionlint_bin}" ]]; then
         actionlint_bin="$(command -v actionlint || true)"

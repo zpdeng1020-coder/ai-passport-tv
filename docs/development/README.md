@@ -8,6 +8,8 @@ This directory contains AI Passport engineering rules and reusable workflows, gr
 
 ## Project state
 
+- [handoff-20260928.md](handoff-20260928.md): **read this first for performance or architecture work.** Hardware-derived ceilings for 320x180 playback, reference projects, and the on-device benchmark plan.
+- [hardware-benchmark-results-20260929.md](hardware-benchmark-results-20260929.md): the measurements that handoff asked for, taken on the board. Supersedes its section 4 where the two differ.
 - [state-20260916.md](state-20260916.md): **read this first.** What is fixed, what is broken, what is measured, what is not established, and the next steps in order. Check it against the code before editing.
 - [metrics-dictionary.md](metrics-dictionary.md): what every counter on both ends actually counts, and what it must not be read as.
 

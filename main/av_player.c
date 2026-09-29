@@ -20,10 +20,20 @@
 // entry point is used; the mem_to_mem convenience wrapper puts an 11 KB
 // tinfl_decompressor on the caller's stack, and this task has four kilobytes.
 #include "miniz.h"
+// The compressed stripes the hardware benchmark inflates, generated on the host
+// because the ROM's tdefl cannot run here. Included unconditionally: it is
+// inert data and the compiler drops it when the benchmark is off, so guarding
+// the include would only add a second place that knows the option.
+#include "bench_blobs.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+// esp_cpu_get_cycle_count(), used only by the hardware benchmark to turn its
+// work into cycles per byte and cycles per pixel. Included unconditionally
+// because the header is free and a conditional include would be a second place
+// that knows which option is on.
+#include "esp_cpu.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -347,6 +357,26 @@ typedef struct {
     // loop, which is this chip being slow. Without the split every one of those
     // looks the same from outside -- the picture does not arrive fast enough.
     atomic_uint_least32_t rx_io_us, rx_wait_us, rx_overhead_us, rx_iterations;
+#ifdef CONFIG_AV_HW_BENCH
+    // Cycles the receive loop actually spent inside its socket reads, and the
+    // bytes those reads produced. The handoff's step 3 exists because "how much
+    // CPU does receiving cost" was the least certain figure in the whole plan --
+    // estimated at 20 to 36 cycles a byte and never observed.
+    //
+    // Counted here rather than with an idle spin task, which is what the
+    // handoff proposed. Two reasons. This board's task watchdog (5 s) checks the
+    // idle task, so a lowest-priority task that never blocks would starve idle
+    // and reset the chip rather than measure it; and a spin task measures the
+    // whole system's stolen cycles, which then has to be attributed back to
+    // causes by inference. Counting inside the read attributes nothing: it is
+    // the cycles that read cost, and the count is reported beside the bytes that
+    // came out of it.
+    //
+    // What it does NOT include is stated where it is reported: lwIP's own work
+    // for packets this loop never asks for, and any Wi-Fi driver time spent
+    // outside this task's context.
+    atomic_uint_least32_t rx_cycles;
+#endif
     // Why frames do not finish.
     //
     // `decoded` counts completed pictures and `dropped` counts the ones thrown
@@ -626,6 +656,17 @@ static bool usb_until(void *buf, size_t n, bool sending, int64_t deadline) {
 }
 
 // Socket owner only. An absolute deadline also covers all discard fragments.
+// A single syscall's cost, in core cycles. Declared here rather than beside the
+// benchmark block further down because io_until() needs it and that is far
+// earlier in the file; the guard matches the only place that calls it.
+//
+// esp_cpu_get_cycle_count() advances every clock whether the core is working or
+// not, so it must wrap a specific operation and never a blocking wait -- around
+// a recv() it measures the copy lwIP did, around the loop that contains one it
+// would measure wall time instead.
+#ifdef CONFIG_AV_HW_BENCH
+static inline uint32_t bench_cycles(void) { return esp_cpu_get_cycle_count(); }
+#endif
 static bool io_until(int fd, void *buf, size_t n, bool sending, int64_t deadline) {
     if (transport_is_usb(fd)) return usb_until(buf,n,sending,deadline);
     size_t off=0;
@@ -633,7 +674,25 @@ static bool io_until(int fd, void *buf, size_t n, bool sending, int64_t deadline
     const char *reason="deadline";
     int error=0;
     while (off<n && !stopping() && esp_timer_get_time()<deadline) {
+#ifdef CONFIG_AV_HW_BENCH
+        // Cycles around one syscall, not around the whole loop.
+        //
+        // esp_cpu_get_cycle_count() advances every clock whether the core is
+        // working or not, so a difference taken across io_until() would be wall
+        // time -- it would include the select() waits, and the inflate running
+        // on the other task while this one is descheduled. None of that is
+        // receive work.
+        //
+        // These sockets are non-blocking -- the EAGAIN branch below is the proof
+        // -- so a single recv() returns promptly having either copied bytes or
+        // found none, and what it costs is lwIP walking the segment and copying
+        // it. That is exactly the figure the handoff wanted and never had.
+        uint32_t cycles_before=bench_cycles();
         ssize_t r=sending ? send(fd,(uint8_t *)buf+off,n-off,0) : recv(fd,(uint8_t *)buf+off,n-off,0);
+        atomic_fetch_add(&s.rx_cycles, bench_cycles()-cycles_before);
+#else
+        ssize_t r=sending ? send(fd,(uint8_t *)buf+off,n-off,0) : recv(fd,(uint8_t *)buf+off,n-off,0);
+#endif
         if (r>0) off+=(size_t)r;
         else if (r==0) { reason="EOF"; break; }
         else if (errno!=EAGAIN && errno!=EWOULDBLOCK && errno!=EINTR) {
@@ -2076,6 +2135,316 @@ piped:;
     bsp_display_raw_release();
 }
 #endif
+#ifdef CONFIG_AV_HW_BENCH
+// The hardware benchmark: what the panel, the CPU and the receive path each
+// cost, measured rather than derived.
+//
+// Every figure the handoff of 2026-09-28 carries is arithmetic. The CPU table
+// says "20/25/8 cycles per byte/pixel" and then admits the numbers are
+// estimates; the panel floor of 30.7 ms has never been the wire and always been
+// the multiplication. The optimisation order in section 9 depends on which of
+// the three actually binds, and nothing in the repository can currently say.
+//
+// Runs before any socket exists, like display_bench(), so nothing here can be
+// paced by a sender. Prints one `BENCH name=... key=value` line per item for
+// tools/bench_summary.py to tabulate; the format is fixed because a script
+// reads it and a human does not.
+//
+// Cycles come from esp_cpu_get_cycle_count(), which counts every cycle the
+// core retires -- not wall time, and not including time the core is idle. That
+// is the right instrument for a cost per byte or per pixel, because it does not
+// change with what else the scheduler is doing.
+
+// How many times to repeat each CPU measurement. Enough that one interrupt
+// cannot move the mean by a visible amount, few enough that the whole benchmark
+// finishes before a human gives up waiting.
+#define BENCH_CPU_REPEATS 4
+
+static void bench_display_variant(const char *name, int stripe_rows) {
+    // The video's own geometry, not the panel's. The product draws a letterboxed
+    // 320x180 picture, so a variant measured across the full 240 panel rows is
+    // measuring something the product never does -- and the first version of
+    // this swept the panel and produced a baseline that could not be compared
+    // with anything.
+    const int video_rows = (int)AV_VIDEO_HEIGHT;
+    const unsigned stripes = (unsigned)video_rows / (unsigned)stripe_rows;
+    const size_t bytes = (size_t)AV_WIDTH * (size_t)stripe_rows * 2u;
+    uint8_t *buf = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!buf) { ESP_LOGW(TAG,"BENCH name=%s skipped=no_memory",name); return; }
+    for (size_t i = 0; i < bytes; i++) buf[i] = (uint8_t)(i ^ (i >> 5));
+    const unsigned frames = 60;
+    int64_t start = esp_timer_get_time();
+    unsigned submitted = 0;
+    for (unsigned f = 0; f < frames; f++) {
+        for (unsigned s = 0; s < stripes; s++) {
+            for (size_t i = 0; i < bytes; i += 64) buf[i] = (uint8_t)(f + s + i);
+            if (bsp_display_raw_submit((int)AV_VIDEO_Y_OFFSET
+                                           + (int)(s * (unsigned)stripe_rows),
+                                       stripe_rows, buf, 200) != ESP_OK) {
+                ESP_LOGE(TAG,"BENCH name=%s submit_failed frame=%u stripe=%u",name,f,s);
+                goto done;
+            }
+            if (bsp_display_raw_wait(200) != ESP_OK) {
+                ESP_LOGE(TAG,"BENCH name=%s wait_failed frame=%u stripe=%u",name,f,s);
+                goto done;
+            }
+            submitted++;
+        }
+    }
+done:;
+    {
+        uint32_t total_us = (uint32_t)(esp_timer_get_time() - start);
+        ESP_LOGW(TAG,"BENCH name=%s stripes=%u stripe_rows=%d frames=%u submitted=%u"
+            " total_ms=%"PRIu32" per_frame_ms=%"PRIu32" bytes_per_frame=%u floor_ms=%u",
+            name, stripes, stripe_rows, frames, submitted,
+            total_us / 1000u, submitted ? (uint32_t)(total_us / 1000u / frames) : 0u,
+            (unsigned)(bytes * stripes), (unsigned)PANEL_FLOOR_MS);
+    }
+    free(buf);
+}
+
+// The whole picture in one window, pixels only. Two buffers, one transfer kept
+// outstanding, which is the depth the product uses -- so the number is reachable
+// rather than a laboratory maximum.
+static void bench_display_onewindow(void) {
+    const size_t bytes = STRIPE_BYTES;
+    uint8_t *a = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    uint8_t *b = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!a || !b) {
+        ESP_LOGW(TAG,"BENCH name=disp_onewindow skipped=no_memory");
+        free(a); free(b);
+        return;
+    }
+    for (size_t i = 0; i < bytes; i++) { a[i] = (uint8_t)(i ^ (i >> 5)); b[i] = (uint8_t)(i * 3u + 1u); }
+    uint8_t *buffers[2] = { a, b };
+    const unsigned frames = 60;
+    // The window covers the whole picture, so the y it is opened at is the
+    // letterbox offset this project draws the video at.
+    if (bsp_display_raw_window_begin((int)AV_VIDEO_Y_OFFSET,
+                                     (int)AV_VIDEO_HEIGHT * (int)AV_ENLARGE_NUM
+                                         / (int)AV_ENLARGE_DEN) != ESP_OK) {
+        ESP_LOGE(TAG,"BENCH name=disp_onewindow window_begin_failed");
+        free(a); free(b);
+        return;
+    }
+    int64_t start = esp_timer_get_time();
+    unsigned pushed = 0;
+    for (unsigned f = 0; f < frames; f++) {
+        for (unsigned s = 0; s < AV_STRIPES; s++) {
+            if (bsp_display_raw_window_push((int)AV_STRIPE_ROWS, buffers[s & 1u]) != ESP_OK) {
+                ESP_LOGE(TAG,"BENCH name=disp_onewindow push_failed frame=%u stripe=%u",f,s);
+                goto done;
+            }
+            pushed++;
+            if (s >= 1) {
+                if (bsp_display_raw_drain(1, 200) != ESP_OK) {
+                    ESP_LOGE(TAG,"BENCH name=disp_onewindow drain_failed frame=%u stripe=%u",f,s);
+                    goto done;
+                }
+            }
+        }
+        if (bsp_display_raw_drain(1, 200) != ESP_OK) goto done;
+    }
+done:;
+    {
+        uint32_t total_us = (uint32_t)(esp_timer_get_time() - start);
+        ESP_LOGW(TAG,"BENCH name=disp_onewindow stripes=%u stripe_rows=%u frames=%u pushed=%u"
+            " total_ms=%"PRIu32" per_frame_ms=%"PRIu32" bytes_per_frame=%u floor_ms=%u",
+            (unsigned)AV_STRIPES, (unsigned)AV_STRIPE_ROWS, frames, pushed,
+            total_us / 1000u, pushed ? (uint32_t)(total_us / 1000u / frames) : 0u,
+            // The video's own bytes, which is what the window actually covers:
+            // STRIPE_BYTES * AV_STRIPES would count panel rows the picture does
+            // not occupy and make this line disagree with its neighbours.
+            (unsigned)(AV_VIDEO_WIDTH * AV_VIDEO_HEIGHT * 2u), (unsigned)PANEL_FLOOR_MS);
+    }
+    free(a); free(b);
+}
+
+// A deterministic byte stream whose compressibility is set by the two
+// arguments: `repeat_block` bytes drawn from a pseudo-random pattern repeat for
+// the whole buffer, and every `noise_every`-th byte is fresh noise instead.
+// Longer blocks and more frequent noise both make the stream harder to
+// compress, so the pair walks the ratio across the range the wire sees.
+//
+// Must stay byte-for-byte identical to fill_source() in tools/make_bench_blobs.py
+// -- that is the whole contract between the two files. The benchmark inflates
+// each blob and compares the result against what this produces, so a drift
+// shows up as a failed check rather than as a plausible cycle count. The
+// generator is the authority: it is where the compressed bytes come from, and
+// this exists so the device can verify the decode rather than trust it.
+int bench_fill_source(uint8_t *dst, size_t n, unsigned repeat_block,
+                      unsigned noise_every) {
+    if (!dst || !repeat_block) return -1;
+    uint32_t x = 0x12345678u;
+    uint8_t *pattern = heap_caps_malloc(repeat_block, MALLOC_CAP_8BIT);
+    if (!pattern) return -1;
+    for (unsigned i = 0; i < repeat_block; i++) {
+        x = x * 1103515245u + 12345u;
+        pattern[i] = (uint8_t)(x >> 16);
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (noise_every && (i % noise_every) == 0u) {
+            x = x * 1103515245u + 12345u;
+            dst[i] = (uint8_t)(x >> 16);
+        } else {
+            dst[i] = pattern[i % repeat_block];
+        }
+    }
+    free(pattern);
+    return 0;
+}
+
+static void bench_cpu(void) {
+    // The blob source size, four stripes: the blobs were generated against it
+    // and bench_fill_source() must produce that many bytes to verify them.
+    const size_t src_bytes = BENCH_BLOB_SOURCE_BYTES;
+    uint8_t *src = heap_caps_malloc(src_bytes, MALLOC_CAP_8BIT);
+    uint8_t *out = heap_caps_malloc(src_bytes, MALLOC_CAP_8BIT);
+    uint8_t *exp = heap_caps_malloc(src_bytes * 2u, MALLOC_CAP_8BIT);
+    tinfl_decompressor *infl = heap_caps_malloc(sizeof(tinfl_decompressor),
+                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!src || !out || !exp || !infl) {
+        ESP_LOGW(TAG,"BENCH name=cpu skipped=no_memory");
+        goto done;
+    }
+    // A known stream for the memcpy baseline, so the byte cost is read against
+    // real data rather than an all-zero block a wide copy could shortcut.
+    if (bench_fill_source(src, src_bytes, 512u, 0u) != 0) {
+        ESP_LOGW(TAG,"BENCH name=cpu_memcpy skipped=no_memory");
+        goto done;
+    }
+
+    // memcpy as the baseline a per-byte figure is read against.
+    {
+        uint64_t cyc = 0;
+        for (unsigned r = 0; r < BENCH_CPU_REPEATS; r++) {
+            uint32_t t = bench_cycles();
+            memcpy(out, src, src_bytes);
+            cyc += bench_cycles() - t;
+        }
+        ESP_LOGW(TAG,"BENCH name=cpu_memcpy bytes=%u repeats=%u cyc_per_byte_x1000=%u",
+                 (unsigned)src_bytes, BENCH_CPU_REPEATS,
+                 (unsigned)(cyc * 1000u / BENCH_CPU_REPEATS / src_bytes));
+    }
+
+    // inflate at four compression ratios, against blobs generated on the host.
+    //
+    // Not compressed here, because the ROM's tdefl cannot run on this chip:
+    // esp_rom's miniz.h defines MINIZ_NO_MALLOC and a tdefl_compressor is about
+    // 130 KB against the 112 KB this device has free. Measured -- the first
+    // version of this benchmark compressed on the device and reported four
+    // `compress_failed` skips. Compressing on the host also makes the ratio a
+    // chosen input rather than an outcome.
+    //
+    // Each blob is verified against bench_fill_source() before it is timed, so
+    // a generator that drifted from the C mirror reports a check failure rather
+    // than a believable cycle count.
+    for (unsigned bi = 0; bi < BENCH_BLOB_COUNT; bi++) {
+        const bench_blob_t *blob = &BENCH_BLOBS[bi];
+        if (bench_fill_source(src, blob->length ? BENCH_BLOB_SOURCE_BYTES : 0u,
+                              blob->repeat_block, blob->noise_every) != 0) {
+            ESP_LOGW(TAG,"BENCH name=cpu_tinfl_r%u skipped=no_memory",
+                     (unsigned)(blob->ratio_x1000 / 1000u));
+            continue;
+        }
+        // Verify once, outside the timing loop: the point of the check is the
+        // decode's correctness, and doing it inside would charge the comparison
+        // to the decoder.
+        {
+            size_t in_len = blob->length, out_len = BENCH_BLOB_SOURCE_BYTES;
+            tinfl_init(infl);
+            tinfl_status st = tinfl_decompress(infl, blob->data, &in_len,
+                                               out, out, &out_len,
+                                               TINFL_FLAG_PARSE_ZLIB_HEADER |
+                                               TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+            if (st != TINFL_STATUS_DONE || out_len != BENCH_BLOB_SOURCE_BYTES ||
+                memcmp(out, src, BENCH_BLOB_SOURCE_BYTES) != 0) {
+                ESP_LOGW(TAG,"BENCH name=cpu_tinfl_r%u skipped=verify_failed st=%d"
+                    " out=%u",(unsigned)(blob->ratio_x1000 / 1000u),(int)st,
+                    (unsigned)out_len);
+                continue;
+            }
+        }
+        uint64_t cyc = 0;
+        bool ok = true;
+        for (unsigned r = 0; r < BENCH_CPU_REPEATS; r++) {
+            size_t in_len = blob->length, out_len = BENCH_BLOB_SOURCE_BYTES;
+            tinfl_init(infl);
+            uint32_t t = bench_cycles();
+            // The same flags the product's decoder uses: the blobs are zlib
+            // streams, so a bare 0 here would fail on all four and the
+            // benchmark would report four skips and no cycle counts.
+            tinfl_status st = tinfl_decompress(infl, blob->data, &in_len,
+                                               out, out, &out_len,
+                                               TINFL_FLAG_PARSE_ZLIB_HEADER |
+                                               TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+            cyc += bench_cycles() - t;
+            if (st != TINFL_STATUS_DONE) { ok = false; break; }
+        }
+        if (!ok) {
+            ESP_LOGW(TAG,"BENCH name=cpu_tinfl_r%u skipped=inflate_failed",
+                     (unsigned)(blob->ratio_x1000 / 1000u));
+            continue;
+        }
+        // Two figures, both wanted: cycles per compressed byte is what the
+        // receiver pays per byte off the wire, and cycles per output byte is
+        // what the decode costs the frame. They differ by the ratio.
+        ESP_LOGW(TAG,"BENCH name=cpu_tinfl_r%u ratio_x1000=%u in_bytes=%u out_bytes=%u"
+            " repeats=%u cyc_per_in_x1000=%u cyc_per_out_x1000=%u",
+            (unsigned)(blob->ratio_x1000 / 1000u), (unsigned)blob->ratio_x1000,
+            (unsigned)blob->length, (unsigned)BENCH_BLOB_SOURCE_BYTES,
+            BENCH_CPU_REPEATS,
+            (unsigned)(cyc * 1000u / BENCH_CPU_REPEATS / blob->length),
+            (unsigned)(cyc * 1000u / BENCH_CPU_REPEATS / BENCH_BLOB_SOURCE_BYTES));
+    }
+
+    // The expander as it ships, on the indexed data the wire actually carries.
+    {
+        const size_t pixels = src_bytes / 2u;
+        uint16_t palette[AV_PALETTE_ENTRIES];
+        for (unsigned i = 0; i < AV_PALETTE_ENTRIES; i++) palette[i] = (uint16_t)(i * 257u);
+        uint64_t cyc = 0;
+        for (unsigned r = 0; r < BENCH_CPU_REPEATS; r++) {
+            // Every index value present, so no palette entry is cold in cache
+            // and no value is special -- the product's own stream is arbitrary.
+            for (size_t i = 0; i < pixels; i++) exp[i] = (uint8_t)i;
+            uint32_t t = bench_cycles();
+            av_expand_indexed(exp, pixels, palette);
+            cyc += bench_cycles() - t;
+        }
+        ESP_LOGW(TAG,"BENCH name=cpu_expand_cur pixels=%u repeats=%u cyc_per_pixel_x1000=%u",
+                 (unsigned)pixels, BENCH_CPU_REPEATS,
+                 (unsigned)(cyc * 1000u / BENCH_CPU_REPEATS / pixels));
+    }
+done:;
+    free(src); free(out); free(exp); free(infl);
+}
+
+static void hw_bench(void) {
+    if (bsp_display_raw_claim() != ESP_OK) {
+        ESP_LOGE(TAG,"BENCH aborted: panel busy");
+        return;
+    }
+    ESP_LOGW(TAG,"BENCH begin version=1 floor_ms=%u pclk_hz=%u width=%u height=%u"
+        " stripe_rows=%u stripes=%u heap=%u",
+        (unsigned)PANEL_FLOOR_MS, (unsigned)BSP_LCD_PCLK_HZ,
+        (unsigned)AV_WIDTH, (unsigned)AV_HEIGHT,
+        (unsigned)AV_STRIPE_ROWS, (unsigned)AV_STRIPES,
+        (unsigned)esp_get_free_heap_size());
+    // Stripe height is swept to separate the fixed per-stripe addressing and
+    // synchronisation cost from the pixel clock: the same pixels at three
+    // stripe heights differ only in how many times that fixed cost is paid.
+    bench_display_variant("disp_stripes12", 12);
+    if (AV_HEIGHT % 30u == 0u) bench_display_variant("disp_stripes30", 30);
+    if (AV_HEIGHT % 60u == 0u) bench_display_variant("disp_stripes60", 60);
+    bench_display_onewindow();
+    bench_cpu();
+    ESP_LOGW(TAG,"BENCH end heap=%u largest=%u",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    bsp_display_raw_release();
+}
+#endif
 // The SMPTE-style bars, in the order they are conventionally drawn: white,
 // yellow, cyan, green, magenta, red, blue. Seven equal vertical bars fill the
 // width exactly because 320/7 is not a whole number of pixels -- each bar takes
@@ -3092,6 +3461,12 @@ void av_player_main(void) {
     // one line in the boot log; see the function for what it settles.
     display_bench();
 #endif
+#ifdef CONFIG_AV_HW_BENCH
+    // Same place, same reason, and it runs even when AV_DISPLAY_BENCH is off.
+    // Both take the panel and both release it before returning, so the order
+    // between them does not matter.
+    hw_bench();
+#endif
     // The USB peripheral, when this build measures with it. Not installed
     // otherwise: it holds about 20 KB of internal RAM in ring buffers for the
     // life of the device, and a build that never uses it should not pay that
@@ -3211,6 +3586,9 @@ void av_player_main(void) {
         atomic_store(&s.rx_stray_packets,0u); atomic_store(&s.rx_max_stripes,0u);
         atomic_store(&s.rx_nobuf_packets,0u);
         atomic_store(&s.rx_header_gap_max_ms,0u);
+#ifdef CONFIG_AV_HW_BENCH
+        atomic_store(&s.rx_cycles,0u);
+#endif
         s.audio_high=s.video_high=0; s.clock_us=0;
         atomic_store(&s.media_started,false);
         // Back to "dialling", but only when that is worth saying.
@@ -3314,6 +3692,9 @@ void av_player_main(void) {
         uint32_t last_expand_us=0, last_enlarge_us=0, last_overlay_us=0,
                  last_submit_us=0;
         uint32_t last_rx_bytes=0, last_rx_pkts=0, last_rx_audio=0;
+#ifdef CONFIG_AV_HW_BENCH
+        uint32_t last_rx_cycles=0;
+#endif
         uint32_t last_rx_io=0, last_rx_wait=0, last_rx_iters=0;
         while((xEventGroupGetBits(s.events)&(RX_DONE|AUDIO_DONE|VIDEO_DONE))!=(RX_DONE|AUDIO_DONE|VIDEO_DONE)) {
             // A channel was chosen: end this session and reconnect on the new
@@ -3434,6 +3815,23 @@ void av_player_main(void) {
                 uint32_t rx_io=atomic_load(&s.rx_io_us)-last_rx_io;
                 uint32_t rx_wait=atomic_load(&s.rx_wait_us)-last_rx_wait;
                 uint32_t rx_iters=atomic_load(&s.rx_iterations)-last_rx_iters;
+#ifdef CONFIG_AV_HW_BENCH
+                // The receive path's real cost, in cycles, over this interval.
+                //
+                // Reported with the byte count it was measured over, because the
+                // figure only means something as a ratio: cycles per byte is
+                // what the handoff wanted and could not get, and it is the one
+                // number that decides whether the receiver still has headroom at
+                // the frame rate the panel might reach once it is unblocked.
+                //
+                // Bytes are video plus audio, since the counter wraps every
+                // recv() on the one socket both arrive on -- which is the point:
+                // a per-stream attribution is not available here and was never
+                // the question.
+                uint32_t rx_cycles=atomic_load(&s.rx_cycles)-last_rx_cycles;
+                uint32_t rx_all_bytes=rx_bytes+rx_audio*(uint32_t)AV_AUDIO_BYTES;
+                uint32_t rx_cpb=rx_all_bytes ? (uint32_t)((uint64_t)rx_cycles/rx_all_bytes) : 0u;
+#endif
                 // The stripe's cost, split. `parts_sum` is not a measurement:
                 // it is the four parts added up on the way out, so that a
                 // reader can see at a glance whether they account for
@@ -3459,6 +3857,9 @@ void av_player_main(void) {
                     " expand_ms=%"PRIu32" enlarge_ms=%"PRIu32" overlay_ms=%"PRIu32" submit_ms=%"PRIu32" parts_ms=%"PRIu32
                     " rx_pkts=%"PRIu32" rx_bps=%"PRIu32" rx_audio=%"PRIu32" rssi=%d"
                     " io_ms=%"PRIu32" wait_ms=%"PRIu32" iters=%"PRIu32" per_iter_us=%"PRIu32
+#ifdef CONFIG_AV_HW_BENCH
+                    " rx_cyc=%"PRIu32" rx_cyc_per_byte=%"PRIu32
+#endif
                     " starts=%"PRIu32" late=%"PRIu32" stray=%"PRIu32" maxstripes=%"PRIu32 " nobuf=%"PRIu32
                     " hdrgap_max=%"PRIu32" phy=%s ch=%u",
                     frames-last_decoded,interval_ms,
@@ -3471,6 +3872,9 @@ void av_player_main(void) {
                     rx_pkts,rx_rate,rx_audio,wifi_rssi(),
                     rx_io/1000,rx_wait/1000,rx_iters,
                     rx_iters ? (uint32_t)(rx_io/rx_iters) : 0,
+#ifdef CONFIG_AV_HW_BENCH
+                    rx_cycles, rx_cpb,
+#endif
                     (uint32_t)atomic_load(&s.rx_frame_starts),
                     (uint32_t)atomic_load(&s.rx_frame_skipped),
                     (uint32_t)atomic_load(&s.rx_stray_packets),
@@ -3483,6 +3887,9 @@ void av_player_main(void) {
                 last_panel_frames+=panel_frames; last_panel_wait+=panel_wait;
                 last_rx_bytes+=rx_bytes; last_rx_pkts+=rx_pkts; last_rx_audio+=rx_audio;
                 last_rx_io+=rx_io; last_rx_wait+=rx_wait; last_rx_iters+=rx_iters;
+#ifdef CONFIG_AV_HW_BENCH
+                last_rx_cycles+=rx_cycles;
+#endif
                 last_expand_us+=expand_us; last_enlarge_us+=enlarge_us;
                 last_overlay_us+=overlay_us; last_submit_us+=submit_us;
                 next_metrics=now+10000000;

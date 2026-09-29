@@ -1,0 +1,20 @@
+# Measurement overlay: the hardware benchmark with the panel clock doubled.
+#
+# Use INSTEAD OF tools/sdkconfig.hw-bench, not alongside it. SDKCONFIG_DEFAULTS
+# is applied in order and later entries win, so the two could be combined, but
+# keeping this file self-contained means the build that produced any given
+# measurement is one file rather than an argv order.
+#
+# CONFIG_AV_HW_BENCH_SPI80 depends on AV_HW_BENCH, so both lines are needed.
+#
+# 80 MHz is outside what the panel is specified for. See the option's help text
+# in main/Kconfig.projbuild for the two independent reasons to doubt it, and
+# note that a run of this configuration is only meaningful with someone looking
+# at the screen.
+#
+# The option cannot be turned on with `idf.py -D CONFIG_AV_HW_BENCH_SPI80=y`:
+# that sets a CMake cache variable, not a Kconfig symbol, and the build succeeds
+# with the option still off. Measured, by building that way for AV_HW_BENCH and
+# finding it unset in the generated sdkconfig.
+CONFIG_AV_HW_BENCH=y
+CONFIG_AV_HW_BENCH_SPI80=y

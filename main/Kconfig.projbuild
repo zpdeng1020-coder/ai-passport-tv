@@ -71,4 +71,69 @@ config AV_DISPLAY_BENCH
 
         Off by default. Both measurements need the device quiet and a human
         reading a console, which is not what a set-top box is doing.
+
+config AV_HW_BENCH
+    bool "Run the hardware benchmark at boot, before the network starts"
+    depends on AV_RAW_PROTOTYPE
+    default n
+    help
+        The successor to AV_DISPLAY_BENCH, and the instrument the handoff of
+        2026-09-28 asks for. Every CPU figure in that handoff is arithmetic:
+        the cost of receiving a byte, of inflating one, of expanding a pixel.
+        None was measured, and the whole optimisation plan is gated on which
+        of the three actually binds.
+
+        Three groups, all before any socket exists so nothing here can be
+        paced by a sender:
+
+        - The panel, as a bus. Stripe height is swept to separate the fixed
+          per-stripe command and synchronisation cost from the pixel clock,
+          and one variant sets the window once and pushes the whole frame
+          without re-sending it. Two more sweep COLMOD and the SPI clock,
+          both of which leave the chip's rated envelope and are therefore
+          only meaningful with a human looking at the screen.
+
+        - The CPU, in cycles, on synthesised stripes of known entropy:
+          memcpy, ROM tinfl at four compression ratios, the current expander,
+          an optimised expander, and a 4x4 block decoder prototype.
+
+        - The receive path, which is the least certain figure of the three
+          and the one that sets the CPU ceiling.
+
+        Everything prints as `BENCH name=... key=value` on one line per item,
+        which tools/bench_summary.py reads.
+
+        Off by default, and it runs before the network comes up: a device that
+        benchmarks on every boot is not a television. AV_DISPLAY_BENCH may be
+        on at the same time; the two do not share state.
+
+config AV_HW_BENCH_SPI80
+    bool "Also clock the panel SPI at 80 MHz (EXCEEDS THE PANEL'S RATING)"
+    depends on AV_HW_BENCH
+    default n
+    help
+        Raises the panel bus from 40 MHz to 80 MHz for the whole build, and
+        ONLY for a build that already has AV_HW_BENCH on -- the product is not
+        reachable from here, which is the point.
+
+        This exceeds what the panel is specified for. The ST7789 datasheet gives
+        a minimum write cycle of 16 ns, which is 62.5 MHz; the C3 can divide its
+        80 MHz APB down to 80, 40 or 26.7 MHz and nothing between, so 40 MHz is
+        the highest compliant rate and 80 is the next step out of the envelope.
+        There is a second, separate reason to doubt it: this board drives SCLK
+        and MOSI through the GPIO matrix (GPIO 8 and 9) rather than the SPI2
+        IOMUX pins (6 and 7), and Espressif only guarantees those two routes are
+        equivalent at or below 40 MHz.
+
+        What the option is for is finding out what happens, because the panel is
+        the measured binding constraint -- 23 ms a frame against a 23.04 ms
+        floor, where the floor is exactly this clock. Halving the clock period
+        would halve the frame time, which is worth more than any other change
+        available. If it works, the picture is intact and the frame rate roughly
+        doubles; if it does not, the picture tears, shifts, or goes blank, and
+        the answer is that the bus cannot go faster and the ceiling is real.
+
+        Whether it works is a question for a person looking at the screen. The
+        console can report a frame rate whether or not the pixels arrive, so a
+        run of this option is only meaningful with someone watching.
 endmenu

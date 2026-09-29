@@ -45,6 +45,45 @@ bool bsp_display_raw_active(void);
 // has accounted for the transfer that read it.
 esp_err_t bsp_display_raw_submit_nowait(int y, int rows, const void *rgb565_be);
 esp_err_t bsp_display_raw_drain(unsigned transfers, uint32_t timeout_ms);
+
+// Open one addressing window for the whole run and push into it without
+// re-sending it. Measurement build only; release() clears the window state.
+//
+// This is the escape hatch from esp_lcd's own window handling.
+// panel_st7789_draw_bitmap sends CASET and RASET and then the pixels, and
+// esp_lcd waits for all transfers already in flight before either command goes
+// out (esp_lcd_panel_io_spi.c, panel_io_spi_tx_param). At fifteen stripes a
+// frame that address-and-synchronise pair is paid fifteen times, and how much
+// of the 30.7 ms floor it accounts for is exactly what the benchmark needs to
+// separate. A caller that knows the whole frame is contiguous can address once
+// and stream into it.
+//
+// The window is the stripe's own rows across the panel's full width, which is
+// the shape every stripe in this project has. Addresses are in panel
+// coordinates after the raw claim's swap_xy/mirror, and the panel's gap is zero
+// on this board (bsp_display_init calls set_gap(0,0)), so no gap offset is
+// applied here. If a future panel needs a gap this must add it, the way
+// panel_st7789_draw_bitmap adds its own.
+//
+// It is not a product path. The product decodes one stripe at a time and
+// submits each as it finishes, which is what lets the picture start before the
+// frame has crossed the wire; this trades that away for the measurement.
+// Ownership rules are submit_nowait's: call drain() before overwriting a
+// buffer, and the buffer must already be RGB565 big-endian.
+//
+// `rows` is carried per push rather than remembered from begin(), because the
+// transfer length has to be known at push time and the caller is the one that
+// knows how many rows its buffer holds.
+//
+// Why begin() takes the whole frame and push() takes a slice: ST7789 advances
+// the write address itself inside an open window, wrapping at the end of it. So
+// the window has to cover everything that will be written -- the whole picture
+// -- and each push then lands where the previous one finished. A window opened
+// per stripe would be the same fifteen addressing commands the product path
+// already pays, which is the cost this variant exists to remove.
+esp_err_t bsp_display_raw_window_begin(int y, int rows);
+esp_err_t bsp_display_raw_window_push(int rows, const void *rgb565_be);
+
 // Internal LVGL ownership guard (initialization only; not concurrent calls).
 bool bsp_display_lvgl_claim(void);
 void bsp_display_lvgl_unclaim(void);

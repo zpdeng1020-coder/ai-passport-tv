@@ -97,6 +97,7 @@
 
 | 文档 | 什么时候读 |
 | --- | --- |
+| [`docs/development/handoff-20260928.md`](../development/handoff-20260928.zh_CN.md) | **做性能优化或换架构之前必读。**硬件推导的理论上限与真机基准计划。 |
 | [`docs/development/state-20260916.md`](../development/state-20260916.zh_CN.md) | **动时序/会话/画质之前必读。** 当前已修/未修/已测的状态；动手前先跟代码核对。 |
 | [`docs/development/metrics-dictionary.md`](../development/metrics-dictionary.zh_CN.md) | 使用或打印任何计数器之前——它到底在数什么，不能被读成什么。 |
 | [`docs/development/live-sender-v2.md`](../development/live-sender-v2.zh_CN.md) | 动 `server/live_sender.py` 之前。 |
