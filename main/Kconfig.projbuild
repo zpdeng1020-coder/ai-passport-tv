@@ -107,4 +107,45 @@ config AV_HW_BENCH
         benchmarks on every boot is not a television. AV_DISPLAY_BENCH may be
         on at the same time; the two do not share state.
 
+config AV_DEMO_PLAYBACK
+    bool "Boot a self-contained playback demo with a live frame-rate readout"
+    depends on AV_RAW_PROTOTYPE
+    default n
+    help
+        Plays a short clip stored in the firmware image, on a loop, with no
+        network and no server, and draws the measured frame rate and the cost
+        of each stage over the picture.
+
+        The clip is stored the way the wire carries it -- one zlib stream per
+        12-row stripe of 3-3-2 indexed pixels -- and drawn by the same steps as
+        the product: inflate, expand through the palette, submit to the raw
+        panel with one transfer kept in flight. So the number on screen is what
+        this pipeline does with the link taken out of it, not a synthetic bus
+        figure.
+
+        Off by default, and it embeds main/demo_clip.bin (regenerate with
+        tools/make_demo_clip.py), so a build that does not ask for it carries
+        neither the clip nor the code. Turn it on with the overlay
+        tools/sdkconfig.playback-demo, not with `idf.py -D`: that form sets a
+        CMake variable and leaves this symbol off.
+config AV_NET_DEMO
+    bool "Boot a minimal network playback benchmark (bypasses the product player)"
+    depends on AV_RAW_PROTOTYPE
+    default n
+    help
+        Boots tools/net_demo_server.py's counterpart: a small receiver that
+        shares nothing with the product's session, receive task or packet
+        protocol. Step 1 draws colour bars, step 2 measures raw TCP receive
+        rate, step 3 receives, inflates and draws unpaced frames so the frame
+        rate on screen is the ceiling of the whole network path. Off by
+        default; enable with tools/sdkconfig.net-demo, not `idf.py -D`.
+config AV_JPEG_BENCH
+    bool "Boot a JPEG decode-speed benchmark (bypasses the player)"
+    depends on AV_RAW_PROTOTYPE
+    default n
+    help
+        Decodes embedded 320x180 4:2:0 JPEG frames with the ROM TJpgDec and
+        prints per-tier decode time. Off by default; enable with
+        tools/sdkconfig.jpeg-bench. Embeds main/jpeg_test.bin
+        (tools/make_jpeg_clip.py).
 endmenu

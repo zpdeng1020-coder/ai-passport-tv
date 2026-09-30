@@ -1,0 +1,3 @@
+# Experiment: the app only ever resolves AF_INET (av_player.c, net_demo.c). IPv6 costs
+# ~7 KB of runtime heap per the ESP-IDF lwIP guide; measure it before adopting.
+# CONFIG_LWIP_IPV6 is not set

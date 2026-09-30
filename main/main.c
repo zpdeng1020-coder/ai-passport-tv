@@ -6,6 +6,9 @@
 //   确定  长按   演示页中=返回菜单(由本文件统一拦截)
 #include "sdkconfig.h"
 #include "av_player.h"
+#include "av_demo.h"
+#include "net_demo.h"
+#include "jpeg_bench.h"
 #include "bsp_i2c.h"
 #include "bsp_display.h"
 #include "bsp_button.h"
@@ -106,6 +109,15 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
 }
 
 void app_main(void) {
+#ifdef CONFIG_AV_JPEG_BENCH
+    jpeg_bench_main();
+#endif
+#ifdef CONFIG_AV_NET_DEMO
+    net_demo_main();
+#endif
+#ifdef CONFIG_AV_DEMO_PLAYBACK
+    av_demo_main();
+#endif
 #ifdef CONFIG_AV_RAW_PROTOTYPE
     av_player_main();
     return;

@@ -1,0 +1,2 @@
+# UDP experiment: a deeper datagram queue.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32

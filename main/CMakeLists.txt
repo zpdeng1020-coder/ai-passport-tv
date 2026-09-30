@@ -11,6 +11,9 @@ idf_component_register(
          "demo_ble.c"
          "demo_low_power.c"
          "av_player.c"
+         "av_demo.c"
+         "net_demo.c"
+         "jpeg_bench.c"
          "av_protocol.c"
          "ui_text.c"
          "ui_menu.c"
@@ -45,4 +48,20 @@ endif()
 # a definition and not only as a Kconfig symbol.
 if(CONFIG_AV_SCREEN_CAPTURE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE AV_SCREEN_CAPTURE=1)
+endif()
+# The playback demo's clip, embedded only when the demo is asked for. Generated
+# by tools/make_demo_clip.py; it is 1.2 MB, so a build without the option must
+# not carry it.
+if(CONFIG_AV_DEMO_PLAYBACK)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/demo_clip.bin")
+        message(FATAL_ERROR "main/demo_clip.bin is missing. Run: python tools/make_demo_clip.py")
+    endif()
+    target_add_binary_data(${COMPONENT_LIB} "demo_clip.bin" BINARY)
+endif()
+
+if(CONFIG_AV_JPEG_BENCH)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/jpeg_test.bin")
+        message(FATAL_ERROR "main/jpeg_test.bin is missing. Run: python tools/make_jpeg_clip.py")
+    endif()
+    target_add_binary_data(${COMPONENT_LIB} "jpeg_test.bin" BINARY)
 endif()
