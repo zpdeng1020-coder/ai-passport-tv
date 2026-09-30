@@ -35,12 +35,15 @@ CONFIG_FREERTOS_HZ=1000
 # 索引画面需要约 420 KB/s。表现是音频欠载、每 8 秒左右断一次会话，看起来像
 # Wi-Fi 信号差，实际是窗口太小。
 #
-# 调到 32 KB：足以容纳两个最大视频包，给重传留出余量，又远小于这块芯片的可用
-# 堆（会话期约 105 KB）。发送缓冲一并调大，设备发出的只是控制包，但两者用同一
-# 份默认值，分开调容易只改一半。
-CONFIG_LWIP_TCP_WND_DEFAULT=32768
+# 先调到 32 KB，后来调到 64 KB。窗口大小影响的是流畅度而不是速度：热点上交替
+# 测 100 秒，32 KB 是 3 次和 9 次音频中断、各 1 次会话重置，64 KB 是两次都 0 次
+# 音频中断、0 次重置，帧率中位数相同（单次运行）。
+# 接收邮箱和 Wi-Fi 动态接收池要跟着放大，否则窗口宣告的比设备装得下的多，多出
+# 的部分在驱动里被丢掉（sdkconfig.av-prototype 里有这条的实测）。动态缓冲只在用到
+# 时才占堆。发送缓冲保持 32 KB：设备发出的只是控制包。
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
-CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=48
 
 # --- Bluetooth LE / NimBLE ---
 # ESP32-C3 仅支持 BLE；示例只启用单连接 peripheral 所需的最小 host 配置。

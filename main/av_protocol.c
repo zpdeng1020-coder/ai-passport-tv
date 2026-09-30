@@ -167,6 +167,30 @@ uint16_t av_palette_rgb565(uint8_t index) {
     uint16_t b5=(uint16_t)((b2<<3)|(b2<<1)|(b2>>1));
     return (uint16_t)((r5<<11)|(g6<<5)|b5);
 }
+void av_palette_wire_order(uint16_t table[AV_PALETTE_ENTRIES]) {
+    for (unsigned i=0;i<AV_PALETTE_ENTRIES;i++) table[i]=__builtin_bswap16(table[i]);
+}
+void av_expand_indexed_wire(uint8_t *buf, size_t pixels, const uint16_t *wire_palette) {
+    // Every access is a 4-byte memcpy from a pointer the compiler is told is
+    // aligned, which becomes a single load or store and is not a strict-aliasing
+    // violation the way reading the byte buffer through a uint32_t pointer is.
+    uint8_t *aligned=__builtin_assume_aligned(buf,4);
+    size_t whole=pixels&~(size_t)3u;
+    // The remainder sits above every whole group, so it is expanded first: its
+    // writes land at 2i, which is above every index still to be read.
+    for (size_t i=pixels; i-- > whole;) {
+        uint16_t colour=wire_palette[aligned[i]];
+        memcpy(aligned+2*i,&colour,2);
+    }
+    for (size_t k=whole/4; k-- > 0;) {
+        uint32_t w;
+        memcpy(&w,aligned+4*k,4);
+        uint32_t high=(uint32_t)wire_palette[(w>>16)&0xffu] | ((uint32_t)wire_palette[w>>24]<<16);
+        uint32_t low =(uint32_t)wire_palette[w&0xffu]       | ((uint32_t)wire_palette[(w>>8)&0xffu]<<16);
+        memcpy(aligned+8*k+4,&high,4);
+        memcpy(aligned+8*k,&low,4);
+    }
+}
 void av_expand_indexed(uint8_t *buf, size_t pixels, const uint16_t *palette) {
     // Backwards: see the note on the declaration. Walking forwards would
     // overwrite the index at buf[1] on the very first step.

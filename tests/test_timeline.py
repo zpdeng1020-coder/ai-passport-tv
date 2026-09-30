@@ -365,6 +365,7 @@ class MultiPacketFrameTests(unittest.TestCase):
         channel._video_advanced = channel._audio_advanced = False
 
         import random
+        from unittest.mock import patch
         from server import frames
         random.seed(1234)
         noise = bytes(random.randrange(256) for _ in range(frames.WIDTH * frames.HEIGHT))
@@ -372,7 +373,11 @@ class MultiPacketFrameTests(unittest.TestCase):
         self.assertGreater(len(packets), 1)
 
         # One frame pushed: one content stamp, and the packet list stays whole.
-        channel._push_video(noise, 0.0)
+        # Run with delta off, which is the mode where the queue holds a frame's
+        # packets; with it on the entry is the raw frame and the packets are made
+        # at send time, which test_delta_encoding covers.
+        with patch.object(frames, "DELTA", False):
+            channel._push_video(noise, 0.0)
         self.assertEqual(len(channel.video), 1, "one frame is one queue entry")
         self.assertEqual(len(channel.video_content), 1,
                          "one frame is one content stamp, however many packets")

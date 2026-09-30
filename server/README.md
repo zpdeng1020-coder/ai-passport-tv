@@ -8,8 +8,10 @@ This is an opt-in, single-device **LAN player for live channels, video files and
 synthetic media**. It is not an Internet proxy or a production authentication
 service. Python 3.11+ and its standard library serve the media; ffmpeg is needed
 to prepare files and to transcode the `live` subcommand, so that host needs it
-installed. No pip dependencies, device access or global configuration changes
-are required. Start commands below from the repository root.
+installed. `numpy` is an **optional** pip dependency: with it, a live frame that does not fit its
+byte target gives detail up perceptually (`server/perceptual.py`); without it, or with
+`TV_PERCEPTUAL=0`, the server steps through the colour ladder as before. No device access
+or global configuration changes are required. Start commands below from the repository root.
 
 Channel addresses live in a fixed allowlist in `server/live.py`. They come from a
 community IPTV playlist, so their availability and rights status are not verified;

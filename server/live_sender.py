@@ -107,7 +107,9 @@ def repack(parts: list[bytes], target: int) -> list[bytes]:
         if first != expected or not count or first + count > frames.STRIPES or table_end > len(part):
             raise ValueError('noncontiguous stripe packet')
         lengths = [int.from_bytes(part[2 + 2*i:4 + 2*i], 'big') for i in range(count)]
-        if not all(lengths) or table_end + sum(lengths) != len(part):
+        # A zero length is a stripe the sender chose not to resend (TV_DELTA);
+        # it is carried through as an empty entry, not treated as corruption.
+        if table_end + sum(lengths) != len(part):
             raise ValueError('invalid stripe lengths')
         for size in lengths:
             stripes.append(part[table_end:table_end + size])
@@ -150,7 +152,7 @@ class LiveSender:
             self.video_budget = float(budget)
         else:
             min_fps = max(1, int(os.environ.get('TV_MIN_FPS', '1')))
-            max_fps = max(min_fps, int(os.environ.get('TV_MAX_FPS', str(FPS))))
+            max_fps = max(min_fps, int(os.environ.get('TV_MAX_FPS', str(rate.MAX_FPS))))
             start_fps = int(os.environ.get('TV_START_FPS', '3'))
             start_fps = max(min_fps, min(max_fps, start_fps))
             self.rate = RateController(minimum=min_fps, maximum=max_fps, start=start_fps)

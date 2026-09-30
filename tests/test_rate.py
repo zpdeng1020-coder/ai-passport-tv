@@ -12,8 +12,9 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from server.rate import (FAST_WRITE_MS, MAX_FPS, MIN_FPS, SLOW_WRITE_MS,
-                         START_FPS, WINDOWS_BEFORE_UP, RateController)
+from server.rate import (FAST_WRITE_MS, FRAME_BYTES, MAX_FPS, MIN_FPS, MIN_RATE_BPS,
+                         RATE_STEP_DOWN, RATE_STEP_UP, SLOW_WRITE_MS, START_FPS,
+                         WINDOWS_BEFORE_UP, ByteRate, RateController, start_rate)
 
 
 # The rate the behaviour is observed from: the top of the range, so every case
@@ -29,6 +30,9 @@ from server.rate import (FAST_WRITE_MS, MAX_FPS, MIN_FPS, SLOW_WRITE_MS,
 TOP = MAX_FPS - 1
 
 class ControllerTests(unittest.TestCase):
+    # These drive RateController, the adaptive-FRAME-rate controller. The default
+    # sender no longer uses it (see ByteRate below); the packet-boundary sender in
+    # live_sender.py (TV_LIVE_ENGINE=v2) still does, so it stays covered.
     def test_a_stalled_write_lowers_the_rate_immediately(self):
         """One write over the line is enough, and it cannot be averaged away.
 
@@ -352,6 +356,115 @@ class ControllerTests(unittest.TestCase):
         control.observe(960_000, 5000.0, dropped=3)
         self.assertIn("dropped", control.describe())
         self.assertIn("ms", control.describe())
+
+
+class ByteRateTests(unittest.TestCase):
+    """The default sender's controller: the frame rate is fixed, the byte rate moves."""
+
+    FPS = 25
+    USED = 0.9  # a window that used most of the rate
+
+    def make(self, **kw):
+        return ByteRate(self.FPS, start=200_000, minimum=100_000, maximum=350_000, **kw)
+
+    def used(self, control):
+        return int(control.rate * self.USED)
+
+    def test_the_frame_rate_never_moves(self):
+        control = self.make()
+        for write in (10, 500, 10, 10, 800, 10):
+            self.assertEqual(control.observe(150_000, write, frames=25), self.FPS)
+        self.assertEqual(control.fps, self.FPS)
+
+    def test_a_stalled_write_lowers_the_byte_rate_at_once(self):
+        control = self.make()
+        control.observe(self.used(control), SLOW_WRITE_MS + 50, frames=25)
+        self.assertEqual(control.rate, int(200_000 * RATE_STEP_DOWN))
+        control.observe(self.used(control), SLOW_WRITE_MS + 50, frames=25)
+        self.assertEqual(control.rate, int(int(200_000 * RATE_STEP_DOWN) * RATE_STEP_DOWN))
+        self.assertIn("write was", control.reason)
+
+    def test_the_rate_bottoms_out_and_says_so(self):
+        control = self.make()
+        for _ in range(40):
+            control.observe(50_000, SLOW_WRITE_MS + 50, frames=25)
+        self.assertEqual(control.rate, control.minimum)
+        self.assertIn("floor", control.reason)
+
+    def test_it_climbs_only_after_several_windows_of_using_the_rate_and_writing_fast(self):
+        control = self.make()
+        for _ in range(WINDOWS_BEFORE_UP - 1):
+            control.observe(self.used(control), FAST_WRITE_MS - 20, frames=25)
+            self.assertEqual(control.rate, 200_000)
+        control.observe(self.used(control), FAST_WRITE_MS - 20, frames=25)
+        self.assertEqual(control.rate, int(200_000 * RATE_STEP_UP))
+
+    def test_a_quiet_channel_is_not_evidence_of_room(self):
+        # Every write is instant because nothing is being written. Raising the
+        # rate on that would open the gate for the next cut to spend all of it.
+        control = self.make()
+        for _ in range(20):
+            control.observe(int(control.rate * 0.3), 5.0, frames=25)
+        self.assertEqual(control.rate, 200_000)
+
+    def test_it_stops_at_the_ceiling(self):
+        control = self.make()
+        for _ in range(200):
+            control.observe(self.used(control), 10.0, frames=25)
+        self.assertEqual(control.rate, control.maximum)
+
+    def test_one_isolated_drop_holds_and_a_run_of_them_lowers(self):
+        control = self.make()
+        control.observe(self.used(control), 30.0, dropped=1, frames=24)
+        self.assertEqual(control.rate, 200_000)
+        control.observe(self.used(control), 30.0, dropped=1, frames=24)
+        self.assertEqual(control.rate, int(200_000 * RATE_STEP_DOWN))
+        self.assertIn("second window", control.reason)
+
+    def test_a_clean_window_ends_a_run_of_drops(self):
+        control = self.make()
+        control.observe(self.used(control), 30.0, dropped=1, frames=24)
+        control.observe(self.used(control), 30.0, frames=25)
+        control.observe(self.used(control), 30.0, dropped=1, frames=24)
+        self.assertEqual(control.rate, 200_000)
+
+    def test_an_empty_window_neither_lowers_nor_raises_and_breaks_the_climb(self):
+        control = self.make()
+        control.observe(self.used(control), 10.0, frames=25)
+        control.observe(0, 0.0)
+        self.assertIn("no measurement", control.reason)
+        control.observe(self.used(control), 10.0, frames=25)
+        self.assertEqual(control.rate, 200_000, "the empty window reset the count")
+
+    def test_a_window_is_judged_over_the_time_it_actually_lasted(self):
+        # 1.8 s of frames in one long window must not read as 1.8 s of rate.
+        control = self.make()
+        control.observe(int(200_000 * 0.9 * 1.8), 10.0, frames=45, window_s=1.8)
+        control.observe(int(200_000 * 0.9 * 1.8), 10.0, frames=45, window_s=1.8)
+        self.assertEqual(control.rate, int(200_000 * RATE_STEP_UP))
+
+    def test_held_means_held(self):
+        control = self.make(adaptive=False)
+        for write in (5, 900, 5):
+            control.observe(200_000, write, dropped=3, frames=25)
+        self.assertEqual(control.rate, 200_000)
+        self.assertEqual(control.reason, "fixed")
+
+    def test_the_defaults_are_a_usable_range(self):
+        for fps in (5, 25, 30):
+            control = ByteRate(fps)
+            self.assertTrue(control.minimum <= control.rate <= control.maximum)
+            self.assertEqual(control.rate, FRAME_BYTES * fps)
+
+    def test_the_target_is_a_size_per_frame_not_a_rate(self):
+        self.assertEqual(start_rate(25) // 25, start_rate(30) // 30)
+        self.assertGreater(start_rate(30), start_rate(25))
+
+    def test_a_start_outside_the_range_is_refused(self):
+        with self.assertRaises(ValueError):
+            ByteRate(25, start=50_000, minimum=100_000, maximum=350_000)
+        with self.assertRaises(ValueError):
+            ByteRate(0)
 
 
 if __name__ == "__main__":

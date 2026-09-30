@@ -855,14 +855,18 @@ class LiveSenderTests(unittest.TestCase):
         the expected state and a test that compared them would pass while
         proving nothing.
         """
-        from server.rate import RateController
+        from server.rate import ByteRate
         kinds, server = self._run(seconds=1.5, capture={}, return_server=True)
         self.assertIn("JPEG", kinds)
         # The controller is per session and starts where rate.py says, so a
         # session that has just begun is at that rate whatever the file's
-        # default is.
-        self.assertIsInstance(getattr(server, "_last_controller", None),
-                              RateController)
+        # default is. What it must NOT do is move the frame rate: that is the
+        # source's own and is fixed for the session.
+        controller = getattr(server, "_last_controller", None)
+        self.assertIsInstance(controller, ByteRate)
+        self.assertEqual(controller.fps, FPS)
+        self.assertGreaterEqual(controller.rate, controller.minimum)
+        self.assertLessEqual(controller.rate, controller.maximum)
 
     def test_live_sender_streams_audio_and_video(self):
         kinds = self._run()

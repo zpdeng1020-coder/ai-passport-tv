@@ -36,12 +36,16 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import frames, pts
+try:
+    from . import perceptual
+except ImportError:
+    perceptual = None
 from .timeline import (BASIS_COMMON_DECODE, BASIS_LAUNCH, ContentTimeline,
                        SessionClock, SourceState, VERDICT_IN_HOLE,
                        VERDICT_NOT_YET, VERDICT_PLACED)
 from .media import (AUDIO_CHUNK_MS, AUDIO_LEAD_MS, FPS, START_DELAY_MS,
                     VIDEO_LEAD_MS, WIDTH as VIDEO_WIDTH)
-from .protocol import AUDIO_BYTES, VIDEO_MAX
+from .protocol import AUDIO_BYTES, HEADER, VIDEO_MAX
 # Device-side limits, mirroring main/av_protocol.h. A channel id the firmware
 # would skip must be rejected here instead, where it can be reported; the
 # tests cross-check these against the header so the two cannot drift.
@@ -271,7 +275,7 @@ PREBUFFER_CHUNKS = int(PREBUFFER_SECONDS * 1000 / AUDIO_CHUNK_MS)   # 20 ms each
 # source -- and a duration is what it should be counted in. The rate to count it
 # at is the one the link was measured carrying, which is what `START_FPS` is:
 # where the median channel lands, and where a session begins.
-from .rate import START_FPS as _START_FPS
+from .rate import START_FPS as _START_FPS, start_rate
 
 PREBUFFER_FRAMES = int(PREBUFFER_SECONDS * _START_FPS)
 # Only the backstop for an origin that never produces anything at all: the
@@ -565,16 +569,27 @@ AUDIO_SAMPLES = AUDIO_BYTES // 2
 # `ashowinfo` line would cover two blocks and every timestamp after the first
 # would be paired with the wrong payload.
 PRE_FILTER = os.environ.get("TV_PRE_FILTER", "").strip()
+# What is done with a frame that does not fit its byte target. On, it gives detail
+# up perceptually (server/perceptual.py); off, or without numpy, it steps through
+# the colour ladder (frames.encode_within). A frame that fits is sent as ffmpeg
+# made it either way.
+PERCEPTUAL = (perceptual is not None and perceptual.AVAILABLE
+              and os.environ.get("TV_PERCEPTUAL", "1") != "0")
 _VIDEO_CHAIN = f"{frames.FIT},{PRE_FILTER}" if PRE_FILTER else frames.FIT
-SOURCE_GRAPH = (
-    f"[0:v]setpts=PTS-STARTPTS,fps={FPS},{_VIDEO_CHAIN},format=rgb8,showinfo[v];"
-    f"[0:a]asetpts=PTS-STARTPTS,aresample={AUDIO_RATE},aformat=channel_layouts=mono,"
-    f"asetnsamples=n={AUDIO_SAMPLES},ashowinfo[a]"
-)
+def source_graph(fps: int) -> str:
+    """The filter graph for a source whose picture is to be produced at `fps`."""
+    return (
+        f"[0:v]setpts=PTS-STARTPTS,fps={fps},{_VIDEO_CHAIN},format=rgb8,showinfo[v];"
+        f"[0:a]asetpts=PTS-STARTPTS,aresample={AUDIO_RATE},aformat=channel_layouts=mono,"
+        f"asetnsamples=n={AUDIO_SAMPLES},ashowinfo[a]"
+    )
+
+
+SOURCE_GRAPH = source_graph(FPS)
 
 
 def source_command(url: str, video_port: int, audio_port: int, ffmpeg: str,
-                   user_agent: str = "") -> list[str]:
+                   user_agent: str = "", fps: int = FPS) -> list[str]:
     """Read the source once and produce both payloads and both timestamps.
 
     The picture is decoded, scaled, and quantised onto ffmpeg's own fixed 3-3-2
@@ -613,7 +628,7 @@ def source_command(url: str, video_port: int, audio_port: int, ffmpeg: str,
         ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "info", "-nostats",
         *frames.input_options(url, user_agent, paced=True),
         "-i", url,
-        "-filter_complex", SOURCE_GRAPH,
+        "-filter_complex", source_graph(fps),
         "-map", "[v]", "-pix_fmt", "rgb8", "-sws_dither", "none",
         "-threads", "1", "-f", "rawvideo", f"tcp://127.0.0.1:{video_port}",
         "-map", "[a]", "-f", "s16le", f"tcp://127.0.0.1:{audio_port}",
@@ -718,6 +733,89 @@ def stream_start_times(url: str, ffmpeg: str, user_agent: str = "",
     return found["video"], found["audio"]
 
 
+# The highest rate a picture is produced at. It is the device's own bound
+# (`json_between(j,"fps",1,30)` in main/av_player.c), and a source above it is
+# brought under it rather than refused.
+MAX_SOURCE_FPS = 30
+# How long ffprobe may spend finding a channel's frame rate. It sits in front of
+# the first picture on every channel change, so it is kept short, and a source
+# that cannot answer in that time is played at the nominal rate instead.
+FPS_PROBE_TIMEOUT_S = float(os.environ.get("TV_FPS_PROBE_TIMEOUT_S", "5"))
+_FPS_CACHE: dict[str, int] = {}
+
+
+def parse_rate(text: str) -> float | None:
+    """A frame rate as ffprobe writes it, "25/1" or "30000/1001" -- or None.
+
+    "0/0" is how ffprobe says it does not know, and it is common on live HLS, so
+    it is an answer of None and not an error.
+    """
+    try:
+        num, _, den = str(text).partition("/")
+        value = float(num) / float(den or 1)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return value if value > 0 else None
+
+
+def choose_fps(avg: float | None, real: float | None) -> int | None:
+    """The whole-number rate to produce a picture at, from what ffprobe reported.
+
+    The average is preferred, and the difference matters: a 25 fps programme
+    carried as 50 fields reports `r_frame_rate` 50 and `avg_frame_rate` 25, and
+    producing 50 would be twice the frames the channel has. When only the
+    container's rate is known and it is over the bound, it is halved until it is
+    under, so 50 becomes 25 rather than being clipped to 30 and resampled unevenly.
+    """
+    rate = avg if avg else real
+    if not rate:
+        return None
+    while rate > MAX_SOURCE_FPS:
+        rate /= 2
+    return max(1, round(rate))
+
+
+def probe_source_fps(url: str, ffmpeg: str, user_agent: str = "") -> int | None:
+    """The frame rate this source's picture should be produced at, or None.
+
+    None means the source did not say, and the caller plays it at the nominal
+    rate. Answers are remembered by URL for the life of the process, so switching
+    back to a channel does not pay for the probe twice.
+    """
+    if url in _FPS_CACHE:
+        return _FPS_CACHE[url]
+    probe = os.path.join(os.path.dirname(ffmpeg), "ffprobe")
+    if not os.path.exists(probe):
+        probe = "ffprobe"
+    command = [probe, "-v", "error"]
+    effective_ua = user_agent or (frames.DEFAULT_USER_AGENT if url.startswith(("http://", "https://")) else "")
+    if effective_ua:
+        command += ["-user_agent", effective_ua]
+    command += ["-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+                "-of", "json", url]
+    try:
+        done = subprocess.run(command, capture_output=True, text=True,
+                              timeout=FPS_PROBE_TIMEOUT_S)
+        if done.returncode != 0:
+            return None
+        streams = json.loads(done.stdout).get("streams", [])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if not streams:
+        return None
+    fps = choose_fps(parse_rate(streams[0].get("avg_frame_rate", "")),
+                     parse_rate(streams[0].get("r_frame_rate", "")))
+    if fps is not None:
+        _FPS_CACHE[url] = fps
+    return fps
+
+
+class _QueuedFrame(list):
+    """A frame's packets, carrying the raw frame they were cut from (TV_DELTA)."""
+    raw: bytes | None = None
+
+
 class LiveChannel:
     """Own one channel: a palette, a picture process, an audio process, and the
     bounded queues between them and the sender."""
@@ -732,6 +830,13 @@ class LiveChannel:
         self.stop = threading.Event()
         self.audio = collections.deque(maxlen=PCM_QUEUE_CHUNKS)
         self.video = collections.deque(maxlen=VIDEO_QUEUE_FRAMES)
+        # What the device has been sent so far, and a counter that picks which
+        # stripe is refreshed regardless. Unused with TV_DELTA=0, and set up
+        # per channel because a channel is a session: a new one starts from a
+        # panel that shows nothing of ours. See frames.choose_stripes.
+        self._shown: bytes | None = None
+        self._delta_tick = 0
+        self._snap_level = 0
         # When each queued item ARRIVED, in step with the two queues above.
         #
         # This is what the picture is aligned by, and the reason is that it needs
@@ -778,10 +883,13 @@ class LiveChannel:
         self.source = SourceState()
         self._video_advanced = False
         self._audio_advanced = False
-        # The rate the link is currently taking pictures at, and when the last
-        # frame was accepted. See set_target_fps and _push_video.
-        self._target_fps = FPS
-        self._last_push: float | None = None
+        # The picture's frame rate, fixed for the session. FPS is the nominal
+        # figure until start() has asked the source; see resolve_fps.
+        self.fps = FPS
+        self.fps_note = "nominal"
+        # The picture's byte rate, set by the sender's controller. Each frame is
+        # compressed to fit rate / fps; see frames.ByteBudget and encode_within.
+        self._budget = frames.ByteBudget(start_rate(FPS), FPS)
         self.lock = threading.Lock()
         self.error: Exception | None = None
         self.dropped_video = 0
@@ -790,6 +898,7 @@ class LiveChannel:
         self.produced_video = 0
         self.encoded_video_bytes = 0
         self.encode_seconds = 0.0
+        self.coarse_frames = 0
         #: The one decoder. It produces both payloads and both timestamps.
         self.decoder: subprocess.Popen | None = None
         self.timestamps: pts.Timestamps | None = None
@@ -899,6 +1008,7 @@ class LiveChannel:
             raise LiveError("start() before build_palette()")
         if self.palette is None:
             raise LiveError("start() before build_palette()")
+        self.resolve_fps()
         # Picture and sound come from a single decoder process, delivered over
         # two loopback TCP connections rather than the anonymous pipes this
         # used before. See source_command() for why: Windows' subprocess module
@@ -936,7 +1046,7 @@ class LiveChannel:
             self.timestamps = pts.Timestamps()
             self.decoder = subprocess.Popen(
                 source_command(self.url, video_port, audio_port, self.ffmpeg,
-                               self.user_agent),
+                               self.user_agent, self.fps),
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE)
             self.pts_reader = pts.Reader(self.decoder.stderr, self.timestamps)
@@ -1134,7 +1244,17 @@ class LiveChannel:
         already counted against.
         """
         encode_started = time.monotonic()
-        packets = frames.frame_packets(frame)
+        if frames.DELTA:
+            # Nothing is compressed here. The raw frame travels alone, and which
+            # stripes to send is decided when the frame is sent, against what was
+            # actually sent before it and what the byte budget has left. Deciding
+            # here would be against the previous frame produced, and the queue
+            # below discards frames. Compressing here as well used to cost every
+            # frame twice, the first time for packets that were then thrown away.
+            packets = _QueuedFrame()
+            packets.raw = frame
+        else:
+            packets = frames.frame_packets(frame)
         with self.lock:
             self.produced_video = getattr(self, "produced_video", 0) + 1
             self.encoded_video_bytes = getattr(self, "encoded_video_bytes", 0) + sum(map(len, packets))
@@ -1255,22 +1375,37 @@ class LiveChannel:
         with self.lock:
             return len(self.audio) * AUDIO_CHUNK_MS
 
-    def set_target_fps(self, fps: int) -> None:
-        """Tell the producer how fast the link is taking pictures.
+    def set_video_rate(self, rate: int) -> None:
+        """Tell the encoder how many bytes a second the picture may cost.
 
-        ffmpeg's own rate is fixed when the process starts, and restarting it to
-        change that would cost the session its stream and its palette. So the
-        producer keeps running at the ceiling and the excess is dropped here
-        instead, which is cheaper than it sounds: ffmpeg is decoding and
-        compressing on the host, and the frame is discarded before it is
-        queued rather than after it has crossed the link.
-
-        Without this the queue is fed faster than it is drained on every channel
-        the controller holds below the ceiling -- which, after the ceiling became
-        a per-channel derivation, is most of them.
+        Called by the sender once a second with what its controller decided. The
+        frame rate is not adjustable and is not offered: the only thing a slow
+        link can take from the picture is detail.
         """
         with self.lock:
-            self._target_fps = max(1, fps)
+            self._budget.set_rate(rate)
+
+    def resolve_fps(self) -> int:
+        """Fix this channel's frame rate, once, before anything is produced.
+
+        `TV_FPS` set explicitly wins outright, so a measurement can force a rate.
+        Otherwise the source is asked and its own rate is used, up to the device's
+        bound; a source that does not answer is played at the nominal rate. The
+        answer is what ffmpeg is told to produce, what the timeline counts in and
+        what the sender paces by, so all three agree by construction.
+        """
+        if "TV_FPS" in os.environ:
+            fps, note = FPS, "TV_FPS"
+        else:
+            probed = probe_source_fps(self.url, self.ffmpeg, self.user_agent)
+            fps, note = (probed, "probed") if probed else (FPS, "nominal; source did not say")
+        self.fps, self.fps_note = fps, note
+        self.timeline = ContentTimeline(video_interval_ms=1000.0 / fps,
+                                        audio_interval_ms=AUDIO_CHUNK_MS)
+        with self.lock:
+            self._budget.set_fps(fps)
+            self._budget.set_rate(start_rate(fps))
+        return fps
 
     def pop_video(self, keep: int = 0) -> tuple[list[bytes], int] | None:
         """The frame whose CONTENT matches the sound the sender is about to send.
@@ -1369,10 +1504,40 @@ class LiveChannel:
                 self.video_content.popleft()
                 if self.video_at:
                     self.video_at.popleft()
-                packets = self.video.popleft()
+                packets = self._delta_encode(self.video.popleft())
                 self.session_clock.note_pair(frame_at, ref_audio)
                 return packets, stamp
             return None
+
+    def _delta_encode(self, packets):
+        """Turn a queued raw frame into the packets that go on the wire.
+
+        Runs at the moment of sending, holding the lock: the choice depends on
+        what the device has been sent and on what the byte budget has left, and
+        both are only known now. It costs a few milliseconds of Python a frame
+        (measured offline, 0.3 to 3.7 ms across six channels), which the sender's
+        loop can afford at 30 frames a second. Without TV_DELTA the packets were
+        already compressed and are returned untouched.
+        """
+        raw = getattr(packets, "raw", None)
+        if raw is None:
+            return packets
+        started = time.monotonic()
+        if PERCEPTUAL:
+            chosen, drawn, rung = perceptual.encode_within(
+                raw, self._shown, self._delta_tick, self._budget.target(), self._snap_level)
+            self._snap_level = rung
+        else:
+            chosen, drawn, rung = frames.encode_within(raw, self._shown, self._delta_tick,
+                                                       self._budget.target())
+        self._delta_tick += 1
+        self._shown = frames.apply_stripes(drawn, self._shown, chosen)
+        out = frames.pack_stripes(chosen)
+        wire = sum(len(part) + HEADER.size for part in out)
+        self.coarse_frames += rung > 0
+        self.encoded_video_bytes += wire
+        self.encode_seconds += time.monotonic() - started
+        return out
 
     def _give_up_frame(self) -> None:
         """Discard the frame at the head of the picture queue. Caller holds the lock."""
@@ -1410,7 +1575,7 @@ class LiveChannel:
                         video_encode_wall_s=round(self.encode_seconds, 4),
                         audio_queue_ms=len(self.audio) * AUDIO_CHUNK_MS,
                         video_queue_frames=len(self.video), audio_skipped=self.skipped_audio,
-                        video_discarded=self.dropped_video)
+                        video_discarded=self.dropped_video, video_coarse=self.coarse_frames)
 
     def trim_backlog(self, maximum_ms: int = 8000, retain_ms: int = 4000) -> int:
         """Trim both streams at one content edge; call between complete frames.
