@@ -28,7 +28,7 @@ class SessionState(str, enum.Enum):
 
 from . import frames, netident
 from .timeline import SourceState
-from .rate import ADAPTIVE, FixedRate, RateController
+from .rate import ADAPTIVE, ByteRate
 from .live import (CHANNELS, CHANNEL_AGENTS, DEFAULT_CHANNEL, LiveChannel, LiveError,
                    AUDIO_MAX_LOOKAHEAD_MS,
                    AUDIO_LATE_RESET_MS, PREBUFFER_SECONDS, PREBUFFER_TIMEOUT_S,
@@ -696,43 +696,24 @@ class AVServer:
         # can leave disagreeing with the present. See the comment in the loop
         # for the two ways this went wrong when it was a due-time instead.
         last_slot = -1
-        # The picture rate, chosen as the session runs rather than fixed for it.
+        # The picture rate is fixed for the session and is the source's own.
         #
-        # A live channel's frames do not all cost the same: a studio shot
-        # compresses to a fraction of one with movement in it, and the same
-        # frames a second is therefore twice the bytes on one channel and half
-        # on another. A rate chosen for the worst case is a rate a quiet channel
-        # is stuck at. See server/rate.py for what decides it and why the
-        # decision is separate from this loop.
+        # It used to be chosen as the session ran, stepping down whenever the link
+        # slowed, and a frame rate that moves is the thing a viewer notices most.
+        # What varies now is the bytes each frame may cost: the controller sets a
+        # byte rate once a second and the channel spends it as it encodes each
+        # frame (frames.encode_within), so a slow link makes the picture coarser
+        # instead of slower. See server/rate.py for the decision.
         #
-        # `fps` here is the rate in force; the controller may change it once a
-        # second, and everything below that used media.FPS now reads this
-        # instead. media.FPS remains the announced rate in CONFIG -- it is not
-        # that the device paces by, since every frame carries its own timestamp
-        # and is scheduled against the audio clock, so the picture can move
-        # without telling it.
-        # Adaptive by default, and each channel's ceiling is derived from that
-        # channel's own frame size rather than fixed for the list.
+        # `fps` is read from the channel because the channel is what asked the
+        # source for it. A stand-in without one -- the test doubles -- is paced at
+        # the nominal rate, which is what it was before.
         #
-        # This comment used to say the adaptive version "is written and tested
-        # but is not in use" and to recommend `TV_ADAPTIVE=1` -- while
-        # `ADAPTIVE` in rate.py defaults to true and the running program has
-        # always taken that branch. A comment that contradicts the code is worse
-        # than no comment: the next reader trusts it, and after a context
-        # compaction that reader is whoever picks this up next.
-        #
-        # What is in force, measured on the device: the rate moves between the
-        # floor of 3 and a ceiling derived as `budget / this channel's bytes a
-        # frame`, so a cheap channel settles near 10 and a heavy one near 3. It
-        # steps down the moment a write is slow or a window is over budget and
-        # climbs after two comfortable windows.
-        #
-        # `TV_ADAPTIVE=0` still exists and pins the rate at media.FPS, which is
-        # what a measurement wants: a sweep that asked what the device does at
-        # ten frames a second would otherwise be told what the controller does
-        # about ten frames a second.
-        controller = RateController() if ADAPTIVE else FixedRate(FPS)
-        fps = controller.fps
+        # `TV_ADAPTIVE=0` holds the byte rate too, which is what a measurement
+        # wants: a sweep at a given rate should learn what the device does at that
+        # rate, not what the controller does about it.
+        fps = getattr(channel, "fps", FPS)
+        controller = ByteRate(fps, adaptive=ADAPTIVE)
         # Kept on the server as well as in the loop so a test can read back the
         # rate a real session settled on, and so the log after a session says
         # where it ended rather than where it started.
@@ -742,8 +723,7 @@ class AVServer:
         # here and accumulated in the loop.
         window_video_bytes = 0
         # Frames that actually reached the wire in this window. The controller
-        # needs it to work out what a frame of this channel costs, which is what
-        # its rate ceiling is derived from -- see RateController.ceiling.
+        # uses it to tell an empty window (the source stopped) from a quiet one.
         window_frames = 0
         window_worst_write = 0.0
         # Frames given up in this window, reported to the controller. It is the
@@ -1591,23 +1571,16 @@ class AVServer:
                 # collapsed into one boolean.
                 self._last_source_state = source
                 if getattr(self, "session_state", None) != SessionState.RECOVERING:
-                    changed = controller.observe(window_video_bytes,
-                                                 window_worst_write * 1000,
-                                                 window_dropped,
-                                                 frames=window_frames,
-                                                 window_s=now - window_started)
-                    if changed != fps:
-                        fps = changed
-                        # Re-derive the slot from the new rate against the same
-                        # origin, rather than carrying the old numbering over. The
-                        # slot is a count of intervals since the origin, so it means
-                        # a different thing at a different rate -- carrying it would
-                        # make a slow-down look like a very long time with no frame
-                        # sent, and the next pass would send every frame it owed at
-                        # once.
-                        slot_now = int((now - origin) * fps)
-                        last_slot = slot_now
-                        self.logger(f"RATE {fps} fps: {controller.describe()}")
+                    before = controller.rate
+                    controller.observe(window_video_bytes,
+                                       window_worst_write * 1000,
+                                       window_dropped,
+                                       frames=window_frames,
+                                       window_s=now - window_started)
+                    if controller.rate != before:
+                        if hasattr(channel, "set_video_rate"):
+                            channel.set_video_rate(controller.rate)
+                        self.logger(f"RATE {controller.rate // 1000} kB/s: {controller.describe()}")
                 window_video_bytes, window_worst_write = 0, 0.0
                 window_dropped = window_frames = 0
                 window_started = now
@@ -1615,7 +1588,7 @@ class AVServer:
                 elapsed = now - last_report if last_report else 5.0
                 self.logger(
                     f"live t={now-origin:6.1f}s fps={fps} "
-                    f"rate=({controller.reason}) source={getattr(self, '_last_source_state', '?')} "
+                    f"rate={controller.rate // 1000}kB/s ({controller.reason}) source={getattr(self, '_last_source_state', '?')} "
                     # Where the picture's CONTENT sat against the sound's, as
                     # counted at the pairing. This is the one sync measurement
                     # the wire timestamps cannot carry, because they are

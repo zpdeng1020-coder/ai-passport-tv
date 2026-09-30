@@ -26,7 +26,7 @@ from server import frames
 from server.media import (AUDIO_BYTES, AUDIO_CHUNK_MS, AUDIO_LEAD_MS, DURATION_MS, FPS, FRAME_COUNT, HEIGHT, Media, START_DELAY_MS, VIDEO_LEAD_MS, WIDTH, prepare, schedule, synthetic_frame, validate_frame)
 from server.protocol import (HEADER, Kind, Packet, ProtocolError, VIDEO_MAX,
                              json_bytes, json_object, receive_packet, send_packet)
-from server.rate import RateController
+from server.rate import ByteRate
 from server.timeline import SessionClock
 
 # Synthetic test-only credential, never a deployment credential.
@@ -610,7 +610,7 @@ class WaitingForTheSoundTests(unittest.TestCase):
 
         server.stop = threading.Event()
         observes = []
-        real_observe = RateController.observe
+        real_observe = ByteRate.observe
 
         def counting_observe(controller, *args, **kwargs):
             observes.append(1)
@@ -626,7 +626,7 @@ class WaitingForTheSoundTests(unittest.TestCase):
             server.stop.set()
 
         threading.Thread(target=stop_after_a_while, daemon=True).start()
-        with patch.object(RateController, "observe", counting_observe):
+        with patch.object(ByteRate, "observe", counting_observe):
             started = time.monotonic()
             server._pace_live(left, WaitingChannel(), 1)
             elapsed = time.monotonic() - started

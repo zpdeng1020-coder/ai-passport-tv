@@ -27,34 +27,16 @@ WIDTH, HEIGHT = frames.WIDTH, frames.HEIGHT
 # every frame carries its own timestamp. So it can be raised or lowered freely
 # from here without rebuilding the firmware.
 #
-# The rate the picture is PRODUCED at. **It is not the rate it is sent at, and
-# this comment used to claim it was.**
+# The frame rate this server ANNOUNCES in CONFIG, and the rate the pre-generated
+# media is made at. It is a nominal figure, not what a live channel is sent at.
 #
-# `FPS` follows `rate.MAX_FPS` and is what ffmpeg is asked for; the sender's
-# rate is what the controller decides once a second, and under the shipped
-# configuration it settles near 5 while ffmpeg produces 12. Measured from the
-# live log: `frame=21678B` with `budget=120000` carries about 5.5 frames a
-# second while 12 are produced, so `prod_drop` climbs by about 6.5 a second and
-# the measured figure was 7.0. The surplus is discarded at the queue, which
-# costs nothing that was going to be sent -- but the two rates are not the same
-# number and must not be reasoned about as one.
-#
-# What the original comment described was a real fault, and it is worth keeping
-# the shape of it: the two being independent is what put the queue permanently
-# full. ffmpeg was asked for ten frames a second while the sender was held to
-# five by the link, so five frames a second piled up in a queue that holds
-# fifteen seconds of them: measured, `video_q` sat at 180 of 180 for the whole
-# session, `prod_drop` climbed by five a second, and the picture on screen was
-# some fifteen seconds behind the channel. Nothing was broken and nothing
-# recovered -- the queue simply stopped draining.
-#
-# It is read from rate.MAX_FPS rather than repeated, so the two cannot drift
-# apart again. Producing faster than the link carries buys nothing: the extra
-# frames are discarded at the far end of a queue, at the cost of encoding them
-# and of the delay it puts between the channel and the screen.
-from .rate import MAX_FPS as _MAX_FPS
-
-FPS = int(os.environ.get("TV_FPS", str(_MAX_FPS)))
+# The device checks it for sanity (1 to 30) and does not pace by it -- every frame
+# carries its own timestamp and is scheduled against the audio clock -- so CONFIG
+# can go out before the source has been looked at. A live channel's own rate is
+# found when it starts (`LiveChannel.fps`, from ffprobe) and is then held for the
+# whole session: ffmpeg is asked for it, the timeline counts in it and the sender
+# paces by it. `TV_FPS` set explicitly overrides that probe and forces one rate.
+FPS = int(os.environ.get("TV_FPS", "25"))
 DURATION_MS = 10000
 AUDIO_CHUNK_MS = 40
 # Send leads, defined here because both the pre-generated scheduler and the live
