@@ -36,6 +36,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import frames, pts
+try:
+    from . import perceptual
+except ImportError:
+    perceptual = None
 from .timeline import (BASIS_COMMON_DECODE, BASIS_LAUNCH, ContentTimeline,
                        SessionClock, SourceState, VERDICT_IN_HOLE,
                        VERDICT_NOT_YET, VERDICT_PLACED)
@@ -271,7 +275,7 @@ PREBUFFER_CHUNKS = int(PREBUFFER_SECONDS * 1000 / AUDIO_CHUNK_MS)   # 20 ms each
 # source -- and a duration is what it should be counted in. The rate to count it
 # at is the one the link was measured carrying, which is what `START_FPS` is:
 # where the median channel lands, and where a session begins.
-from .rate import START_FPS as _START_FPS, START_RATE_BPS
+from .rate import START_FPS as _START_FPS, start_rate
 
 PREBUFFER_FRAMES = int(PREBUFFER_SECONDS * _START_FPS)
 # Only the backstop for an origin that never produces anything at all: the
@@ -565,6 +569,12 @@ AUDIO_SAMPLES = AUDIO_BYTES // 2
 # `ashowinfo` line would cover two blocks and every timestamp after the first
 # would be paired with the wrong payload.
 PRE_FILTER = os.environ.get("TV_PRE_FILTER", "").strip()
+# What is done with a frame that does not fit its byte target. On, it gives detail
+# up perceptually (server/perceptual.py); off, or without numpy, it steps through
+# the colour ladder (frames.encode_within). A frame that fits is sent as ffmpeg
+# made it either way.
+PERCEPTUAL = (perceptual is not None and perceptual.AVAILABLE
+              and os.environ.get("TV_PERCEPTUAL", "1") != "0")
 _VIDEO_CHAIN = f"{frames.FIT},{PRE_FILTER}" if PRE_FILTER else frames.FIT
 def source_graph(fps: int) -> str:
     """The filter graph for a source whose picture is to be produced at `fps`."""
@@ -826,6 +836,7 @@ class LiveChannel:
         # panel that shows nothing of ours. See frames.choose_stripes.
         self._shown: bytes | None = None
         self._delta_tick = 0
+        self._snap_level = 0
         # When each queued item ARRIVED, in step with the two queues above.
         #
         # This is what the picture is aligned by, and the reason is that it needs
@@ -878,7 +889,7 @@ class LiveChannel:
         self.fps_note = "nominal"
         # The picture's byte rate, set by the sender's controller. Each frame is
         # compressed to fit rate / fps; see frames.ByteBudget and encode_within.
-        self._budget = frames.ByteBudget(START_RATE_BPS, FPS)
+        self._budget = frames.ByteBudget(start_rate(FPS), FPS)
         self.lock = threading.Lock()
         self.error: Exception | None = None
         self.dropped_video = 0
@@ -1393,6 +1404,7 @@ class LiveChannel:
                                         audio_interval_ms=AUDIO_CHUNK_MS)
         with self.lock:
             self._budget.set_fps(fps)
+            self._budget.set_rate(start_rate(fps))
         return fps
 
     def pop_video(self, keep: int = 0) -> tuple[list[bytes], int] | None:
@@ -1511,8 +1523,13 @@ class LiveChannel:
         if raw is None:
             return packets
         started = time.monotonic()
-        chosen, drawn, rung = frames.encode_within(raw, self._shown, self._delta_tick,
-                                                   self._budget.target())
+        if PERCEPTUAL:
+            chosen, drawn, rung = perceptual.encode_within(
+                raw, self._shown, self._delta_tick, self._budget.target(), self._snap_level)
+            self._snap_level = rung
+        else:
+            chosen, drawn, rung = frames.encode_within(raw, self._shown, self._delta_tick,
+                                                       self._budget.target())
         self._delta_tick += 1
         self._shown = frames.apply_stripes(drawn, self._shown, chosen)
         out = frames.pack_stripes(chosen)

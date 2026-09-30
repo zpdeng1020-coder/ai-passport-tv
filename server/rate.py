@@ -177,13 +177,14 @@ FAST_WRITE_MS = 120.0
 WINDOWS_BEFORE_UP = 2
 
 
-# Whether the rate is chosen as the session runs, or held at media.FPS.
+# Whether the byte rate is chosen as the session runs, or held at the target.
 #
-# Held is the right setting for a measurement and for nothing else: a sweep that
-# wanted to know what the device does at ten frames a second would learn instead
-# what the controller does about ten frames a second. It is off by default,
-# because adapting is the point.
-ADAPTIVE = os.environ.get("TV_ADAPTIVE", "1") != "0"
+# Held is the default: the target byte rate is fixed and every frame is fitted
+# into it, which is the most predictable mode and the one to get right first.
+# Adapting is opt-in (TV_ADAPTIVE=1) and is only worth considering once the
+# fixed mode is good, because a controller that moves the target also moves the
+# picture quality and makes any measurement about the controller.
+ADAPTIVE = os.environ.get("TV_ADAPTIVE", "0") == "1"
 
 
 class FixedRate:
@@ -600,17 +601,32 @@ class RateController:
 # live_sender.py (TV_LIVE_ENGINE=v2) still drives them. Nothing on the default
 # path reads them.
 #
-# The three numbers are working points, not measurements of the link. The one
-# measured ceiling is a real channel received at 349 kB/s in total (fixed 25 fps,
-# 90 seconds, one channel, no limiter, no audio underrun, no reset). Whether that
-# figure counts the sound is not recorded, so the picture's ceiling is set as if
-# it does: 320 kB/s of picture plus the sound's fixed 32 kB/s is that figure. The
-# start is a margin under it, and the floor is where a picture is still
-# recognisable. Each can be overridden without editing a file, because the point
-# of having them here is that they get re-measured on other channels and links.
-START_RATE_BPS = int(os.environ.get("TV_RATE_START", "250000"))
+# The target is a size per FRAME, and the byte rate follows from the frame rate:
+# FRAME_BYTES * fps, so a 25 fps channel is held to 500 kB/s and a 30 fps one to
+# 600 kB/s. It is what the session runs at when ADAPTIVE is off, which is the
+# default, and every frame is fitted into it (frames.encode_within) rather than
+# merely capped by it. TV_RATE_START sets a byte rate directly instead, whatever
+# the frame rate.
+#
+# MIN and MAX only bound the adaptive controller and have no effect in the fixed
+# mode. MAX defaults to START because the adaptive mode is not the one being
+# tuned; raise it together with TV_ADAPTIVE=1 to let the controller climb.
+# Each can be overridden without editing a file.
+FRAME_BYTES = int(os.environ.get("TV_FRAME_BYTES", "20000"))
 MIN_RATE_BPS = int(os.environ.get("TV_RATE_MIN", "100000"))
-MAX_RATE_BPS = int(os.environ.get("TV_RATE_MAX", "320000"))
+
+
+def start_rate(fps: int) -> int:
+    """The fixed byte rate for a picture at `fps`."""
+    explicit = os.environ.get("TV_RATE_START")
+    return int(explicit) if explicit else FRAME_BYTES * fps
+
+
+def max_rate(fps: int) -> int:
+    explicit = os.environ.get("TV_RATE_MAX")
+    return max(int(explicit), start_rate(fps)) if explicit else start_rate(fps)
+
+
 RATE_STEP_DOWN = 0.85
 RATE_STEP_UP = 1.05
 
@@ -628,11 +644,17 @@ class ByteRate:
     climbs in a window that used at least 80% of it and still wrote quickly.
     """
 
-    def __init__(self, fps: int, start: int = START_RATE_BPS,
-                 minimum: int = MIN_RATE_BPS, maximum: int = MAX_RATE_BPS,
+    def __init__(self, fps: int, start: int | None = None,
+                 minimum: int | None = None, maximum: int | None = None,
                  adaptive: bool = True):
         if fps < 1:
             raise ValueError("a frame rate below one is not a rate")
+        if start is None:
+            start = start_rate(fps)
+            minimum = min(MIN_RATE_BPS, start) if minimum is None else minimum
+            maximum = max_rate(fps) if maximum is None else maximum
+        minimum = MIN_RATE_BPS if minimum is None else minimum
+        maximum = max(start, max_rate(fps)) if maximum is None else maximum
         if not 0 < minimum <= start <= maximum:
             raise ValueError("start rate is outside the range")
         self.fps = fps

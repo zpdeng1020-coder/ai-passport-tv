@@ -12,9 +12,9 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from server.rate import (FAST_WRITE_MS, MAX_FPS, MAX_RATE_BPS, MIN_FPS, MIN_RATE_BPS,
+from server.rate import (FAST_WRITE_MS, FRAME_BYTES, MAX_FPS, MIN_FPS, MIN_RATE_BPS,
                          RATE_STEP_DOWN, RATE_STEP_UP, SLOW_WRITE_MS, START_FPS,
-                         START_RATE_BPS, WINDOWS_BEFORE_UP, ByteRate, RateController)
+                         WINDOWS_BEFORE_UP, ByteRate, RateController, start_rate)
 
 
 # The rate the behaviour is observed from: the top of the range, so every case
@@ -451,9 +451,14 @@ class ByteRateTests(unittest.TestCase):
         self.assertEqual(control.reason, "fixed")
 
     def test_the_defaults_are_a_usable_range(self):
-        control = ByteRate(25)
-        self.assertTrue(MIN_RATE_BPS <= START_RATE_BPS <= MAX_RATE_BPS)
-        self.assertEqual(control.rate, START_RATE_BPS)
+        for fps in (5, 25, 30):
+            control = ByteRate(fps)
+            self.assertTrue(control.minimum <= control.rate <= control.maximum)
+            self.assertEqual(control.rate, FRAME_BYTES * fps)
+
+    def test_the_target_is_a_size_per_frame_not_a_rate(self):
+        self.assertEqual(start_rate(25) // 25, start_rate(30) // 30)
+        self.assertGreater(start_rate(30), start_rate(25))
 
     def test_a_start_outside_the_range_is_refused(self):
         with self.assertRaises(ValueError):

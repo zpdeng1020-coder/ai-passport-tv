@@ -181,6 +181,7 @@ class AFrameOnItsWayOut(unittest.TestCase):
         channel.dropped_video = 0
         channel._video_advanced = False
         channel._shown, channel._delta_tick = None, 0
+        channel._snap_level = 0
         self.now = 1000.0
         channel._budget = frames.ByteBudget(rate, FPS)
         channel.encoded_video_bytes, channel.encode_seconds, channel.coarse_frames = 0, 0.0, 0

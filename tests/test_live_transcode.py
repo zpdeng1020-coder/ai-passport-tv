@@ -855,7 +855,7 @@ class LiveSenderTests(unittest.TestCase):
         the expected state and a test that compared them would pass while
         proving nothing.
         """
-        from server.rate import ByteRate, START_RATE_BPS
+        from server.rate import ByteRate
         kinds, server = self._run(seconds=1.5, capture={}, return_server=True)
         self.assertIn("JPEG", kinds)
         # The controller is per session and starts where rate.py says, so a
