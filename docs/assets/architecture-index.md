@@ -113,6 +113,8 @@ first, since it is what a flashed device cannot renegotiate):
 | Doc | When to read it |
 | --- | --- |
 | [`docs/development/handoff-20260928.md`](../development/handoff-20260928.md) | **Before performance or architecture work.** Hardware-derived ceilings and the on-device benchmark plan. |
+| [`docs/development/tcp-delta-progress-20260930.md`](../development/tcp-delta-progress-20260930.md) | **Before further work on the product's TCP path.** The product's frame-rate cap is the rate controller's budget, not the link; streaming-stripe receive, the 64 KB window, delta coding, the open problems. The UDP rewrite is shelved. |
+| [`docs/development/server-optimisation-handoff-20260930.md`](../development/server-optimisation-handoff-20260930.md) | **Before server or picture-quality work.** Fixed frame rate per channel, per-frame fit to a byte target, what is measured and what is not, next steps in order. |
 | [`docs/development/state-20260916.md`](../development/state-20260916.md) | **Before touching timing/session/quality.** Current fixed/broken/measured state; check it against the code first. |
 | [`docs/development/metrics-dictionary.md`](../development/metrics-dictionary.md) | Before trusting or logging any counter -- what it counts and what it must not be read as. |
 | [`docs/development/live-sender-v2.md`](../development/live-sender-v2.md) | Before touching `server/live_sender.py`. |

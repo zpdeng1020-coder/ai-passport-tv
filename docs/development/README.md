@@ -10,6 +10,8 @@ This directory contains AI Passport engineering rules and reusable workflows, gr
 
 - [handoff-20260928.md](handoff-20260928.md): **read this first for performance or architecture work.** Hardware-derived ceilings for 320x180 playback, reference projects, and the on-device benchmark plan.
 - [hardware-benchmark-results-20260929.md](hardware-benchmark-results-20260929.md): the measurements that handoff asked for, taken on the board. Supersedes its section 4 where the two differ.
+- [tcp-delta-progress-20260930.md](tcp-delta-progress-20260930.md): **read this before further TCP work.** The UDP rewrite is shelved; this records what was changed on the product's TCP path (delta coding), what it measured (no steady gain, about 7-11 fps), the open problems and the candidate next steps. Single runs.
+- [server-optimisation-handoff-20260930.md](server-optimisation-handoff-20260930.md): **read this first for server or picture-quality work.** The fixed-frame-rate server, what it measured, what is not established (the coarsening under a byte target is visibly worse than lossless), and the next steps in order. The firmware side is considered done.
 - [state-20260916.md](state-20260916.md): **read this first.** What is fixed, what is broken, what is measured, what is not established, and the next steps in order. Check it against the code before editing.
 - [metrics-dictionary.md](metrics-dictionary.md): what every counter on both ends actually counts, and what it must not be read as.
 
