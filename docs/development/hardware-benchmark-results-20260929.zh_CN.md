@@ -4,6 +4,8 @@
 
 # 真机基准测试结果（2026-09-29）
 
+> **状态说明。**产品里的面板时钟现在是 80 MHz（`BSP_LCD_PCLK_HZ`），下文把 80 MHz 称为"超出标称范围"的地方记录的是取得这些数字时的分类。本文用来产生 80 MHz 那一列的 `CONFIG_AV_HW_BENCH_SPI80` 与 `tools/sdkconfig.hw-bench-spi80` 已删除；`tools/sdkconfig.hw-bench` 现在就是 80 MHz，40 MHz 那一列要改常量才能重建。
+
 [2026-09-28 的交接文档](handoff-20260928.zh_CN.md)第 4 节要求的测量，在真机上取到了。那份文档的数字全是算术，它自己也如此声明；这份用观测替换它，并指出两者不一致的地方。
 
 设备：ESP32-C3 rev v1.1，8 MB XMC Flash，MAC `4c:11:ae:30:f5:4c`，走 COM3。Wi-Fi SSID `Link`，信道 9，RSSI −9 至 −11 dBm。

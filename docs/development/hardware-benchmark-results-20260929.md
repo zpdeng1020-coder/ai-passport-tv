@@ -4,6 +4,8 @@
 
 # Hardware Benchmark Results (2026-09-29)
 
+> **Status note.** The panel clock in the product is now 80 MHz (`BSP_LCD_PCLK_HZ`), so the passages below that call 80 MHz "out of rating" record how it was classified when these numbers were taken. `CONFIG_AV_HW_BENCH_SPI80` and `tools/sdkconfig.hw-bench-spi80`, which this file uses to produce the 80 MHz column, have since been removed; `tools/sdkconfig.hw-bench` now runs at 80 MHz and the 40 MHz column cannot be rebuilt without changing the constant.
+
 The measurements the [handoff of 2026-09-28](handoff-20260928.md) asked for, taken on the
 real board. That document's section 4 is arithmetic throughout and says so; this
 one replaces it with observations, and reports where the two disagree.

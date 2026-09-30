@@ -168,14 +168,15 @@ _Static_assert(AV_WIDTH == BSP_LCD_H && AV_HEIGHT == BSP_LCD_W, "Landscape geome
 _Static_assert(AV_PALETTE_ENTRIES == 256, "An 8-bit index needs 256 colours");
 // The panel's floor, and it is asserted rather than trusted because the
 // expression printing it has been wrong twice in the same direction: 3 ms for a
-// bus that takes 30.7. A byte is eight bits and the clock is in Hz; leave the
-// eight out and the floor reads a tenth of the truth, which is worse than no
-// number at all because every later judgement is made against it.
+// bus that takes 15.4 (then 30.7, at the old 40 MHz clock). A byte is eight bits
+// and the clock is in Hz; leave the eight out and the floor reads a tenth of the
+// truth, which is worse than no number at all because every later judgement is
+// made against it.
 //
-// 320*240*2*8 bits at 40 MHz is 30720 us. Checked as a millisecond figure with
-// a tolerance of one, since the integer division in the log line truncates.
+// 320*240*2*8 bits at 80 MHz is 15360 us. Checked as a whole millisecond figure,
+// since the integer division truncates it to 15.
 #define PANEL_FLOOR_MS ((AV_WIDTH * AV_HEIGHT * 2 * 8) * 1000u / BSP_LCD_PCLK_HZ)
-_Static_assert(PANEL_FLOOR_MS == 30u,
+_Static_assert(PANEL_FLOOR_MS == 15u,
                "The panel floor changed: every per-frame figure is compared against it");
 static const char *TAG = "av_raw";
 // What a session knows about reaching the server.
@@ -204,13 +205,23 @@ typedef struct { uint32_t pts; uint8_t pcm[AV_AUDIO_BYTES]; } audio_t;
 // and `parts` how many make up the frame, which is known only once the last has
 // arrived. `bytes` is the frame's compressed size, summed as it lands, and it is
 // the number that says how much has to be inflated for each picture drawn.
+//
+// The unit that crosses from the receiver to the picture task is one STRIPE, not
+// one packet. A packet used to be read whole into a buffer sized for the worst
+// case (22 KB, two of them) although a stripe is about 1 KB and a packet about
+// 12: the receiver now reads the length table, then each stripe straight into a
+// small byte ring, and the picture task inflates from the ring. `data` is NULL
+// for a stripe of length zero (already on the panel) and for one that was
+// dropped because the ring stayed full.
 typedef struct {
-    uint8_t *jpeg; uint32_t length, pts;
-    // True only on the packet that opens a frame. Every packet of a frame
+    uint8_t *data; uint16_t length; uint8_t stripe;
+    uint32_t pts;
+    // True only on the stripe that opens a frame. Every packet of a frame
     // carries the frame's presentation time, so this is what says which of
     // them the clock is waited on for: waiting on each of the five waited for
     // a moment that had already passed. See video_task.
     bool frame_start;
+    bool packet_start, packet_end, dropped;
 } video_t;
 // A queued button gesture. Carrying the event type (not just the key) is what
 // lets a click mean "next channel" while a long press means "volume".
@@ -224,7 +235,7 @@ typedef struct { bsp_btn_t key; bsp_btn_ev_t ev; } key_ev_t;
 typedef struct { char id[AV_CHANNEL_ID_MAX]; char name[UI_MENU_NAME_MAX]; } channel_t;
 typedef struct {
     EventGroupHandle_t events;
-    QueueHandle_t audio, video, free_video, keys;
+    QueueHandle_t audio, video, keys;
     // jpeg[] holds incoming video payloads and stripe[] the panel rows built
     // from them. One stripe buffer is enough now that each stripe is drawn
     // complete before the next is touched: the old pair existed because a
@@ -264,7 +275,14 @@ typedef struct {
     // What it costs is 10 KB of a heap with none to spare -- the packet buffers
     // had to be cut from three to two to pay for it, and that cut is visible as
     // 141 dropped frames against 38. Reverted.
-    uint8_t *jpeg[AV_VIDEO_BUFFERS], *stripe[2];
+    uint8_t *stripe[2];
+    // The byte ring the receiver fills with compressed stripes and the picture
+    // task drains. `ring_head` belongs to the receiver alone; `ring_tail` is the
+    // end of the last stripe the picture task finished with, and `ring_inflight`
+    // counts stripes whose bytes are still in the ring.
+    uint8_t *ring;
+    uint32_t ring_head;
+    atomic_uint_least32_t ring_tail, ring_inflight;
     // Which of the two the next stripe is built in. They alternate; a stripe
     // is only overwritten once the transfer that read it has been drained.
     unsigned stripe_next;
@@ -279,7 +297,9 @@ typedef struct {
     // reach a channel.
     tinfl_decompressor *inflate;
     // The colours a 256-index picture is drawn with, sent by the server before
-    // the first frame because the palette is chosen per channel.
+    // the first frame because the palette is chosen per channel. Held in WIRE
+    // order (each entry byte-swapped, see av_palette_wire_order), which is what
+    // av_expand_indexed_wire reads; nothing else uses this table.
     uint16_t palette[AV_PALETTE_ENTRIES];
     bool palette_ready;
     // Stripes drawn since the current frame began. A frame arrives as several
@@ -524,6 +544,50 @@ static bool rx_done(void) { return xEventGroupGetBits(s.events) & RX_DONE; }
 static void fail(const char *reason) {
     ESP_LOGW(TAG, "Session reset: %s", reason); // Never log remote JSON/secrets.
     xEventGroupSetBits(s.events, STOP);
+}
+// Sized by what a frame costs, not by the largest packet the protocol allows:
+// a frame is about 12-18 KB of stripes and this holds most of one, and the
+// receiver waits briefly for space rather than dropping.
+#ifndef AV_VIDEO_RING_BYTES
+#define AV_VIDEO_RING_BYTES 16384u
+#endif
+// Stripes (including empty ones) that can be queued between the two tasks.
+#define AV_VIDEO_ITEMS 32u
+// Largest compressed stripe accepted. 3840 index bytes stored raw by zlib come
+// to about 3.86 KB, so anything above this is not something the server cut.
+#define AV_STRIPE_CMAX 4096u
+// How long the receiver waits for ring or queue space before giving a stripe up.
+#define AV_VIDEO_WAIT_US 100000
+// One producer (receiver), one consumer (picture task). Allocation is
+// contiguous, wrapping to the start when the tail of the ring is too short, and
+// frees happen in the order of allocation, so `ring_tail` is always the start of
+// the oldest stripe still held.
+static bool ring_alloc(uint32_t n, uint32_t *off) {
+    n=(n+3u)&~3u;
+    const uint32_t cap=AV_VIDEO_RING_BYTES;
+    if(atomic_load(&s.ring_inflight)==0) { s.ring_head=0; atomic_store(&s.ring_tail,0u); }
+    uint32_t head=s.ring_head, tail=atomic_load(&s.ring_tail);
+    if(head>=tail) {
+        if(cap-head>=n) { *off=head; s.ring_head=head+n; return true; }
+        if(tail>n) { *off=0; s.ring_head=n; return true; }
+        return false;
+    }
+    if(tail-head>n) { *off=head; s.ring_head=head+n; return true; }
+    return false;
+}
+static void ring_release(const video_t *v) {
+    uint32_t end=(uint32_t)(v->data-s.ring)+(((uint32_t)v->length+3u)&~3u);
+    atomic_store(&s.ring_tail,end);
+    atomic_fetch_sub(&s.ring_inflight,1u);
+}
+static bool video_enqueue(const video_t *v) {
+    int64_t give_up=esp_timer_get_time()+AV_VIDEO_WAIT_US*2;
+    while(!stopping()) {
+        if(xQueueSend(s.video,v,0)) return true;
+        if(esp_timer_get_time()>=give_up) return false;
+        vTaskDelay(1);
+    }
+    return false;
 }
 static bool delay_until(int64_t us) {
     while (!stopping() && esp_timer_get_time()<us) vTaskDelay(pdMS_TO_TICKS(5));
@@ -1184,90 +1248,86 @@ static void receive_task(void *arg) {
             if (!xQueueSend(s.audio,&a,0)) { fail("bounded PCM queue full"); break; }
             unsigned q=uxQueueMessagesWaiting(s.audio); if(q>s.audio_high) s.audio_high=q;
         } else if (h.type==AV_VIDEO) {
-            // A frame is several consecutive packets under one timestamp, and
-            // every one of them carries that same timestamp. Which of them
-            // opens the frame is what the video task needs to know, so it is
-            // passed along rather than left to be inferred from the timestamp:
-            // consecutive frames can share one when the frame rate is not a
-            // whole number of milliseconds, and a frame whose start went
-            // unrecognised is a frame nothing waits for.
-            video_t v={0};
-            v.length=h.length; v.pts=h.pts_ms;
-            v.frame_start=!(h.flags&AV_VIDEO_CONTINUES);
-            if(v.frame_start) atomic_fetch_add(&s.rx_frame_starts,1u);
+            // A packet is [first][count][u16 length * count][stripes]. The table
+            // is read first, then each stripe goes straight into the ring, so no
+            // buffer is ever sized for a whole packet. Stripes of one packet are
+            // consecutive on the wire and nothing else may be read between them.
+            const bool frame_start=!(h.flags&AV_VIDEO_CONTINUES);
+            if(frame_start) atomic_fetch_add(&s.rx_frame_starts,1u);
             else atomic_fetch_add(&s.rx_stray_packets,1u);
             atomic_store(&s.media_started,true);
-            if (!xQueueReceive(s.free_video,&v.jpeg,0)) {
-                // No buffer free: the picture task is still holding both.
-                //
-                // Counted separately from the drops the video task makes,
-                // because the two are different faults with different fixes:
-                // this one is the sender outrunning the renderer, and the
-                // other is a frame arriving too late to draw. Both show up as
-                // a frame that never completes, and without this count there
-                // was no way to tell which was happening -- measured, 78
-                // packets arriving against 56 accepted, and nothing in the log
-                // saying where the other 22 went.
-                atomic_fetch_add(&s.rx_nobuf_packets,1u);
-                // Never block audio behind rendering. Discard entire bounded payload.
-                uint8_t discard[256]; uint32_t left=h.length;
-                int64_t deadline=esp_timer_get_time()+1500000;
-                s_rx_stage="video-discard";
-                int64_t io_start=esp_timer_get_time();
-                while (left && !stopping()) {
-                    unsigned n=left<sizeof(discard)?left:sizeof(discard);
-                    if (!io_until(fd,discard,n,false,deadline)) break;
-                    left-=n;
-                }
-                atomic_fetch_add(&s.rx_io_us,(uint32_t)(esp_timer_get_time()-io_start));
-                if (left) break;
-                // Counted once for the frame when it is the frame's opening
-                // packet: what the picture loses is a frame, and counting each
-                // packet of it would report five losses for one missing
-                // picture.
-                if(v.frame_start) s.dropped++;
-                continue;
-            }
-            s_rx_stage="video-read";
-            // Read straight into the packet's payload, with nothing in between.
-            //
-            // There used to be a loop here that drained "whatever audio has
-            // already arrived" before starting the picture, so that a slow
-            // video read would not hold the sound up. It cannot work, and the
-            // reason is the order of the bytes rather than the intent: the
-            // header of this packet has just been read, and the sender writes
-            // a packet's header and payload as one contiguous write
-            // (protocol.py, send_packet). The very next bytes on the socket
-            // are therefore this packet's payload -- never an audio packet.
-            // Anything the loop took, it took out of the payload it was about
-            // to read, so the picture was assembled from bytes 640 further on
-            // and the decoder refused it.
-            //
-            // Measured before it was removed: every session ended in "indexed
-            // stripe decode" with decode_max_ms reading 0, which is the
-            // decoder rejecting the payload before doing any work, and the
-            // picture's own timestamp agreeing exactly with the sound's at the
-            // moment it failed. The fault only appears once picture packets
-            // actually flow, which is why it survived every session in which
-            // they did not.
-            //
-            // The gap this loop was built for is real but it is the sender's
-            // to close, and the sender closes it: the frame's packets are
-            // separated by audio whenever a chunk falls due mid-frame. Reading
-            // one packet at a time in order is what makes that work.
+            s_rx_stage="video-table";
             int64_t io_start=esp_timer_get_time();
-            bool video_ok=io_all(fd,v.jpeg,v.length,false,AV_READ_DEADLINE_MS);
-            atomic_fetch_add(&s.rx_io_us,(uint32_t)(esp_timer_get_time()-io_start));
-            atomic_fetch_add(&s.rx_iterations,1u);
-            if (!video_ok) {
-                xQueueSend(s.free_video,&v.jpeg,0); break;
+            int64_t wait_total=0;
+            uint8_t table[2+2*AV_STRIPES_PER_PACKET];
+            uint16_t len[AV_STRIPES_PER_PACKET];
+            unsigned first=0,count=0;
+            uint32_t total=0;
+            if(h.length<2 || !io_all(fd,table,2,false,AV_READ_DEADLINE_MS)) break;
+            first=table[0]; count=table[1];
+            if(!count || count>AV_STRIPES_PER_PACKET || first>=AV_STRIPES || first+count>AV_STRIPES
+               || h.length<2u+2u*count) break;
+            if(!io_all(fd,table+2,2u*count,false,AV_READ_DEADLINE_MS)) break;
+            for(unsigned i=0;i<count;i++) {
+                len[i]=(uint16_t)(((unsigned)table[2+2*i]<<8)|table[3+2*i]);
+                if(len[i]>AV_STRIPE_CMAX) goto done;
+                total+=len[i];
             }
+            // The lengths must account for the payload exactly, as av_video_decode
+            // requires: a frame that does not add up is not the one that was sent.
+            if(total!=h.length-(2u+2u*count)) break;
+            bool nobuf=false;
+            for(unsigned n=0;n<count;n++) {
+                video_t v={.data=NULL,.length=len[n],.stripe=(uint8_t)(first+n),.pts=h.pts_ms,
+                           .frame_start=frame_start && n==0,.packet_start=(n==0),
+                           .packet_end=(n+1==count),.dropped=false};
+                if(len[n]) {
+                    s_rx_stage="video-ring";
+                    uint32_t off=0;
+                    bool got=false;
+                    int64_t wait0=esp_timer_get_time();
+                    int64_t give_up=wait0+AV_VIDEO_WAIT_US;
+                    while(!stopping()) {
+                        if(uxQueueSpacesAvailable(s.video)>0 && ring_alloc(len[n],&off)) { got=true; break; }
+                        if(esp_timer_get_time()>=give_up) break;
+                        vTaskDelay(1);
+                    }
+                    int64_t waited=esp_timer_get_time()-wait0;
+                    wait_total+=waited;
+                    atomic_fetch_add(&s.rx_wait_us,(uint32_t)waited);
+                    if(stopping()) goto done;
+                    if(got) {
+                        s_rx_stage="video-read";
+                        if(!io_all(fd,s.ring+off,len[n],false,AV_READ_DEADLINE_MS)) goto done;
+                        v.data=s.ring+off;
+                        atomic_fetch_add(&s.ring_inflight,1u);
+                    } else {
+                        // No room: the picture task is behind. Discard this
+                        // stripe's bytes and say so with a marker, so the frame
+                        // is counted incomplete and its start is not lost.
+                        s_rx_stage="video-discard";
+                        uint8_t discard[256]; uint32_t left=len[n];
+                        int64_t deadline=esp_timer_get_time()+1500000;
+                        while (left && !stopping()) {
+                            unsigned k=left<sizeof(discard)?left:sizeof(discard);
+                            if (!io_until(fd,discard,k,false,deadline)) goto done;
+                            left-=k;
+                        }
+                        v.length=0; v.dropped=true; nobuf=true;
+                    }
+                }
+                if(!video_enqueue(&v)) {
+                    if(v.data) atomic_fetch_sub(&s.ring_inflight,1u);
+                    goto done;
+                }
+            }
+            atomic_fetch_add(&s.rx_io_us,(uint32_t)(esp_timer_get_time()-io_start-wait_total));
+            atomic_fetch_add(&s.rx_iterations,1u);
             atomic_fetch_add(&s.rx_video_packets,1u);
-            atomic_fetch_add(&s.rx_video_bytes,v.length);
-            if (!xQueueSend(s.video,&v,0)) {
-                xQueueSend(s.free_video,&v.jpeg,0);
-                if(v.frame_start) s.dropped++;
-                continue;
+            atomic_fetch_add(&s.rx_video_bytes,h.length);
+            if(nobuf) {
+                atomic_fetch_add(&s.rx_nobuf_packets,1u);
+                if(frame_start) s.dropped++;
             }
             unsigned q=uxQueueMessagesWaiting(s.video); if(q>s.video_high) s.video_high=q;
         } else if (h.type==AV_PALETTE) {
@@ -1279,6 +1339,7 @@ static void receive_task(void *arg) {
             s_rx_stage="palette-read";
             if (!io_all(fd,raw,sizeof(raw),false,AV_READ_DEADLINE_MS)) break;
             av_palette_decode(raw,s.palette);
+            av_palette_wire_order(s.palette);
             s.palette_ready=true;
         } else if (h.type==AV_END) { clean=true; break; }
     }
@@ -1866,10 +1927,14 @@ static void enlarge_stripe(uint8_t *buf) {
     }
 #endif
 }
-static bool push_stripe(const av_video_t *v, unsigned n, unsigned y) {
-    const uint8_t *source=NULL;
-    size_t available=0;
-    if(!av_video_stripe(v,n,&source,&available) || !available) return false;
+// The four-pixels-a-step expander is written for whole groups on a 4-byte
+// boundary; the heap gives that for a DMA-capable buffer and this pins the count.
+_Static_assert(AV_STRIPE_PIXELS%4u==0u,"stripe pixel count must be a multiple of four");
+static bool push_stripe(const uint8_t *source, size_t available, unsigned n, unsigned y) {
+    // A stripe of length zero is one the sender chose not to resend because the
+    // panel already shows it (TV_DELTA on the server). Nothing to inflate and
+    // nothing to put on the bus; it is not an error.
+    if(!available) return true;
     // Take the next buffer in turn, and wait for its previous transfer only
     // now -- here, where it is about to be written over. The panel has had the
     // whole of the last stripe's build time to finish sending it, so this
@@ -1919,7 +1984,7 @@ static bool push_stripe(const av_video_t *v, unsigned n, unsigned y) {
     // this chip.
     {
         int64_t t=esp_timer_get_time();
-        av_expand_indexed(buf,AV_STRIPE_PIXELS,s.palette);
+        av_expand_indexed_wire(buf,AV_STRIPE_PIXELS,s.palette);
         atomic_fetch_add(&s.expand_us,(uint32_t)(esp_timer_get_time()-t));
     }
     {
@@ -2003,9 +2068,9 @@ static void drain_display(void) {
 // decodes, nothing here receives, and nothing here can be paced by a sender.
 //
 // The number it produces is the answer to "how fast can this device draw",
-// and the number to compare it against is 153600 bytes over 40 MHz of four-wire
-// SPI: 30.7 ms a frame, which until now has been arithmetic rather than an
-// observation.
+// and the number to compare it against is 153600 bytes over four-wire SPI at
+// BSP_LCD_PCLK_HZ (80 MHz): 15.4 ms a frame (30.7 ms at the old 40 MHz), which
+// until now has been arithmetic rather than an observation.
 static void display_bench(void) {
     if(bsp_display_raw_claim()!=ESP_OK) {
         ESP_LOGE(TAG,"display bench: panel busy");
@@ -2058,8 +2123,8 @@ done:;
         " floor_ms=%u heap=%u",
         frames,AV_STRIPES,total_us/1000,total_us/1000/frames,
         fill_us/1000,submit_us/1000,wait_us/1000,
-        // 153600 bytes, eight bits each, at 40 MHz: 320*240*2*8/40000000
-        // seconds, which is 30.72 ms. Written out in full rather than
+        // 153600 bytes, eight bits each, at 80 MHz: 320*240*2*8/80000000
+        // seconds, which is 15.36 ms. Written out in full rather than
         // simplified, because this line has now been wrong twice.
         //
         // It first printed 3 ms -- a tenth of the truth, the divide-by-1000
@@ -2416,6 +2481,34 @@ static void bench_cpu(void) {
                  (unsigned)pixels, BENCH_CPU_REPEATS,
                  (unsigned)(cyc * 1000u / BENCH_CPU_REPEATS / pixels));
     }
+
+    // The four-at-a-time expander the product uses, against the plain one above,
+    // on the same varied indices: it must be byte for byte the same, and this
+    // reports what it costs. The check is on the device because the host tests
+    // need a native compiler that not every machine has.
+    {
+        const size_t pixels = src_bytes / 2u;
+        uint16_t palette[AV_PALETTE_ENTRIES], wire[AV_PALETTE_ENTRIES];
+        for (unsigned i = 0; i < AV_PALETTE_ENTRIES; i++) wire[i] = palette[i] = (uint16_t)(i * 257u + (i << 3));
+        av_palette_wire_order(wire);
+        uint8_t *ref = heap_caps_malloc(pixels * 2u, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!ref) { ESP_LOGW(TAG,"BENCH name=cpu_expand_wire skipped=no-memory"); goto done; }
+        for (size_t i = 0; i < pixels; i++) exp[i] = ref[i] = (uint8_t)(i * 7u + (i >> 3));
+        av_expand_indexed(ref, pixels, palette);
+        uint64_t cyc = 0;
+        bool same = true;
+        for (unsigned r = 0; r < BENCH_CPU_REPEATS; r++) {
+            for (size_t i = 0; i < pixels; i++) exp[i] = (uint8_t)(i * 7u + (i >> 3));
+            uint32_t t = bench_cycles();
+            av_expand_indexed_wire(exp, pixels, wire);
+            cyc += bench_cycles() - t;
+            if (memcmp(ref, exp, pixels * 2u) != 0) same = false;
+        }
+        free(ref);
+        ESP_LOGW(TAG,"BENCH name=cpu_expand_wire pixels=%u repeats=%u same=%d cyc_per_pixel_x1000=%u",
+                 (unsigned)pixels, BENCH_CPU_REPEATS, (int)same,
+                 (unsigned)(cyc * 1000u / BENCH_CPU_REPEATS / pixels));
+    }
 done:;
     free(src); free(out); free(exp); free(infl);
 }
@@ -2672,6 +2765,8 @@ for(unsigned y=0;y<AV_HEIGHT && !stopping();y+=AV_STRIPE_ROWS) {
 
 static void video_task(void *arg) {
     (void)arg;
+    int64_t pkt_start_us=0;
+    bool pkt_ok=true;
     bool claimed=bsp_display_raw_claim()==ESP_OK;
     if(!claimed) { fail("raw display claim"); goto done; }
     // Painted before the first frame so the panel never shows uninitialised
@@ -2729,19 +2824,10 @@ static void video_task(void *arg) {
             if(s.skipping) { s.dropped++; atomic_fetch_add(&s.rx_frame_skipped,1u); }
         }
         if(!s.skipping) {
-            int64_t start=esp_timer_get_time();
-            bool drawn=true;
-            // Zeroed rather than left to whatever the stack held. On the path
-            // where the decoder refuses the packet, `parts` is never written
-            // and the stripe count below would then be read from an
-            // uninitialised struct -- which decides whether the frame counts
-            // as drawn, so a stale value there is a wrong answer and not just
-            // a stray read.
-            av_video_t parts={0};
-            if(!av_video_decode(v.jpeg,v.length,&parts)) drawn=false;
-            else {
+            if(v.packet_start) { pkt_start_us=esp_timer_get_time(); pkt_ok=true; }
+            if(!v.dropped) {
 #if AV_VIDEO_Y_OFFSET > 0
-                if(s.decoded == 0 && parts.first == 0) {
+                if(s.decoded == 0 && v.stripe == 0) {
                     memset(s.stripe[0], 0, STRIPE_BYTES);
                     for (unsigned cy = 0; cy < (unsigned)AV_VIDEO_Y_OFFSET; ) {
                         unsigned rows = (unsigned)AV_VIDEO_Y_OFFSET - cy;
@@ -2760,22 +2846,17 @@ static void video_task(void *arg) {
                     }
                 }
 #endif
-                // Each packet carries a run of consecutive stripes, drawn as it
-                // arrives so the panel updates while the rest of the frame is
-                // still crossing the network.
-                for(unsigned i=0;i<parts.count;i++) {
-                    unsigned y=(unsigned)AV_VIDEO_Y_OFFSET + (parts.first+i)*AV_STRIPE_ROWS;
-                    if(!push_stripe(&parts,i,y)) { drawn=false; break; }
-                }
+                unsigned y=(unsigned)AV_VIDEO_Y_OFFSET + (unsigned)v.stripe*AV_STRIPE_ROWS;
+                if(!push_stripe(v.data,v.length,v.stripe,y)) pkt_ok=false;
+                s.drawn_stripes++;
             }
-            s.drawn_stripes += parts.count;
+        }
+        if(!s.skipping && v.packet_end) {
+            int64_t start=pkt_start_us;
+            bool drawn=pkt_ok;
             if (s.drawn_stripes > atomic_load(&s.rx_max_stripes)) {
                 atomic_store(&s.rx_max_stripes, s.drawn_stripes);
             }
-            // A frame counts as drawn only when every stripe of it has been.
-            // The count is what says so, and the receiver checks it because a
-            // frame that lost a packet would otherwise be counted as a whole
-            // picture while the panel still showed part of the last one.
             if(drawn && s.drawn_stripes>=AV_STRIPES) {
                 s.decoded++;
                 s.drawn_stripes=0;
@@ -2820,7 +2901,7 @@ static void video_task(void *arg) {
             atomic_fetch_add(&s.panel_frames,1u);
             if(!drawn && !stopping()) fail("indexed stripe decode/geometry/DMA error");
         }
-        xQueueSend(s.free_video,&v.jpeg,0);
+        if(v.data) ring_release(&v);
     }
     // Fault recovery preserves ownership until completion or a hardware reboot.
     drain_display();
@@ -2843,11 +2924,11 @@ static bool allocate_session(void) {
     // that mattered was the channel list's, and every slot added anywhere in
     // the session is paid for out of the same heap before the first CONFIG is
     // parsed.
-    s.video=xQueueCreate(AV_VIDEO_BUFFERS,sizeof(video_t));
-    s.free_video=xQueueCreate(AV_VIDEO_BUFFERS,sizeof(uint8_t *));
-    for(int i=0;i<AV_VIDEO_BUFFERS;i++) {
-        s.jpeg[i]=heap_caps_malloc(AV_VIDEO_MAX,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
-    }
+    s.video=xQueueCreate(AV_VIDEO_ITEMS,sizeof(video_t));
+    s.ring=heap_caps_malloc(AV_VIDEO_RING_BYTES,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    s.ring_head=0;
+    atomic_store(&s.ring_tail,0u);
+    atomic_store(&s.ring_inflight,0u);
     // Internal memory, not DMA-capable: the panel reads it through the same
     // DMA submission as before, but the buffer also has to hold the index bytes
     // while they are expanded in place, so it is written by the CPU first.
@@ -2867,22 +2948,14 @@ static bool allocate_session(void) {
     s.palette_ready=false;
     s.drawn_stripes=0;
     s.skipping=false;
-    if(!s.audio || !s.video || !s.free_video || !s.stripe[0] || !s.stripe[1] || !s.inflate) return false;
-    for(int i=0;i<AV_VIDEO_BUFFERS;i++) {
-        // Every buffer has to be there. A short pool is not a session that runs
-        // on less memory; it is a session that stalls on its first picture,
-        // because the receiver waits for a buffer that is never coming back.
-        if(!s.jpeg[i]) return false;
-    }
-    for(int i=0;i<AV_VIDEO_BUFFERS;i++) xQueueSend(s.free_video,&s.jpeg[i],0);
+    if(!s.audio || !s.video || !s.ring || !s.stripe[0] || !s.stripe[1] || !s.inflate) return false;
     return true;
 }
 static void free_session(void) {
     if(s.audio) vQueueDelete(s.audio);
     if(s.video) vQueueDelete(s.video);
-    if(s.free_video) vQueueDelete(s.free_video);
-    s.audio=s.video=s.free_video=NULL;
-    for(int i=0;i<AV_VIDEO_BUFFERS;i++) { free(s.jpeg[i]); s.jpeg[i]=NULL; }
+    s.audio=s.video=NULL;
+    free(s.ring); s.ring=NULL;
     free(s.stripe[0]); s.stripe[0]=NULL;
     free(s.stripe[1]); s.stripe[1]=NULL;
     free(s.inflate); s.inflate=NULL;
@@ -3633,9 +3706,8 @@ void av_player_main(void) {
         // review noticed the line was stale twice before anyone corrected it.
         // A log line that reports numbers nobody computed is worse than no
         // line: it is read as a measurement.
-        ESP_LOGI(TAG,"Allocated video=%ux%u=%u PCM=%ux%u=%u stripes=%ux%u=%u; heap=%u largest=%u",
-            (unsigned)AV_VIDEO_BUFFERS,(unsigned)AV_VIDEO_MAX,
-            (unsigned)(AV_VIDEO_BUFFERS*AV_VIDEO_MAX),
+        ESP_LOGI(TAG,"Allocated video ring=%u PCM=%ux%u=%u stripes=%ux%u=%u; heap=%u largest=%u",
+            (unsigned)AV_VIDEO_RING_BYTES,
             (unsigned)PCM_QUEUE,(unsigned)AV_AUDIO_BYTES,
             (unsigned)(PCM_QUEUE*AV_AUDIO_BYTES),
             (unsigned)STRIPE_BUFFERS,(unsigned)STRIPE_BYTES,

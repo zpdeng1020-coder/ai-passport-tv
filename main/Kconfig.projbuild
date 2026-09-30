@@ -54,10 +54,10 @@ config AV_DISPLAY_BENCH
         First, a bare panel benchmark: fill a stripe buffer with a constant
         and submit it 15 times a frame for 60 frames, timing the whole run and
         each part of it. It never decodes anything and never reads a socket.
-        This is the only measurement of the 4-wire SPI bus at its rated
-        40 MHz and therefore the only check on the 30.7 ms floor every other
-        figure in this project is compared against -- a floor that has so far
-        been arithmetic rather than an observation.
+        This is the only measurement of the 4-wire SPI bus at its configured
+        clock (BSP_LCD_PCLK_HZ, 80 MHz) and therefore the only check on the
+        15.4 ms floor every other figure in this project is compared against --
+        a floor that has so far been arithmetic rather than an observation.
 
         Second, a stop-the-world freeze. On a serial command the receive task
         stops reading its socket while the picture task carries on consuming
@@ -107,33 +107,4 @@ config AV_HW_BENCH
         benchmarks on every boot is not a television. AV_DISPLAY_BENCH may be
         on at the same time; the two do not share state.
 
-config AV_HW_BENCH_SPI80
-    bool "Also clock the panel SPI at 80 MHz (EXCEEDS THE PANEL'S RATING)"
-    depends on AV_HW_BENCH
-    default n
-    help
-        Raises the panel bus from 40 MHz to 80 MHz for the whole build, and
-        ONLY for a build that already has AV_HW_BENCH on -- the product is not
-        reachable from here, which is the point.
-
-        This exceeds what the panel is specified for. The ST7789 datasheet gives
-        a minimum write cycle of 16 ns, which is 62.5 MHz; the C3 can divide its
-        80 MHz APB down to 80, 40 or 26.7 MHz and nothing between, so 40 MHz is
-        the highest compliant rate and 80 is the next step out of the envelope.
-        There is a second, separate reason to doubt it: this board drives SCLK
-        and MOSI through the GPIO matrix (GPIO 8 and 9) rather than the SPI2
-        IOMUX pins (6 and 7), and Espressif only guarantees those two routes are
-        equivalent at or below 40 MHz.
-
-        What the option is for is finding out what happens, because the panel is
-        the measured binding constraint -- 23 ms a frame against a 23.04 ms
-        floor, where the floor is exactly this clock. Halving the clock period
-        would halve the frame time, which is worth more than any other change
-        available. If it works, the picture is intact and the frame rate roughly
-        doubles; if it does not, the picture tears, shifts, or goes blank, and
-        the answer is that the bus cannot go faster and the ceiling is real.
-
-        Whether it works is a question for a person looking at the screen. The
-        console can report a frame rate whether or not the pixels arrive, so a
-        run of this option is only meaningful with someone watching.
 endmenu

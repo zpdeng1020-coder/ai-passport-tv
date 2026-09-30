@@ -2,10 +2,6 @@
 // 移植自 trae_card/components/platform/platform_esp32/src/disp_st7789.c
 #include "bsp_display.h"
 #include "bsp_pins.h"
-// For CONFIG_AV_HW_BENCH_SPI80, the measurement-only panel clock override.
-// ESP-IDF puts the generated config/ directory on every component's include
-// path, so sdkconfig.h resolves here without a component dependency.
-#include "sdkconfig.h"
 #include "driver/spi_master.h"
 #include "driver/ledc.h"
 #include "esp_lcd_panel_io.h"
@@ -75,26 +71,6 @@ static const st_init_cmd_t ST7789P3_CMDS[] = {
             0x40, 0x3A, 0x15, 0x15, 0x26, 0x2A}, 14, 10},  // NVGAMCTRL 负伽马
 };
 
-// The panel's write clock, with the measurement build's override applied.
-//
-// 80 MHz is outside what the panel is specified for: the datasheet's minimum
-// write cycle is 16 ns, or 62.5 MHz, and the C3's 80 MHz APB only divides to 80,
-// 40 or 26.7 MHz, so 40 is the fastest compliant rate and 80 is the next step
-// out. The GPIO-matrix routing this board uses for SCLK/MOSI (GPIO 8/9 rather
-// than the SPI2 IOMUX pins 6/7) is also only guaranteed equivalent at or below
-// 40 MHz.
-//
-// It exists because the panel is the measured binding constraint: 23 ms a frame
-// against a 23.04 ms floor that is exactly this clock. Halving the period halves
-// the floor, which is worth more than any other change on the table -- and
-// whether the pixels survive it is a question only a person looking at the
-// screen can answer, because a console reports a frame rate either way.
-#ifdef CONFIG_AV_HW_BENCH_SPI80
-#define BSP_LCD_EFFECTIVE_PCLK_HZ (BSP_LCD_PCLK_HZ * 2)
-#else
-#define BSP_LCD_EFFECTIVE_PCLK_HZ (BSP_LCD_PCLK_HZ)
-#endif
-
 static void backlight_init(void) {
     if (BSP_LCD_BL < 0) { ESP_LOGW(TAG, "背光引脚未接 MCU,亮度不可调"); return; }
     ledc_timer_config_t t = {
@@ -141,7 +117,7 @@ esp_err_t bsp_display_init(void) {
     esp_lcd_panel_io_spi_config_t io_cfg = {
         .cs_gpio_num = BSP_LCD_CS,
         .dc_gpio_num = BSP_LCD_DC,
-        .pclk_hz = BSP_LCD_EFFECTIVE_PCLK_HZ,
+        .pclk_hz = BSP_LCD_PCLK_HZ,
         .spi_mode = BSP_LCD_SPI_MODE,
         .lcd_cmd_bits = 8, .lcd_param_bits = 8,
         .trans_queue_depth = 10,
