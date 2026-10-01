@@ -4,6 +4,9 @@
 
 # Local audio/video prototype server
 
+> **No longer maintained here.** The media server has moved to its own repository, [ai-passport-tv-server](https://github.com/cjpjxjx/ai-passport-tv-server). This `server/` directory is a frozen snapshot as of commit `208357b`; make server changes in the new repository only.
+
+
 This is an opt-in, single-device **LAN player for live channels, video files and
 synthetic media**. It is not an Internet proxy or a production authentication
 service. Python 3.11+ and its standard library serve the media; ffmpeg is needed
