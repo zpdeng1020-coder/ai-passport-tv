@@ -1,5 +1,9 @@
 #include "av_protocol.h"
 #include <string.h>
+// 16 kHz mono: 16 samples a millisecond. A chunk length that stops matching its
+// duration would shift every timestamp the audio clock derives from it.
+_Static_assert(AV_AUDIO_SAMPLES == 16u * AV_AUDIO_MS, "audio chunk samples and duration disagree");
+_Static_assert(AV_AUDIO_SAMPLES % 2u == 0u, "an ADPCM block holds whole bytes of samples");
 static uint32_t get32(const uint8_t *p) {
     return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3];
 }

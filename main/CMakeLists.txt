@@ -15,6 +15,7 @@ idf_component_register(
          "net_demo.c"
          "jpeg_bench.c"
          "av_protocol.c"
+         "av_adpcm.c"
          "ui_text.c"
          "ui_menu.c"
          "av_provision.cpp"

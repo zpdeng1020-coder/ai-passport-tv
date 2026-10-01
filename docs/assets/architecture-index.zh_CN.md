@@ -46,6 +46,7 @@
 | 文件 | 负责什么 |
 | --- | --- |
 | [`main/av_channel_policy.c`/`.h`](../../main/av_channel_policy.h) | "这个频道是否出过画面"的记录，以及跳到下一频道的决策。 |
+| [`main/av_adpcm.c`/`.h`](../../main/av_adpcm.h) | 音频包的 IMA ADPCM 块解码（324 字节 → 640 个采样）；块格式写在头文件和 [`docs/local-tv-prototype.md`](../local-tv-prototype.zh_CN.md) 里。由 `audio_task()` 调用。 |
 | [`main/av_provision.cpp`/`.h`](../../main/av_provision.h) | Wi-Fi station/AP 生命周期（C++，封装 `esp-wifi-connect`）。 |
 | [`main/av_provision_policy.c`/`.h`](../../main/av_provision_policy.h) | 纯启动模式判定（`AV_BOOT_PLAY` vs `AV_BOOT_SETUP`），无 ESP-IDF 依赖。 |
 | [`main/av_settings.c`/`.h`](../../main/av_settings.h) | 亮度/音量的分档表（固定档位而非连续值）。 |

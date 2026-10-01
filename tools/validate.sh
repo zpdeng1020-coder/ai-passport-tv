@@ -40,6 +40,10 @@ run_static_checks() {
         tests/test_av_protocol.c main/av_protocol.c \
         -o "${test_dir}/test_av_protocol"
     "${test_dir}/test_av_protocol"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_av_adpcm.c main/av_adpcm.c \
+        -o "${test_dir}/test_av_adpcm"
+    "${test_dir}/test_av_adpcm"
     # Overlay text and menu state: pure logic, so they run without a device.
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_ui_text.c main/ui_text.c \

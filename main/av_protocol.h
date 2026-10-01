@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "av_adpcm.h"
 #define AV_HEADER_BYTES 24u
 // Control payload ceiling. It has to hold the channel list, which the server
 // sends in the CONFIG packet: about 47 bytes of JSON per channel plus the fixed
@@ -66,7 +67,15 @@
 #ifndef AV_VIDEO_BUFFERS
 #define AV_VIDEO_BUFFERS 2u
 #endif
-#define AV_AUDIO_BYTES 1280u
+// One audio packet is 40 ms of 16 kHz mono sound, 640 samples, sent as IMA ADPCM:
+// a four-byte state header and four bits a sample, 324 bytes against the 1280 the
+// same sound takes as PCM. `AV_AUDIO_BYTES` is the length the packet header
+// carries -- what crosses the wire -- and `AV_AUDIO_PCM_BYTES` is what the codec
+// is fed after decoding. They are different numbers and the code that confuses
+// them still compiles, so each use should say which one it means.
+#define AV_AUDIO_SAMPLES 640u
+#define AV_AUDIO_PCM_BYTES (AV_AUDIO_SAMPLES * 2u)
+#define AV_AUDIO_BYTES (AV_ADPCM_HEADER_BYTES + AV_AUDIO_SAMPLES / 2u)
 #define AV_WIDTH 320u
 #define AV_HEIGHT 240u
 // How much picture arrives, and how much the device makes of it.

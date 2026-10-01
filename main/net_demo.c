@@ -205,7 +205,7 @@ static volatile uint32_t g_a_feed_max_ms, g_a_qmin = 0xFFFFFFFFu, g_a_arr_max_ms
 static uint32_t a_expected; static int64_t a_last_arr;
 
 static void audio_rx(const uint8_t *pkt, int r, int64_t now) {
-    if (r != 16 + (int)AV_AUDIO_BYTES || !aud_q) return;
+    if (r != 16 + (int)AV_AUDIO_PCM_BYTES || !aud_q) return;
     uint32_t seq = pkt[8] | (pkt[9] << 8) | (pkt[10] << 16) | ((uint32_t)pkt[11] << 24);
     if (!g_aud_active) { a_expected = seq; a_last_arr = 0; }
     if (seq >= a_expected) { g_a_lost += seq - a_expected; a_expected = seq + 1; }
@@ -221,7 +221,7 @@ static void audio_rx(const uint8_t *pkt, int r, int64_t now) {
 
 static void audio_task(void *arg) {
     (void)arg;
-    static uint8_t pcm[AV_AUDIO_BYTES], silence[AV_AUDIO_BYTES];
+    static uint8_t pcm[AV_AUDIO_PCM_BYTES], silence[AV_AUDIO_PCM_BYTES];
     for (;;) {
         while (!g_aud_active) vTaskDelay(pdMS_TO_TICKS(20));
         // Prebuffer, as the product does, then open the output.
@@ -250,8 +250,8 @@ static void audio_task(void *arg) {
                 if (gap > g_a_feed_max_ms) g_a_feed_max_ms = gap;
             }
             size_t written = 0;
-            esp_err_t e = bsp_audio_write_timeout(real ? pcm : silence, AV_AUDIO_BYTES, &written, 100);
-            if (e != ESP_OK || written != AV_AUDIO_BYTES) g_a_write_fail++;
+            esp_err_t e = bsp_audio_write_timeout(real ? pcm : silence, AV_AUDIO_PCM_BYTES, &written, 100);
+            if (e != ESP_OK || written != AV_AUDIO_PCM_BYTES) g_a_write_fail++;
             last_feed = esp_timer_get_time();
         }
         bsp_audio_set_mute(true);
@@ -260,7 +260,7 @@ static void audio_task(void *arg) {
 }
 
 static void audio_start(void) {
-    aud_q = xQueueCreate(AUD_QUEUE, AV_AUDIO_BYTES);
+    aud_q = xQueueCreate(AUD_QUEUE, AV_AUDIO_PCM_BYTES);
     if (!aud_q || bsp_audio_init() != ESP_OK || bsp_audio_set_format(16000, 16, 1) != ESP_OK) {
         ESP_LOGE(TAG, "audio init failed"); return;
     }

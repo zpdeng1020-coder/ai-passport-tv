@@ -3,7 +3,7 @@ English | [简体中文](local-tv-prototype.zh_CN.md)
 # Standalone local audio/video prototype
 
 This optional boot entry plays live or pre-generated 160x120 baseline YUV420 JPEG and
-16 kHz mono s16le PCM over one authenticated LAN TCP connection. The server's
+16 kHz mono IMA ADPCM audio (decoded to s16le PCM on the device) over one authenticated LAN TCP connection. The server's
 `live` subcommand transcodes a channel in real time; `run` replays prepared media.
 The channel list and the current channel are always chosen by the server, and the
 allowlisted addresses are unverified third-party relays. The original
@@ -55,7 +55,10 @@ HELLO (1) has header session/seq/PTS zero and JSON `{token,version:1}`, plus an
 optional `channel` naming the channel to play (omit or send an unknown id to get
 the server default). CONFIG (2) has a nonzero session, seq/PTS zero, and matching
 JSON session. Required values: width 160, height 120, fps 12, sample_rate 16000,
-channels 1, sample_bits 16, audio_chunk_ms 20, video_max_bytes 24576. Optional
+channels 1, sample_bits 16, audio_codec "ima_adpcm", audio_chunk_ms 40,
+video_max_bytes 24576. `sample_bits` is the decoded sound; `audio_codec` says what
+travels, and a CONFIG without it (a server still sending PCM) is refused with the
+field named in the log. Optional
 `start_delay_ms` must be 200; additional server timing fields are tolerated.
 
 `channels` is the audio channel count and must stay a number. The selectable
@@ -65,7 +68,29 @@ the device on its current channel. Keep the two keys distinct: sending the list
 as `channels` fails the device's CONFIG validation and ends every session. The startup target is CONFIG
 receipt +200 ms, but audio reset/prebuffer can delay it (see estimated clock).
 
-AUDIO (3) is exactly 640 bytes/20 ms. VIDEO (4) is a complete baseline YUV420 JPEG,
+AUDIO (3) is exactly 324 bytes per 40 ms: one IMA ADPCM block of 640 samples
+(16 kHz mono), against the 1280 bytes the same sound takes as PCM. The block is a
+four-byte header followed by 320 bytes of samples:
+
+```text
+[s16 predictor, big-endian][u8 step index 0..88][u8 zero][320 bytes: 640 x 4-bit codes]
+```
+
+The header is the decoder state *before the first sample*, not the first sample, so
+all 640 samples are coded and every block decodes without the one before it. A
+continuous encoder therefore writes, as each block's header, the predictor and
+index it holds when that block starts. Two codes share a byte with the **earlier
+sample in the low nibble**. Each code is the standard IMA one -- bit 3 the sign,
+bits 0-2 the magnitude; step table of 89 entries from 7 to 32767; index change
+-1,-1,-1,-1,2,4,6,8 by magnitude; `diff = step>>3` plus `step`, `step>>1`,
+`step>>2` for magnitude bits 2, 1, 0; predictor and index both clamped. A step
+index above 88 or a non-zero fourth header byte ends the session. Because the
+nibble order and header differ from a WAV IMA block (which stores sample 0 in the
+header and so holds 641 samples in 324 bytes), a stock `adpcm_ima_wav` stream is
+not this format; `audioop.lin2adpcm` packs the high nibble first, so swap the
+nibbles of each byte to use it as a reference.
+
+VIDEO (4) is a complete baseline YUV420 JPEG,
 1..24576 bytes; the ROM validates actual JPEG geometry/subsampling. END (5) has
 zero payload. ERROR (6) and other control JSON are at most 1024 bytes. Bad magic,
 version/type/flags, sizes, session, sequence, config, JPEG or truncated TCP input
@@ -73,7 +98,7 @@ terminates the session; there is no magic-search recovery. Before recursive JSON
 parsing, a linear string/escape-aware scan limits nesting depth to four. A pre-CONFIG ERROR is
 a terminal handshake failure, not accepted media. Remote JSON is never logged.
 Sequences increase globally, but media PTS is checked independently: audio starts
-at zero and advances by 20; video strictly increases and may skip frames. Video
+at zero and advances by 40; video strictly increases and may skip frames. Video
 PTS can be lower than an immediately preceding audio PTS. Loops must maintain
 continuous PTS/sequence or start a new session; `duration_ms` describes server
 material, not a firmware-enforced session timeout.
@@ -91,10 +116,12 @@ network configuration are unchanged. See [server instructions](../server/README.
 ## Ownership, memory and lifecycle
 
 - Socket worker: sole descriptor owner, nonblocking connect/read/write with
-  bounded polling/deadlines. Complete PCM/JPEG is queued; no consumer reads TCP.
+  bounded polling/deadlines. Complete ADPCM blocks/JPEG are queued; no consumer reads TCP.
 - Audio worker: existing BSP I2S/codec only; 100 ms maximum per write, partial
-  submission treated as failure. A 20-entry PCM queue provides 400 ms/12800 bytes,
-  plus one worker/receiver chunk. Startup waits for five chunks. Queue full,
+  submission treated as failure. It decodes each queued ADPCM block to 1280 bytes of
+  PCM just before writing it; an empty queue feeds zeroed PCM. The queue holds 24
+  blocks (960 ms) of 324 bytes, 7776 bytes against 30720 for the same audio as PCM
+  (`PCM_QUEUE` in `main/av_player.c` is the authority for the depth). Startup waits for five chunks. Queue full,
   starvation or feed gaps reset the connection and synchronization origin.
 - Video worker: sole raw panel owner, no LVGL callback. Exactly two 24 KiB JPEG
   buffers, two 320x16x2 internal DMA strips (20480 bytes) and 4096-byte decoder
@@ -107,7 +134,7 @@ network configuration are unchanged. See [server instructions](../server/README.
   before sequential DMA submission/wait; buffers are never reused before completion.
   This retains 20480 bytes of strip RAM, without claiming decode/DMA overlap or
   faster playback. This is a LEO-style source-size change, not a 20 fps replication.
-- Worker stacks: receiver 5120, audio/video 4096 bytes each; queues, driver DMA,
+- Worker stacks: receiver 5120, audio 5120, video 4096 bytes; queues, driver DMA,
   Wi-Fi and BSP overhead are additional. The overlay uses 160 MHz and bounded
   Wi-Fi RX/TX pools. Runtime free/minimum/largest heap is authoritative, not a
   build-size estimate. Allocation failure leaves the test stopped.

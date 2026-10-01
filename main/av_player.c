@@ -199,7 +199,10 @@ typedef enum {
     LINK_DOWN,
 } link_state_t;
 
-typedef struct { uint32_t pts; uint8_t pcm[AV_AUDIO_BYTES]; } audio_t;
+// One audio packet as it arrived: IMA ADPCM, decoded to PCM by the audio task
+// just before it is written. The queue holds the compressed form, 324 bytes a
+// chunk against the 1280 of the PCM it stands for.
+typedef struct { uint32_t pts; uint8_t block[AV_AUDIO_BYTES]; } audio_t;
 // One packet, as the transmitter sends it. A frame is several of these and the
 // receiver gathers them into the session's buffers; `slot` is which one this is
 // and `parts` how many make up the frame, which is known only once the last has
@@ -921,6 +924,10 @@ static bool json_between(const cJSON *j, const char *key, uint32_t low, uint32_t
     const cJSON *v=cJSON_GetObjectItemCaseSensitive(j,key);
     return cJSON_IsNumber(v) && v->valuedouble>=(double)low && v->valuedouble<=(double)high;
 }
+static bool json_string(const cJSON *j, const char *key, const char *expected) {
+    const cJSON *v=cJSON_GetObjectItemCaseSensitive(j,key);
+    return cJSON_IsString(v) && v->valuestring && !strcmp(v->valuestring,expected);
+}
 static bool config_valid(char *buf, size_t n, uint32_t session) {
     if (!av_json_depth_safe(buf,n,4)) {
         ESP_LOGW(TAG,"CONFIG rejected: json depth/parse guard");
@@ -944,7 +951,13 @@ static bool config_valid(char *buf, size_t n, uint32_t session) {
         // The bounds still catch a server sending nonsense, and the ceiling
         // keeps a stream from announcing a rate the panel could never draw.
         json_between(j,"fps",1,30) && json_number(j,"sample_rate",16000) && json_number(j,"channels",1) &&
-        json_number(j,"sample_bits",16) && json_number(j,"audio_chunk_ms",AV_AUDIO_MS) &&
+        // sample_bits is the decoded sound, not what travels: the packets are
+        // ADPCM, and "audio_codec" is what says so. A server that still sends
+        // PCM would otherwise connect, pass every other check, and be dropped
+        // at its first audio packet for a length no header can have -- with the
+        // log saying nothing about why.
+        json_number(j,"sample_bits",16) && json_string(j,"audio_codec","ima_adpcm") &&
+        json_number(j,"audio_chunk_ms",AV_AUDIO_MS) &&
         json_number(j,"video_max_bytes",AV_VIDEO_MAX) && json_number(j,"session",session) &&
         // The picture's stripe height, not the panel's. The two were the same
         // number until the picture started arriving smaller than the panel, and
@@ -986,6 +999,11 @@ static bool config_valid(char *buf, size_t n, uint32_t session) {
                 if (!cJSON_IsNumber(v) || v->valuedouble!=(double)want[i])
                     ESP_LOGW(TAG,"CONFIG field %s: server=%d device=%u",names[i],
                              cJSON_IsNumber(v)?(int)v->valuedouble:-1,(unsigned)want[i]);
+            }
+            if (!json_string(j,"audio_codec","ima_adpcm")) {
+                const cJSON *c=cJSON_GetObjectItemCaseSensitive(j,"audio_codec");
+                ESP_LOGW(TAG,"CONFIG field audio_codec: server=%s device=ima_adpcm",
+                         cJSON_IsString(c)&&c->valuestring?c->valuestring:"(missing)");
             }
             const cJSON *ss=cJSON_GetObjectItemCaseSensitive(j,"session");
             if (!cJSON_IsNumber(ss) || ss->valuedouble!=(double)session)
@@ -1240,10 +1258,15 @@ static void receive_task(void *arg) {
             if (stopping()) break;
             s_rx_stage="audio-read";
             int64_t io_start=esp_timer_get_time();
-            bool audio_ok=io_all(fd,a.pcm,sizeof(a.pcm),false,AV_READ_DEADLINE_MS);
+            bool audio_ok=io_all(fd,a.block,sizeof(a.block),false,AV_READ_DEADLINE_MS);
             atomic_fetch_add(&s.rx_io_us,(uint32_t)(esp_timer_get_time()-io_start));
             atomic_fetch_add(&s.rx_iterations,1u);
             if (!audio_ok) break;
+            // A header no encoder wrote is a stream that is not the one agreed
+            // in CONFIG; ending the session here is the same rule a malformed
+            // video table gets, and keeps garbage out of the decoder.
+            s_rx_stage="audio-header";
+            if (!av_adpcm_header_valid(a.block)) break;
             atomic_fetch_add(&s.rx_audio_packets,1u);
             if (!xQueueSend(s.audio,&a,0)) { fail("bounded PCM queue full"); break; }
             unsigned q=uxQueueMessagesWaiting(s.audio); if(q>s.audio_high) s.audio_high=q;
@@ -1369,9 +1392,12 @@ static void audio_task(void *arg) {
     opened=true; bsp_audio_set_mute(true); bsp_audio_set_volume(s.volume);
     // Clear any prior-session DMA audio while muted. >90ms, finite writes.
     audio_t a={0};
+    // What the codec is fed. The queue holds ADPCM; this is the one chunk of it
+    // that has been expanded, and it is also the silence buffer.
+    int16_t pcm[AV_AUDIO_SAMPLES]={0};
     for (int i=0;i<6 && !stopping();i++) {
         size_t written=0;
-        if (bsp_audio_write_timeout(a.pcm,sizeof(a.pcm),&written,100)!=ESP_OK || written!=sizeof(a.pcm)) {
+        if (bsp_audio_write_timeout(pcm,sizeof(pcm),&written,100)!=ESP_OK || written!=sizeof(pcm)) {
             fail("I2S reset write"); goto done;
         }
     }
@@ -1446,15 +1472,19 @@ static void audio_task(void *arg) {
                     starved_ms);
                 fail("audio starved beyond budget; reconnect/rebuffer"); break;
             }
-            // The chunk that is fed instead of a real one. `a` already holds the
+            // The chunk that is fed instead of a real one. `pcm` still holds the
             // last one that played, so it is zeroed rather than left as it was
             // -- feeding the previous chunk again would repeat 40 ms of sound.
-            memset(a.pcm,0,sizeof(a.pcm));
+            memset(pcm,0,sizeof(pcm));
             silent=true;
         } else {
             starved_since=0;
             starved_reported=false;
             silent=false;
+            // Each block carries its own decoder state, so no state is kept
+            // from one chunk to the next, and a stretch of silence in between
+            // leaves nothing for the next block to inherit.
+            av_adpcm_decode(a.block,AV_AUDIO_SAMPLES,pcm);
         }
         if (!unmuted) {
             unmuted=true;
@@ -1477,7 +1507,7 @@ static void audio_task(void *arg) {
             if (gap>AUDIO_FEED_GAP_MS) { fail("audio feed gap exceeds DMA budget"); break; }
         }
         size_t written=0;
-        esp_err_t e=bsp_audio_write_timeout(a.pcm,sizeof(a.pcm),&written,100);
+        esp_err_t e=bsp_audio_write_timeout(pcm,sizeof(pcm),&written,100);
         taskENTER_CRITICAL(&clock_lock);
         s.submitted_samples+=written/2;
         // Charged apart. This write went to the codec and really did play, so
@@ -1487,7 +1517,7 @@ static void audio_task(void *arg) {
         if(silent) s.silence_samples+=written/2;
         taskEXIT_CRITICAL(&clock_lock);
         last_feed=esp_timer_get_time();
-        if (e!=ESP_OK || written!=sizeof(a.pcm)) { fail("I2S timeout/partial write"); break; }
+        if (e!=ESP_OK || written!=sizeof(pcm)) { fail("I2S timeout/partial write"); break; }
     }
     if (!stopping()) delay_until(esp_timer_get_time()+100000); // Estimated final drain.
 done:
@@ -1495,6 +1525,8 @@ done:
         bsp_audio_set_mute(true);
         if (bsp_audio_stream_close()!=ESP_OK) fail("codec close");
     }
+    ESP_LOGI(TAG,"audio task stack high-water=%u bytes free",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     xEventGroupSetBits(s.events,AUDIO_DONE);
     vTaskDelete(NULL);
 }
@@ -3702,11 +3734,12 @@ void av_player_main(void) {
         // the allocations behind them changed -- 49152 was three 16384-byte
         // buffers when a frame could be split, and the real figures are now
         // 2 x AV_VIDEO_MAX = 45056 for the picture buffers, 24 x AV_AUDIO_BYTES
-        // = 30720 of PCM payload, and STRIPE_BYTES x 2 = 20480. An external
+        // = 7776 of ADPCM payload (30720 when the queue held PCM), and
+        // STRIPE_BYTES x 2 = 20480. An external
         // review noticed the line was stale twice before anyone corrected it.
         // A log line that reports numbers nobody computed is worse than no
         // line: it is read as a measurement.
-        ESP_LOGI(TAG,"Allocated video ring=%u PCM=%ux%u=%u stripes=%ux%u=%u; heap=%u largest=%u",
+        ESP_LOGI(TAG,"Allocated video ring=%u audio(ADPCM)=%ux%u=%u stripes=%ux%u=%u; heap=%u largest=%u",
             (unsigned)AV_VIDEO_RING_BYTES,
             (unsigned)PCM_QUEUE,(unsigned)AV_AUDIO_BYTES,
             (unsigned)(PCM_QUEUE*AV_AUDIO_BYTES),
@@ -3745,7 +3778,11 @@ void av_player_main(void) {
         // the timeline everything else is paced against.
         shot_maybe_request();
         if(xTaskCreate(video_task,"av_video",4096,NULL,5,NULL)!=pdPASS) { fail("video task allocation"); xEventGroupSetBits(s.events,VIDEO_DONE); }
-        if(xTaskCreate(audio_task,"av_audio",4096,NULL,7,NULL)!=pdPASS) { fail("audio task allocation"); xEventGroupSetBits(s.events,AUDIO_DONE); }
+        // One chunk of PCM now lives on this stack beside the queued ADPCM block,
+        // 324 bytes more than the PCM-only layout needed, so the stack grows a
+        // kilobyte; the queue gave back about 23 KB. The high-water mark is
+        // logged when the task ends -- trim this to what that says.
+        if(xTaskCreate(audio_task,"av_audio",5120,NULL,7,NULL)!=pdPASS) { fail("audio task allocation"); xEventGroupSetBits(s.events,AUDIO_DONE); }
         if(xTaskCreate(receive_task,"av_rx",5120,NULL,6,NULL)!=pdPASS) { fail("receive task allocation"); xEventGroupSetBits(s.events,RX_DONE); }
         int64_t session_start=esp_timer_get_time();
         int64_t next_metrics=session_start+10000000;

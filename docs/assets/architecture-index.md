@@ -60,6 +60,7 @@ Supporting modules, each already host-testable and already covered by
 | File | Owns |
 | --- | --- |
 | [`main/av_channel_policy.c`/`.h`](../../main/av_channel_policy.h) | "Has this channel ever shown a picture" bookkeeping and the skip-to-next-channel decision. |
+| [`main/av_adpcm.c`/`.h`](../../main/av_adpcm.h) | IMA ADPCM block decode for the audio packet (324 bytes → 640 samples); block layout is documented in the header and in [`docs/local-tv-prototype.md`](../local-tv-prototype.md). Called from `audio_task()`. |
 | [`main/av_provision.cpp`/`.h`](../../main/av_provision.h) | Wi-Fi station/AP lifecycle (C++, wraps `esp-wifi-connect`). |
 | [`main/av_provision_policy.c`/`.h`](../../main/av_provision_policy.h) | Pure boot-mode decision (`AV_BOOT_PLAY` vs `AV_BOOT_SETUP`), no ESP-IDF. |
 | [`main/av_settings.c`/`.h`](../../main/av_settings.h) | Brightness/volume step tables (fixed levels, not continuous). |
