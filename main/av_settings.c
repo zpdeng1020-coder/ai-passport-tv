@@ -1,9 +1,9 @@
 #include "av_settings.h"
 
-// Five levels, brightest first. Descending order is what makes "up" mean
-// brighter with a plain index decrement, which is the direction the arrow on the
-// case points.
-const uint8_t AV_BRIGHTNESS_LEVELS[] = {100, 80, 60, 40, 20};
+// Ten levels in steps of 10%, brightest first, matching the volume steps.
+// Descending order is what makes "up" mean brighter with a plain index
+// decrement, which is the direction the arrow on the case points.
+const uint8_t AV_BRIGHTNESS_LEVELS[] = {100, 90, 80, 70, 60, 50, 40, 30, 20, 10};
 const unsigned AV_BRIGHTNESS_COUNT = sizeof(AV_BRIGHTNESS_LEVELS) / sizeof(AV_BRIGHTNESS_LEVELS[0]);
 
 uint8_t av_brightness_percent(unsigned index)

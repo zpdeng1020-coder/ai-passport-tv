@@ -372,6 +372,9 @@ typedef struct {
     // not the link's: the two differ by everything thrown away, and telling them
     // apart is the difference between "the network is slow" and "we are slow".
     atomic_uint_least32_t rx_video_bytes, rx_video_packets, rx_audio_packets;
+    // One-second readings for the screen, written by the session loop: frames a
+    // second times ten, and bytes a second off the socket, audio included.
+    atomic_uint_least32_t fps_x10, rx_bytes_per_s;
     // Where the receive task's time actually goes, in microseconds, measured
     // rather than reasoned about. The three parts answer three different
     // questions and want three different fixes: `io` is time inside recv(),
@@ -499,6 +502,11 @@ static char shown_channel[AV_CHANNEL_ID_MAX];
 // draw the waiting screen even though its channel id is still empty and equals
 // shown_channel. See the use site.
 static bool waiting_drawn;
+// Whether the black bars above and below the picture currently carry readings,
+// and when they were last painted. The picture never covers the bars, so during
+// playback they are only touched by refresh_info_bars().
+static bool bars_drawn;
+static int64_t bars_painted_us;
 // Which overlay the waiting screen was last painted with, and when.
 //
 // The waiting screen is a still image, so it is painted when something it shows
@@ -863,7 +871,12 @@ static int connect_server(void) {
     // unless a build turns it on. See CONFIG_AV_USB_TRANSPORT.
 #ifdef CONFIG_AV_USB_TRANSPORT
     if (usb_serial_jtag_is_driver_installed() && usb_serial_jtag_is_connected()) {
-        ESP_LOGI(TAG,"Transport: USB (host connected)");
+        // Whatever the host wrote before this session began belongs to a
+        // session that is over. The ring is not flushed by a session ending, and
+        // a header read that lands in the middle of old media never resyncs.
+        uint8_t stale[64]; unsigned dropped=0; int got;
+        while ((got=usb_serial_jtag_read_bytes(stale,sizeof(stale),0))>0) dropped+=(unsigned)got;
+        ESP_LOGI(TAG,"Transport: USB (host connected), dropped %u stale bytes",dropped);
         atomic_store(&s.link,(int)LINK_UP);
         return AV_TRANSPORT_USB;
     }
@@ -928,6 +941,14 @@ static bool json_string(const cJSON *j, const char *key, const char *expected) {
     const cJSON *v=cJSON_GetObjectItemCaseSensitive(j,key);
     return cJSON_IsString(v) && v->valuestring && !strcmp(v->valuestring,expected);
 }
+// The product refuses an announced rate above 30. A measurement build that
+// carries the media over USB lifts that, so the cable can be pushed past what the
+// panel was sized for and the point where it stops keeping up can be found.
+#ifdef CONFIG_AV_USB_TRANSPORT
+#define AV_CONFIG_FPS_MAX 60
+#else
+#define AV_CONFIG_FPS_MAX 30
+#endif
 static bool config_valid(char *buf, size_t n, uint32_t session) {
     if (!av_json_depth_safe(buf,n,4)) {
         ESP_LOGW(TAG,"CONFIG rejected: json depth/parse guard");
@@ -950,7 +971,7 @@ static bool config_valid(char *buf, size_t n, uint32_t session) {
         //
         // The bounds still catch a server sending nonsense, and the ceiling
         // keeps a stream from announcing a rate the panel could never draw.
-        json_between(j,"fps",1,30) && json_number(j,"sample_rate",16000) && json_number(j,"channels",1) &&
+        json_between(j,"fps",1,AV_CONFIG_FPS_MAX) && json_number(j,"sample_rate",16000) && json_number(j,"channels",1) &&
         // sample_bits is the decoded sound, not what travels: the packets are
         // ADPCM, and "audio_codec" is what says so. A server that still sends
         // PCM would otherwise connect, pass every other check, and be dropped
@@ -1200,7 +1221,16 @@ static void receive_task(void *arg) {
         memset(&h,0,sizeof(h));
         if (!io_all(fd,wire,sizeof(wire),false,header_deadline_ms)) break;
         s_rx_stage="header-decode";
-        if(!av_header_decode(wire,&h)) break;
+        if(!av_header_decode(wire,&h)) {
+#ifdef CONFIG_AV_USB_TRANSPORT
+            // A byte lost on the cable shifts every later header, and a bare
+            // "header-decode" cannot tell that from a bad packet.
+            char hex[AV_HEADER_BYTES*3+1];
+            for (unsigned i=0;i<AV_HEADER_BYTES;i++) snprintf(hex+i*3,4,"%02x ",wire[i]);
+            ESP_LOGW(TAG,"RX header rejected: %s",hex);
+#endif
+            break;
+        }
         // The gap is taken here, between two headers that both arrived: a
         // read that timed out ends the session, so it would otherwise be
         // recorded as one enormous gap that means nothing.
@@ -1647,6 +1677,123 @@ static unsigned wifi_bars(void) {
     return 1;
 }
 
+static void drain_display(void);
+
+// Readings for the black bars around the picture, drawn into whichever stripe
+// overlaps a bar and nothing else. The picture covers rows
+// [AV_VIDEO_Y_OFFSET, AV_HEIGHT-AV_VIDEO_Y_OFFSET), so these rows belong to the
+// overlay alone: WiFi and battery in the top bar, frame rate and receive rate in
+// the bottom one. A bar too thin to hold a line of text is left alone.
+static void info_bars_stripe(ui_surface_t surface) {
+    // Text sits 16 px from each edge: the panel's corners are rounded, and the
+    // bars are exactly where they cut in.
+    const int edge=UI_TEXT_PAD_X+2+8;   // half a 16 px glyph
+    const int bar=(int)AV_VIDEO_Y_OFFSET;
+    const int box_h=(int)UI_TEXT_LINE_H+2*UI_TEXT_PAD_Y;
+    if (bar<box_h) return;
+    const int first=surface.origin_y, last=surface.origin_y+surface.rows;
+    const int pad=(bar-(int)UI_TEXT_LINE_H)/2;
+    char text[24];
+
+    const int top_y=pad;
+    if (first<bar && last>top_y-UI_TEXT_PAD_Y) {
+        unsigned bars=wifi_bars();
+        if (bars) snprintf(text,sizeof(text),"WiFi %u/4",bars);
+        else snprintf(text,sizeof(text),"WiFi --");
+        ui_text_draw(surface,edge,top_y,text,UI_COLOR_DIM,UI_COLOR_BOX);
+        int soc=atomic_load(&s.battery_soc);
+        if (soc>=0) snprintf(text,sizeof(text),"Battery %d%%",soc);
+        else snprintf(text,sizeof(text),"Battery --");
+        ui_text_draw(surface,(int)AV_WIDTH-edge-ui_text_width(text),top_y,
+                     text,UI_COLOR_DIM,UI_COLOR_BOX);
+    }
+
+    const int bottom=(int)AV_HEIGHT-bar;
+    const int bottom_y=bottom+pad;
+    if (last>bottom) {
+        // Cleared first: the list's last row can run into this band on a screen
+        // that paints the whole height, and it must not show through.
+        ui_text_fill(surface,0,bottom,(int)AV_WIDTH,bar,UI_COLOR_BOX);
+        uint32_t fps=atomic_load(&s.fps_x10);
+        snprintf(text,sizeof(text),"FPS %u.%u",(unsigned)(fps/10u),(unsigned)(fps%10u));
+        ui_text_draw(surface,edge,bottom_y,text,UI_COLOR_DIM,UI_COLOR_BOX);
+        snprintf(text,sizeof(text),"Net %u KB/s",
+                 (unsigned)((atomic_load(&s.rx_bytes_per_s)+512u)/1024u));
+        ui_text_draw(surface,(int)AV_WIDTH-edge-ui_text_width(text),bottom_y,
+                     text,UI_COLOR_DIM,UI_COLOR_BOX);
+    }
+}
+
+// Draw the channel list's readings on the bars, or blank them, between frames.
+// Called from the video task, which owns the panel: the queue is drained first so
+// the stripe buffer is free, then each band is built in s.stripe[0] and sent the
+// way the first frame blackens the bars. Does nothing until the picture owns the
+// panel; before that the waiting screen paints the bars itself.
+static bool refresh_info_bars(void) {
+    if (!atomic_load(&s.media_started)) return true;
+    const bool want=s.menu.view==UI_VIEW_MENU;
+    const int64_t now=esp_timer_get_time();
+    if (want) {
+        if (bars_drawn && now-bars_painted_us<1000000) return true;
+    } else if (!bars_drawn) {
+        return true;
+    }
+    const unsigned bar=(unsigned)AV_VIDEO_Y_OFFSET;
+    if (bar==0) return true;
+    drain_display();
+    const unsigned starts[2]={0u,(unsigned)AV_HEIGHT-bar};
+    for (unsigned b=0;b<2;b++) {
+        for (unsigned y=starts[b];y<starts[b]+bar;y+=AV_STRIPE_ROWS) {
+            unsigned rows=starts[b]+bar-y;
+            if (rows>AV_STRIPE_ROWS) rows=AV_STRIPE_ROWS;
+            memset(s.stripe[0],0,STRIPE_BYTES);
+            if (want) info_bars_stripe(stripe_surface(y,s.stripe[0]));
+            if (bsp_display_raw_submit_nowait(y,rows,s.stripe[0])!=ESP_OK ||
+                bsp_display_raw_drain(1,200)!=ESP_OK) {
+                fail("info bar DMA");
+                return false;
+            }
+        }
+    }
+    bars_drawn=want;
+    bars_painted_us=now;
+    return true;
+}
+
+// The status page's text, rebuilt at most once a second and read by every
+// stripe. Only the video task touches it: both callers of overlay_stripe run
+// there.
+#define STATUS_LINES 4u
+static char status_text[STATUS_LINES][UI_MENU_NAME_MAX+24];
+static int64_t status_text_us;
+static bool status_text_valid;
+
+static void refresh_status_text(void) {
+    const int64_t now=esp_timer_get_time();
+    if (status_text_valid && now-status_text_us<1000000) return;
+    status_text_valid=true;
+    status_text_us=now;
+
+    // Copied out under the table lock: the receive task may be replacing the
+    // table while this runs.
+    char name[UI_MENU_NAME_MAX];
+    current_channel_name(name,sizeof(name));
+    snprintf(status_text[0],sizeof(status_text[0]),"Channel  %s",name);
+
+    unsigned bars=wifi_bars();
+    if (bars) snprintf(status_text[1],sizeof(status_text[1]),"WiFi     %u/4",bars);
+    else snprintf(status_text[1],sizeof(status_text[1]),"WiFi     --");
+
+    int soc=atomic_load(&s.battery_soc);
+    if (soc>=0) snprintf(status_text[2],sizeof(status_text[2]),"Battery  %d%%",soc);
+    else snprintf(status_text[2],sizeof(status_text[2]),"Battery  --");
+
+    // It says "WiFi" rather than "network" because that is the word on the
+    // setup page the viewer will land on, and it says which arrow because the
+    // other one does nothing here.
+    snprintf(status_text[3],sizeof(status_text[3]),"Hold UP: set up WiFi");
+}
+
 // Draw one stripe's worth of overlay, if this stripe is one the overlay occupies.
 // Everything is positioned from absolute screen rows so a stripe can be drawn in
 // isolation without knowing what came before it.
@@ -1729,6 +1876,7 @@ static void overlay_stripe(unsigned stripe_y, uint8_t *pixels) {
                          chosen?UI_COLOR_SELECT_TEXT:UI_COLOR_TEXT,
                          chosen?UI_COLOR_SELECT:UI_COLOR_BOX);
         }
+        info_bars_stripe(surface);
     } else if (s.menu.view==UI_VIEW_BRIGHTNESS) {
         // The backlight page. Deliberately the same shape as the volume
         // indicator: a labelled level over a filled bar, because they are the
@@ -1776,43 +1924,22 @@ static void overlay_stripe(unsigned stripe_y, uint8_t *pixels) {
         if (first<(unsigned)header+1u && last>(unsigned)header) {
             ui_text_fill(surface,0,header,(int)AV_WIDTH,1,UI_COLOR_RULE);
         }
-        // Sized for the label plus a full-length channel name (UI_MENU_NAME_MAX).
-        // The name is bounded by the table, not by this line, so a buffer that
-        // holds only the label is a truncation warning the compiler is right to
-        // raise.
-        char text[UI_MENU_NAME_MAX+24];
         // Four lines: three readings and the gesture that leaves for setup. The
-        // fourth is not decoration -- the setup gesture is a long press on an
+        // last is not decoration -- the setup gesture is a long press on an
         // arrow, which nothing else on this page uses and which nobody would
         // guess, so the page has to say it.
-        for (unsigned i=0;i<4;i++) {
+        //
+        // The text is built once a second by refresh_status_text() and only
+        // drawn here. This runs for every stripe of every frame, and building
+        // the lines in place meant a WiFi driver call and a critical section
+        // several times a frame.
+        refresh_status_text();
+        for (unsigned i=0;i<STATUS_LINES;i++) {
             int y=header+8+(int)i*line;
             if ((int)last<=y-UI_TEXT_PAD_Y || (int)first>=y+(UI_TEXT_LINE_H+UI_TEXT_PAD_Y)) continue;
-            uint16_t colour=UI_COLOR_TEXT;
-            if (i==0) {
-                // Copied out under the table lock: this runs on the video task
-                // while the receive task may be replacing the table.
-                char name[UI_MENU_NAME_MAX];
-                current_channel_name(name,sizeof(name));
-                snprintf(text,sizeof(text),"Channel  %s",name);
-            } else if (i==1) {
-                unsigned bars=wifi_bars();
-                if (bars) snprintf(text,sizeof(text),"WiFi     %u/4",bars);
-                else snprintf(text,sizeof(text),"WiFi     --");
-            } else if (i==2) {
-                int soc=atomic_load(&s.battery_soc);
-                if (soc>=0) snprintf(text,sizeof(text),"Battery  %d%%",soc);
-                else snprintf(text,sizeof(text),"Battery  --");
-            } else {
-                // Dimmed, because it is an instruction rather than a reading.
-                //
-                // It says "WiFi" rather than "network" because that is the word
-                // on the setup page the viewer will land on, and it says which
-                // arrow because the other one does nothing here.
-                colour=UI_COLOR_DIM;
-                snprintf(text,sizeof(text),"Hold UP: set up WiFi");
-            }
-            ui_text_draw(surface,14,y,text,colour,UI_COLOR_BACKDROP);
+            // The instruction is dimmed, because it is not a reading.
+            ui_text_draw(surface,14,y,status_text[i],
+                         i==STATUS_LINES-1u?UI_COLOR_DIM:UI_COLOR_TEXT,UI_COLOR_BACKDROP);
         }
     }
     #undef LINE_HEIGHT
@@ -2812,6 +2939,7 @@ static void video_task(void *arg) {
         // only place its owner runs while it waits, so this is where the check
         // belongs.
         if (waiting_screen_stale() && !paint_waiting_screen()) break;
+        if (!refresh_info_bars()) break;
         video_t v;
         if(!xQueueReceive(s.video,&v,pdMS_TO_TICKS(20))) { if(rx_done()) break; continue; }
         // The clock is waited on once per frame, at the packet that opens it.
@@ -3685,6 +3813,8 @@ void av_player_main(void) {
         atomic_store(&s.inflate_bytes,0u);
         atomic_store(&s.rx_video_bytes,0u); atomic_store(&s.rx_video_packets,0u);
         atomic_store(&s.rx_audio_packets,0u);
+        atomic_store(&s.fps_x10,0u); atomic_store(&s.rx_bytes_per_s,0u);
+        bars_drawn=false;   // the first frame blackens the bars again
         atomic_store(&s.rx_io_us,0u); atomic_store(&s.rx_wait_us,0u);
         atomic_store(&s.rx_overhead_us,0u); atomic_store(&s.rx_iterations,0u);
         atomic_store(&s.rx_frame_starts,0u); atomic_store(&s.rx_frame_skipped,0u);
@@ -3787,6 +3917,8 @@ void av_player_main(void) {
         int64_t session_start=esp_timer_get_time();
         int64_t next_metrics=session_start+10000000;
         int64_t next_battery=session_start;
+        int64_t rate_at=session_start, next_rate=session_start+1000000;
+        uint32_t rate_decoded=0, rate_bytes=0;
         int64_t last_tick=session_start;
         // The banner fires once per session, at the moment the server confirms
         // the channel; last_announced carries across sessions so reconnecting to
@@ -3868,6 +4000,24 @@ void av_player_main(void) {
                 int soc=bsp_battery_soc();
                 atomic_store(&s.battery_soc,soc);   // -1 when unreadable
                 next_battery=tick_now+30000000;     // every 30 s
+            }
+            // Frame rate and receive rate over the last second. The counters are
+            // zeroed at the start of each session, as are these baselines, so
+            // the differences never wrap. Audio is counted at its fixed packet
+            // size: the receive counter only tallies video bytes.
+            if(tick_now>=next_rate) {
+                uint32_t span_ms=(uint32_t)((tick_now-rate_at)/1000);
+                uint32_t decoded_now=s.decoded;
+                uint32_t bytes_now=atomic_load(&s.rx_video_bytes)
+                    +atomic_load(&s.rx_audio_packets)*(uint32_t)AV_AUDIO_BYTES;
+                if(span_ms) {
+                    atomic_store(&s.fps_x10,
+                        (uint32_t)((uint64_t)(decoded_now-rate_decoded)*10000u/span_ms));
+                    atomic_store(&s.rx_bytes_per_s,
+                        (uint32_t)((uint64_t)(bytes_now-rate_bytes)*1000u/span_ms));
+                }
+                rate_decoded=decoded_now; rate_bytes=bytes_now;
+                rate_at=tick_now; next_rate=tick_now+1000000;
             }
             // Write back a setting that changed. Done here rather than in the key
             // handler because a flash write takes long enough to be felt as a
