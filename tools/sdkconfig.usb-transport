@@ -1,0 +1,12 @@
+# Measurement overlay: carry the media stream over the USB cable as well.
+#
+# Passed as a third SDKCONFIG_DEFAULTS entry after sdkconfig.defaults and
+# sdkconfig.av-prototype, the same way as sdkconfig.hw-bench, so the two files
+# under version control keep CONFIG_AV_USB_TRANSPORT off. A device that prefers
+# the cable whenever one is plugged in is not the product. It costs about 20 KB
+# of internal RAM for the driver's ring buffers.
+#
+# The option cannot be turned on with `idf.py -D CONFIG_AV_USB_TRANSPORT=y`: that
+# sets a CMake cache variable, not a Kconfig symbol, and the build succeeds with
+# the option still off.
+CONFIG_AV_USB_TRANSPORT=y
