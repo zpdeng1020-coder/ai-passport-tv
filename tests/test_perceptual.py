@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from server import frames, perceptual
 
 if not perceptual.AVAILABLE:
-    raise SystemExit("numpy is needed for these tests")
+    raise unittest.SkipTest("numpy is needed for these tests")
 
 import numpy as np
 
