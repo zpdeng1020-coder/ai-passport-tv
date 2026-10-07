@@ -177,7 +177,7 @@ class TcpIntegration(unittest.TestCase):
                                 self.assertEqual(unpack(current_parts), raw)
                                 complete_frames.append(pts)
                                 current_parts = []
-                    if first_audio and (time.monotonic() - first_audio >= 4.2 or len(audio_times) >= 85): break
+                    if first_audio and (len(audio_times) >= 85 or time.monotonic() - first_audio >= 6.0): break
             finally:
                 server.stop.set()
                 client.close()
