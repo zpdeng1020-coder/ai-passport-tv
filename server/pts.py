@@ -1,33 +1,12 @@
-"""Both streams' own timestamps, out of the one decode that produced them.
+"""音视频各自的时间戳，取自产出它们的同一个解码进程。
 
-The server used to run two ffmpeg processes and count frames on each side: a
-picture's content time was `frames_produced / fps` and a sound block's was
-`blocks_produced * 40 ms`, with the relationship between the two measured once
-from `ffprobe`. Counting is a rate, not a clock. It is right on average and
-wrong on every individual item, and it cannot see a gap at all: a decoder that
-skips 300 ms of audio still emits one block per 40 ms, so the count closes the
-hole and shifts everything after it.
+一个 ffmpeg 进程解码一次并同时输出两路载荷，`showinfo` 与 `ashowinfo` 在其滤镜图中
+逐条记录每个条目的 `pts_time`。时间戳与载荷出自同一次解码、处于同一时间轴，无需推算偏移，
+源中的断档也能被看到。
 
-What replaces it is the decoder's own answer. One ffmpeg process reads the
-source once and produces both payloads; `showinfo` and `ashowinfo` sit in that
-process's filter graph and log each item's `pts_time` as it passes. The
-timestamps therefore describe the same decode as the bytes, and they are already
-on one timeline, so no offset has to be inferred from start times or launch
-times.
-
-**One log line per item, checked by index.** `showinfo` logs a frame before the
-muxer writes it, so the timestamp is always available by the time its bytes have
-been read. Each line carries its own `n`, and the reader compares that against
-the count of items it has read. A mismatch means a line was lost, and a lost
-line would silently shift every later item by one; refusing is the only answer
-that does not produce a plausible-looking stream with the wrong times in it.
-
-Measured on a live channel (12 s, mono 16 kHz, 12 fps): 144 `showinfo` lines,
-`n` contiguous from 0, one per frame written; 300 `ashowinfo` lines for 300
-device blocks of 1280 bytes, `n` contiguous from 0. `asetnsamples=n=640` and a
-forced mono layout are what make one line equal one device block -- without the
-mono conversion a stereo frame carries two blocks and the correspondence is
-halved, which is exactly how the first version of this was wrong.
+每个条目一行日志，按序号校验。`showinfo` 在写出前记录，读完载荷时对应行必已就绪。
+每行带 `n`，读取方与已读条目数比对；不符说明丢了行，此后所有时间戳都会错位一个条目，
+此时必须拒绝继续。`asetnsamples=n=640` 与强制单声道使一行日志恰好对应一个设备块。
 """
 
 from __future__ import annotations
@@ -36,21 +15,19 @@ import collections
 import re
 import threading
 
-# ffmpeg writes, for each item:
+# ffmpeg 为每个条目输出：
 #   [Parsed_showinfo_3 @ 0x...] n:   0 pts:      0 pts_time:0       duration: ...
 #   [Parsed_ashowinfo_6 @ 0x...] n:0 pts:0 pts_time:0 fmt:s16 channels:1 ...
-# `Parsed_ashowinfo` does not contain `Parsed_showinfo`, so the two are told
-# apart by the filter name and not by the fields, which are the same shape.
+# 两行字段形状相同，只能按滤镜名区分；`Parsed_ashowinfo` 不含 `Parsed_showinfo`。
 VIDEO_FILTER = b"Parsed_showinfo"
 AUDIO_FILTER = b"Parsed_ashowinfo"
 _FIELDS = re.compile(rb"\] n:\s*(\d+)\s+pts:\s*(-?\d+)\s+pts_time:([-\d.eE+]+)")
 
 
 def parse(line: bytes) -> tuple[str, int, float] | None:
-    """Which stream, which index, what time. None if the line is not one of ours.
+    """返回（流类型，序号，时间）；不是目标行时返回 None。
 
-    `showinfo` also emits side-data and colour-range lines with the same prefix
-    and no `n:`; requiring the full field sequence is what keeps those out.
+    `showinfo` 还会输出同前缀但没有 `n:` 的行，要求完整字段序列以排除它们。
     """
     if AUDIO_FILTER in line:
         kind = "audio"
@@ -65,20 +42,11 @@ def parse(line: bytes) -> tuple[str, int, float] | None:
 
 
 class Misaligned(RuntimeError):
-    """The decoder's own index did not match the item that was read.
-
-    Raised rather than repaired: the timestamps after this point are all one
-    item out, and a stream stamped with the wrong times still looks like a
-    stream, which is the failure mode this whole module exists to avoid.
-    """
+    """解码器给出的序号与已读条目对不上；此后的时间戳都会错位，只能拒绝而不修复。"""
 
 
 class Timestamps:
-    """The decoder's timestamps, in the order it produced them.
-
-    Indexed, and the index is load-bearing: a reader that has just taken the
-    Nth item asks for the Nth timestamp and is told if it does not get it.
-    """
+    """按解码器产出顺序保存的时间戳；读完第 N 个条目即取第 N 个时间戳，并校验序号。"""
 
     def __init__(self) -> None:
         self._condition = threading.Condition()
@@ -87,12 +55,11 @@ class Timestamps:
         self._expected = {"video": 0, "audio": 0}
         self.received = {"video": 0, "audio": 0}
         self._closed = False
-        # What the decoder said, kept whole: when a session ends badly the only
-        # useful artefact is the last thing the instrument reported.
+        # 保留解码器最近的日志行，会话异常结束时用于排查。
         self.tail: collections.deque[bytes] = collections.deque(maxlen=64)
 
     def note(self, line: bytes) -> None:
-        """Record one logged item. Called from the stderr reader thread."""
+        """记录一条日志；在 stderr 读取线程中调用。"""
         self.tail.append(line)
         found = parse(line)
         if found is None:
@@ -105,14 +72,10 @@ class Timestamps:
             self._condition.notify_all()
 
     def take(self, kind: str, timeout: float = 5.0) -> float | None:
-        """The next timestamp for `kind`, in seconds, or None if none came.
+        """返回 `kind` 的下一个时间戳（秒）；超时或已关闭且无数据时返回 None。
 
-        Blocks until the decoder has logged the item the caller has just read.
-        It should never actually wait: the filter logs an item before the bytes
-        reach the pipe, so by the time the payload has been read the line is
-        already here. The timeout is for the case that is not true -- a
-        decoder that has stopped -- where waiting for ever would turn a stalled
-        source into a stalled server.
+        滤镜先于载荷写出日志，正常情况下读完载荷时本行已到，不会阻塞；
+        超时只用于解码器已停止的情况，避免源停供拖死服务端。
         """
         with self._condition:
             queue = self._video if kind == "video" else self._audio
@@ -135,34 +98,22 @@ class Timestamps:
             return seconds
 
     def close(self) -> None:
-        """Wake up any threads waiting in take() and mark closed."""
+        """标记关闭并唤醒在 take() 中等待的线程。"""
         with self._condition:
             self._closed = True
             self._condition.notify_all()
 
-    def reset(self) -> None:
-        """A new decoder starts its own indexing. Nothing carries over."""
-        with self._condition:
-            self._video.clear()
-            self._audio.clear()
-            self._expected = {"video": 0, "audio": 0}
-            self.received = {"video": 0, "audio": 0}
-            self._closed = False
 
 
 def _now() -> float:
-    # time.monotonic, named once so the import list above stays honest about
-    # what this module needs: a clock, a condition and a regex.
     import time
     return time.monotonic()
 
 
 class Reader(threading.Thread):
-    """Drain the decoder's stderr into a `Timestamps`.
+    """持续读取解码器 stderr 并写入 `Timestamps`。
 
-    A thread of its own and not a later read: ffmpeg blocks when nothing is
-    consuming its log, so an undrained stderr is a stalled stream that looks
-    exactly like a stalled source.
+    必须独立线程：没人读日志时 ffmpeg 会阻塞，表现与源停供无法区分。
     """
 
     def __init__(self, stream, timestamps: Timestamps):

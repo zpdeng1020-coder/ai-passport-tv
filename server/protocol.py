@@ -1,4 +1,4 @@
-"""Bounded FAV1 framing; a bad header terminates the connection, never resyncs."""
+"""FAV1 定长限界分包；包头非法即断开连接，不做重新同步。"""
 
 from __future__ import annotations
 
@@ -13,17 +13,14 @@ from enum import IntEnum
 HEADER = struct.Struct("!4sBBHIIII")
 MAGIC = b"FAV1"
 VERSION = 1
-# Control payload ceiling, matching main/av_protocol.h TV_CONTROL_MAX. The
-# channel list travels in one CONFIG packet: a few hundred channels is about
-# 12 KB of JSON, which the previous 1024-byte ceiling rejected outright.
+# 控制包载荷上限，与固件 main/av_protocol.h 的 TV_CONTROL_MAX 一致；频道表放在一个 CONFIG 包里。
 CONTROL_MAX = 24 * 1024
-# Must equal AV_VIDEO_MAX in main/av_protocol.h and VIDEO_MAX in frames.py. A
-# video packet carries whole stripes, so the worst it can be is three stripes
-# of incompressible data -- 15399 bytes -- and the picture format module is
-# where that number is derived. Kept as an import rather than a second literal
-# so the two cannot drift apart.
+# 视频包上限，须与固件 AV_VIDEO_MAX 一致；取自 frames.VIDEO_MAX，不重复定义。
 from .frames import VIDEO_MAX
-AUDIO_BYTES = 1280
+# ffmpeg 输出的一个 40 ms 块：640 个 s16le 单声道采样。
+AUDIO_PCM_BYTES = 1280
+# 该块上线的字节数：4 字节 IMA ADPCM 头加 640 个半字节（见 adpcm.py），须与固件 AV_AUDIO_BYTES 一致。
+AUDIO_BYTES = 324
 UINT32_MAX = 0xFFFFFFFF
 IO_TIMEOUT = 0.25
 
@@ -32,25 +29,20 @@ class Kind(IntEnum):
     HELLO = 1
     CONFIG = 2
     PCM = 3
-    # The picture, one indexed frame cut into stripes. Still called JPEG here
-    # because the device's own name for the slot is AV_VIDEO and the numbers
-    # have to agree; the payload is no longer a JPEG.
+    # 画面：切成条带的一帧索引图。名称沿用 JPEG 以与固件的取值对应，载荷并非 JPEG。
     JPEG = 4
     END = 5
     ERROR = 6
-    # The 256 colours the indices refer to, sent once before the first frame of
-    # a channel because the palette is chosen per channel.
+    # 索引所指的 256 色调色板，每个频道首帧之前发送一次。
     PALETTE = 7
 
-# The only flag bit in use, and only on video: this packet carries more stripes
-# of the frame the previous packet started. A frame cut across several packets
-# sends them all under one timestamp, and the timestamp must otherwise advance,
-# so a continuation has to say so or it is indistinguishable from a repeat.
+# 唯一使用的标志位，仅用于视频：本包是上一包所起始那一帧的后续条带。
+# 同一帧的多个包共用一个时间戳，需要此标志与重复帧区分。
 VIDEO_CONTINUES = 0x01
 
 
 class ProtocolError(ValueError):
-    """Invalid peer input (messages must never contain peer payloads)."""
+    """对端输入非法；消息中不得包含对端载荷。"""
 
 
 @dataclass(frozen=True)
@@ -60,9 +52,7 @@ class Packet:
     seq: int
     pts_ms: int
     payload: bytes = b""
-    # Only video uses this, and only VIDEO_CONTINUES. Kept a plain integer so a
-    # caller passing a stray bit is caught by the range check rather than
-    # silently reaching the wire.
+    # 仅视频使用，且只能是 VIDEO_CONTINUES；用普通整数，多余的位由范围检查拦下。
     flags: int = 0
 
     def encode(self) -> bytes:
@@ -82,7 +72,7 @@ def validate_length(kind: Kind, size: int) -> None:
     if kind in (Kind.HELLO, Kind.CONFIG, Kind.ERROR):
         valid = 0 < size <= CONTROL_MAX
     elif kind == Kind.PCM:
-        valid = size == AUDIO_BYTES
+        valid = (size == AUDIO_BYTES or size == AUDIO_PCM_BYTES)
     elif kind in (Kind.JPEG, Kind.PALETTE):
         valid = 0 < size <= VIDEO_MAX
     elif kind == Kind.END:
@@ -147,7 +137,7 @@ def _read_exact(sock: socket.socket, size: int, deadline: float) -> bytes:
 
 def receive_packet(sock: socket.socket, timeout: float = IO_TIMEOUT,
                    expected_session: int | None = None) -> Packet:
-    """One total deadline includes header and payload; validate before allocation."""
+    """包头与载荷共用一个总期限；先校验长度再分配缓冲。"""
     deadline = time.monotonic() + timeout
     raw = _read_exact(sock, HEADER.size, deadline)
     magic, version, kind, flags, session, seq, pts, length = HEADER.unpack(raw)
@@ -157,9 +147,7 @@ def receive_packet(sock: socket.socket, timeout: float = IO_TIMEOUT,
         kind = Kind(kind)
     except ValueError:
         raise ProtocolError("unknown packet type") from None
-    # Only the one flag exists, and only on video, exactly as the device
-    # enforces it. Anything else reaching the wire is a bug on the sending
-    # side, and it is better caught here than drawn as a torn picture.
+    # 与设备一致：只允许视频包带 VIDEO_CONTINUES 一个标志。
     if flags and not (kind == Kind.JPEG and flags == VIDEO_CONTINUES):
         raise ProtocolError("unsupported packet flags")
     validate_length(kind, length)
@@ -171,16 +159,10 @@ def receive_packet(sock: socket.socket, timeout: float = IO_TIMEOUT,
 
 def send_packet(sock: socket.socket, packet: Packet,
                 timeout: float = IO_TIMEOUT, deadline: float | None = None) -> None:
-    """No application send queue; at most one bounded packet, one total deadline.
+    """无应用层发送队列，一次最多写一个限长包，共用一个总期限。
 
-    The server owns a nonblocking socket. A partial write followed by timeout is
-    fatal: do not append an ERROR into the unfinished packet.
-
-    `deadline` is for a packet that is one of several making up a single thing.
-    A frame is five packets, and giving each of them its own full timeout would
-    let a frame hold the sender for five times as long -- during which no audio
-    goes out and the device's 400 ms buffer runs dry. A shared deadline bounds
-    the whole frame instead of each packet in it.
+    套接字为非阻塞。写到一半超时属于致命错误，不得在未写完的包后追加 ERROR。
+    `deadline` 供同一帧的多个包共用，使整帧而不是每个包受期限约束。
     """
     data = memoryview(packet.encode())
     if deadline is None:
@@ -197,19 +179,10 @@ def send_packet(sock: socket.socket, packet: Packet,
 
 
 def _write_slice(sock: socket.socket, data: memoryview, deadline: float) -> bool:
-    """Write one already-encoded slice of a packet, or report the deadline passed.
+    """写出已编码包的一个分片；期限已过时返回 False。
 
-    The caller encodes the packet once and hands over successive pieces of it,
-    which is the only way for a single loop carrying both media to serve the
-    sound while a picture packet is still going out. `send_packet` cannot be
-    used for that: it takes the whole packet and returns only when all of it is
-    written, which for a picture packet is a quarter of a second during which
-    nothing else in the process happens.
-
-    Returns False rather than raising when the deadline has passed, because a
-    slice is a fraction of a packet and the caller is the one that knows what
-    the whole of it was worth -- the same division send_packet makes with its
-    `deadline` argument.
+    调用方对包编码一次、分片多次写入，使同一循环在大视频包发送期间仍能发音频。
+    超时返回 False 而不抛异常，由调用方决定整包如何处置。
     """
     remaining = memoryview(data)
     while remaining:

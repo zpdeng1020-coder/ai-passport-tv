@@ -2,12 +2,11 @@
 # 顺序就是设备上 UP/DOWN 换台的顺序。
 # 手动编辑同样有效，改完重启媒体服务即可。
 
-# === 央视频道（CCTV 1~17 序列）===
 ch000 | CCTV1 | http://101.35.240.114:88/live.php?id=CCTV1 | AptvPlayer-UA
 ch001 | CCTV2 | http://101.35.240.114:88/live.php?id=CCTV2 | AptvPlayer-UA
 ch002 | CCTV3 | http://101.35.240.114:88/live.php?id=CCTV3 | AptvPlayer-UA
 ch003 | CCTV4 | http://101.35.240.114:88/live.php?id=CCTV4 | AptvPlayer-UA
-ch004 | CCTV5 | http://173.208.212.130:8181/720p/cctv5.m3u8
+ch004 | CCTV5 | http://173.208.212.130:8181/720p/cctv5.m3u8 | AptvPlayer-UA
 ch005 | CCTV6 | http://101.35.240.114:88/live.php?id=CCTV6 | AptvPlayer-UA
 ch006 | CCTV7 | http://101.35.240.114:88/live.php?id=CCTV7 | AptvPlayer-UA
 ch007 | CCTV8 | http://101.35.240.114:88/live.php?id=CCTV8 | AptvPlayer-UA
@@ -18,123 +17,81 @@ ch011 | CCTV12 | http://101.35.240.114:88/live.php?id=CCTV12 | AptvPlayer-UA
 ch012 | CCTV13 | http://101.35.240.114:88/live.php?id=CCTV13 | AptvPlayer-UA
 ch013 | CCTV14 | http://101.35.240.114:88/live.php?id=CCTV14 | AptvPlayer-UA
 ch014 | CCTV15 | http://101.35.240.114:88/live.php?id=CCTV15 | AptvPlayer-UA
-ch015 | CCTV16 | http://gmxw.7766.org:808/hls/169/index.m3u8
+ch015 | CCTV16 | http://gmxw.7766.org:808/hls/169/index.m3u8 | AptvPlayer-UA
 ch016 | CCTV17 | http://101.35.240.114:88/live.php?id=CCTV17 | AptvPlayer-UA
-ch017 | CCTV-6电影 | http://8.138.7.223/tv/1905.php?id=LIVE3YPYZ30E7V1R0
-
-# === 各省主流卫视 ===
-ch018 | 湖南卫视 | http://101.35.240.114:88/live.php?id=湖南卫视 | AptvPlayer-UA
-ch019 | 浙江卫视 | http://101.35.240.114:88/live.php?id=浙江卫视 | AptvPlayer-UA
-ch020 | 江苏卫视 | http://101.35.240.114:88/live.php?id=江苏卫视 | AptvPlayer-UA
-ch021 | 东方卫视 | http://bp-resource-dfl.bestv.cn/155/3/video.m3u8 | AptvPlayer-UA
-ch022 | 广东卫视 | http://101.35.240.114:88/live.php?id=广东卫视 | AptvPlayer-UA
-ch023 | 深圳卫视 | http://101.35.240.114:88/live.php?id=深圳卫视 | AptvPlayer-UA
-ch024 | 湖北卫视 | http://101.35.240.114:88/live.php?id=湖北卫视 | AptvPlayer-UA
-ch025 | 江西卫视 | http://101.35.240.114:88/live.php?id=江西卫视 | AptvPlayer-UA
-ch026 | 陕西卫视 | http://101.35.240.114:88/live.php?id=陕西卫视 | AptvPlayer-UA
-ch027 | 河北卫视 | http://120.76.248.139/live/bfgd/4200000108.m3u8
-ch028 | 内蒙古卫视 | http://120.76.248.139/live/bfgd/4200000110.m3u8
-ch029 | 海南卫视 | http://120.76.248.139/live/bfgd/4200000473.m3u8
-ch030 | 宁夏卫视 | http://120.76.248.139/live/bfgd/4200000118.m3u8
-ch031 | 西藏卫视 | http://101.35.240.114:88/live.php?id=西藏卫视 | AptvPlayer-UA
-ch032 | 农林卫视 | http://120.76.248.139/live/bfgd/4200000122.m3u8
-ch033 | 山东教育 | https://test1.live.sdetv.com.cn/live/dianshizhibo/playlist.m3u8
-ch034 | 香港卫视 | http://webcast.hkstv.tv/livestream/mutfysrq/playlist.m3u8
-ch035 | 浙江卫视备用 | http://ali-m-l.cztv.com/channels/lantian/channel001/1080p.m3u8
-ch036 | 河北卫视备用 | http://event.pull.hebtv.com/jishi/weishi_tingyun.m3u8
-ch037 | 海南卫视备用 | http://nn.7x9d.cn/地方台8563/海南.php?id=hnws
-
-# === 超高清4K专区 ===
-ch038 | 东方卫视4K | http://bp-resource-dfl.bestv.cn/148/3/video.m3u8 | aliplayer
-ch039 | 浙江卫视4K | http://101.35.240.114:88/live.php?id=浙江卫视4K | aliplayer
-ch040 | 江苏卫视4K | http://8.138.7.223/tv/jsws4k.php | aliplayer
-ch041 | 河北4K | https://event.pull.hebtv.com:443/live/live101.m3u8
-ch042 | 苏州4K | https://live-auth.51kandianshi.com/szgd/csztv4k_hd.m3u8
-ch043 | 南国都市4K | https://tencentplay.gztv.com/live/nanguodushi.m3u8?txSecret=550af55c0ea34ce492748481415b6dfa&txTime=1903e7b17de
-
-# === 港澳台专区 ===
-ch044 | 凤凰中文 | http://43.152.224.209/qctv.fengshows.cn/live/0701pcc72.flv
-ch045 | 凤凰资讯 | http://43.152.224.209/qctv.fengshows.cn/live/0701pin72.flv
-ch046 | 凤凰香港 | http://43.152.224.209/qctv.fengshows.cn/live/0701phk72.flv
-ch047 | 凤凰中文高清 | http://221.7.175.154:85/tsfile/live/1020_1.m3u8?key=txiptv&playlive=1&authid=0
-ch048 | 凤凰资讯高清 | http://221.7.175.154:85/tsfile/live/1021_1.m3u8?key=txiptv&playlive=1&authid=0
-ch049 | 凤凰电影 | http://221.7.175.154:85/tsfile/live/1022_1.m3u8?key=txiptv&playlive=1&authid=0
-ch050 | 台视新闻 | http://38.64.72.148/hls/modn/list/4013/chunklist1.m3u8
-ch051 | TVBS新闻台 | http://61.221.215.25:8800/hls/9/index.m3u8
-ch052 | 三立戏剧 | http://61.221.215.25:8800/hls/41/index.m3u8
-ch053 | 美亚C+ | http://ottproxy2.ist.ooo/livehls/MOB-U1-NO/03.m3u8
-ch054 | 纬来精采 | http://61.221.215.25:8800/hls/48/index.m3u8
-ch055 | 大立电视台 | http://www.dalitv.com.tw:4568/live/dali/index.m3u8
-ch056 | 人间卫视 | http://61.216.67.119:1935/bltvhd/bltv1/chunklist_w1266569526.m3u
-ch057 | 耀才财经 | https://v3.mediacast.hk/webcast/bshdlive-pc/chunklist_w99771165.m3u8
-
-# === 国际视界与特色直播 ===
-ch058 | 环球电视 | http://utv1.hqtvzb.com:9999/hls/world.m3u8
-ch059 | 中国交通 | http://drive.mxmy.net:8888/udp/239.3.1.188:8001
-ch060 | 直播中国 | https://gcalic.v.myalicdn.com/gc/wgw05_1/index.m3u8?contentid=2820180516001
-ch061 | 熊猫直播 | https://gcwbndali.v.myalicdn.com/gcwbnd/ipanda1000_2/index.m3u8
-ch062 | CGTN英语 | http://english-livetx.cgtn.com/hls/yypdyyctzb_hd.m3u8
-ch063 | CGTN记录 | https://english-livetx.cgtn.com/hls/yypdjlctzb_hd.m3u8
-ch064 | CNA | https://d2e1asnsl7br7b.cloudfront.net/7782e205e72f43aeb4a48ec97f66ebbe/index_5.m3u8
-ch065 | ABC News Live | https://d4ybyqrhce41r.cloudfront.net/v1/master/3fec3e5cac39a52b2132f9c66c83dae043dc17d4/prod-xumo-linear-nbcu-hlsv3/master.m3u8?ads.channelId=99991626
-ch066 | WionNews | https://d7x8z4yuq42qn.cloudfront.net/index_7.m3u8
-ch067 | Arirang | https://amdlive-ch01-ctnd-com.akamaized.net/arirang_1ch/smil:arirang_1ch.smil/chunklist_b3256000_sleng.m3u8
-ch068 | Trace Sports | https://lightning-tracesport-samsungau.amagi.tv/playlist1080p.m3u8
-ch069 | RT News（英语国际） | https://rt-glb.rttv.com/dvr/rtnews/playlist_4500Kb.m3u8
-ch070 | RT Documentary（英语纪录） | https://rt-rtd.rttv.com/dvr/rtdoc/playlist_4500Kb.m3u8
-ch071 | Newsmax | http://nmxlive.akamaized.net/hls/live/529965/Live_1/index.m3u8
-ch072 | Wild Earth | https://wildearth-plex.amagi.tv/masterR1080p.m3u8
-
-# === 经典电视剧轮播 ===
-ch073 | 重温经典 | http://8.138.7.223/tv/cwjd.php
-ch074 | 新三国 | https://live.ottiptv.cc/huya/11352944
-ch075 | 新三国（斗鱼） | https://goodiptv.club/douyu/5908256
-ch076 | 新水浒传 | https://live.ottiptv.cc/huya/11342384
-ch077 | 西游记2 | https://live.metshop.top/huya/29465859
-ch078 | 封神榜 | https://live.metshop.top/huya/29465849
-ch079 | 寻秦记 | https://live.metshop.top/huya/29465848
-ch080 | 大唐双龙传 | https://live.metshop.top/huya/29465850
-ch081 | 天龙八部 | https://live.ottiptv.cc/yy/1351814644
-ch082 | 神雕侠侣 | http://live.ottiptv.cc/yy/1351762426
-ch083 | 古装武侠 | http://www.goodiptv.club/douyu/2793084
-ch084 | 楚汉骄雄 | https://live.metshop.top/huya/29465854
-ch085 | 延禧攻略 | https://live.ottiptv.cc/huya/26355864
-ch086 | 神探狄仁杰第一部 | https://live.ottiptv.cc/huya/11352958
-ch087 | 少年包青天第一部 | https://live.ottiptv.cc/yy/1356043677
-ch088 | 少年包青天第三部 | https://live.ottiptv.cc/yy/1382736814
-ch089 | 斗鱼港剧 | http://www.goodiptv.club/douyu/5061550
-ch090 | 橙记港剧 | http://www.goodiptv.club/douyu/4549169
-
-# === 精彩电影与纪录专区 ===
-ch091 | 1905电影网 | http://8.138.7.223/tv/1905.php?id=LIVE8J4LTCXPI7QJ5
-ch092 | 1905电影网（国内） | http://8.138.7.223/tv/1905.php?id=LIVEOYY31H24H48NE
-ch093 | 新视觉HD | http://120.76.248.139/live/bfgd/4200000249.m3u8
-ch094 | 新纪实 | http://bp-resource-dfl.bestv.cn/155/3/video.m3u8 | AptvPlayer-UA
-ch095 | 纪实科教 | http://120.76.248.139/live/bfgd/4200000113.m3u8
-ch096 | 周星驰电影 | https://live.metshop.top/huya/11342412
-ch097 | 林正英电影 | https://live.metshop.top/huya/11342421
-ch098 | 成龙电影 | https://live.metshop.top/huya/11342386
-ch099 | 李连杰电影 | https://live.metshop.top/huya/11342390
-ch100 | 刘德华电影 | https://live.metshop.top/huya/11342424
-ch101 | 古天乐电影 | https://live.metshop.top/huya/29982675
-ch102 | 甄子丹电影 | https://live.metshop.top/huya/11352935
-ch103 | 邵氏影院 | http://www.goodiptv.club/douyu/4246519
-ch104 | 华语影视 | http://www.goodiptv.club/douyu/3928
-ch105 | 冰冰影剧 | http://www.goodiptv.club/douyu/74374
-ch106 | 刀刀影院 | http://www.goodiptv.club/douyu/747764
-ch107 | 倩女幽魂妖魔道 | http://jsmov2.a.yximgs.com/bs3/video-hls/5232901391302199073_hlsb.m3u8
-ch108 | 倩女幽魂人间道 | http://jsmov2.a.yximgs.com/bs3/video-hls/5250634317044855747_hlsb.m3u8
-ch109 | 倩女幽魂道道道 | http://jsmov2.a.yximgs.com/bs3/video-hls/5216294367991385255_hlsb.m3u8
-ch110 | 人在囧途 | https://vip.ffzy-play.com/20221018/1953_2d6ba500/index.m3u8
-ch111 | 人在囧途之泰囧 | https://vip.ffzy-play.com/20221018/1951_47e1adc8/index.m3u8
-ch112 | 人在囧途之港囧 | https://vip.ffzy-play7.com/20230112/11082_fde1a94d/index.m3u8
-ch113 | 拆弹专家1 | https://vip.ffzy-online.com/20221015/719_80ff87c2/index.m3u8 | Mozilla/5.0
-
-# === 少儿与动漫专场（猫和老鼠、哆啦A梦放在最后面）===
-ch114 | 浙江少儿 | https://ali-m-l.cztv.com/channels/lantian/channel008/1080p.m3u8
-ch115 | 宁夏少儿 | https://hls.ningxiahuangheyun.com/live/nxse1M.m3u8
-ch116 | 韩国EBS少儿 | http://ebsonairios.ebs.co.kr/ebsutablet500k/tablet500k/playlist.m3u8
-ch117 | 七龙珠 | https://live.ottiptv.cc/huya/11601966
-ch118 | 灌篮高手 | https://live.ottiptv.cc/yy/1382735626
-ch119 | 猫和老鼠 | https://live.ottiptv.cc/huya/11352879
-ch120 | 哆啦A梦 | https://live.ottiptv.cc/huya/11601963
+ch017 | 湖南卫视 | http://101.35.240.114:88/live.php?id=湖南卫视 | AptvPlayer-UA
+ch018 | 浙江卫视 | http://101.35.240.114:88/live.php?id=浙江卫视 | AptvPlayer-UA
+ch019 | 江苏卫视 | http://101.35.240.114:88/live.php?id=江苏卫视 | AptvPlayer-UA
+ch020 | 东方卫视 | http://bp-resource-dfl.bestv.cn/155/3/video.m3u8 | AptvPlayer-UA
+ch021 | 香港卫视 | http://webcast.hkstv.tv/livestream/mutfysrq/playlist.m3u8 | AptvPlayer-UA
+ch022 | 东方卫视4K | http://bp-resource-dfl.bestv.cn/148/3/video.m3u8 | aliplayer
+ch023 | 浙江卫视4K | http://101.35.240.114:88/live.php?id=浙江卫视4K | aliplayer
+ch024 | 江苏卫视4K | http://8.138.7.223/tv/jsws4k.php | aliplayer
+ch025 | 河北4K | https://event.pull.hebtv.com:443/live/live101.m3u8 | AptvPlayer-UA
+ch026 | 苏州4K | https://live-auth.51kandianshi.com/szgd/csztv4k_hd.m3u8 | AptvPlayer-UA
+ch027 | 南国都市4K | https://tencentplay.gztv.com/live/nanguodushi.m3u8?txSecret=550af55c0ea34ce492748481415b6dfa&txTime=1903e7b17de | AptvPlayer-UA
+ch028 | 凤凰中文 | http://43.152.224.209/qctv.fengshows.cn/live/0701pcc72.flv | AptvPlayer-UA
+ch029 | 凤凰资讯 | http://43.152.224.209/qctv.fengshows.cn/live/0701pin72.flv | AptvPlayer-UA
+ch030 | 凤凰香港 | http://43.152.224.209/qctv.fengshows.cn/live/0701phk72.flv | AptvPlayer-UA
+ch031 | 台视新闻 | http://38.64.72.148/hls/modn/list/4013/chunklist1.m3u8 | AptvPlayer-UA
+ch032 | 三立戏剧 | http://61.221.215.25:8800/hls/41/index.m3u8 | AptvPlayer-UA
+ch033 | 耀才财经 | https://v3.mediacast.hk/webcast/bshdlive-pc/chunklist_w99771165.m3u8 | AptvPlayer-UA
+ch034 | 环球电视 | http://utv1.hqtvzb.com:9999/hls/world.m3u8 | AptvPlayer-UA
+ch035 | 中国交通 | http://drive.mxmy.net:8888/udp/239.3.1.188:8001 | AptvPlayer-UA
+ch036 | 熊猫直播 | https://gcwbndali.v.myalicdn.com/gcwbnd/ipanda1000_2/index.m3u8 | AptvPlayer-UA
+ch037 | CGTN英语 | http://english-livetx.cgtn.com/hls/yypdyyctzb_hd.m3u8 | AptvPlayer-UA
+ch038 | CGTN记录 | https://english-livetx.cgtn.com/hls/yypdjlctzb_hd.m3u8 | AptvPlayer-UA
+ch039 | CNA | https://d2e1asnsl7br7b.cloudfront.net/7782e205e72f43aeb4a48ec97f66ebbe/index_5.m3u8 | AptvPlayer-UA
+ch040 | ABC News Live | https://d4ybyqrhce41r.cloudfront.net/v1/master/3fec3e5cac39a52b2132f9c66c83dae043dc17d4/prod-xumo-linear-nbcu-hlsv3/master.m3u8?ads.channelId=99991626 | AptvPlayer-UA
+ch041 | WionNews | https://d7x8z4yuq42qn.cloudfront.net/index_7.m3u8 | AptvPlayer-UA
+ch042 | Arirang | https://amdlive-ch01-ctnd-com.akamaized.net/arirang_1ch/smil:arirang_1ch.smil/chunklist_b3256000_sleng.m3u8 | AptvPlayer-UA
+ch043 | Trace Sports | https://lightning-tracesport-samsungau.amagi.tv/playlist1080p.m3u8 | AptvPlayer-UA
+ch044 | RT News（英语国际） | https://rt-glb.rttv.com/dvr/rtnews/playlist_4500Kb.m3u8 | AptvPlayer-UA
+ch045 | RT Documentary（英语纪录） | https://rt-rtd.rttv.com/dvr/rtdoc/playlist_4500Kb.m3u8 | AptvPlayer-UA
+ch046 | Newsmax | http://nmxlive.akamaized.net/hls/live/529965/Live_1/index.m3u8 | AptvPlayer-UA
+ch047 | Wild Earth | https://wildearth-plex.amagi.tv/masterR1080p.m3u8 | AptvPlayer-UA
+ch048 | 新纪实 | http://bp-resource-dfl.bestv.cn/155/3/video.m3u8 | AptvPlayer-UA
+ch049 | 纪实科教 | http://120.76.248.139/live/bfgd/4200000113.m3u8 | AptvPlayer-UA
+ch050 | 猫和老鼠 | https://live.ottiptv.cc/huya/11352879 | AptvPlayer-UA
+ch051 | 哆啦A梦 | https://live.ottiptv.cc/huya/11601963 | AptvPlayer-UA
+ch052 | TVBS新闻 | https://d2jc41c1shgcol.cloudfront.net/live/tvbsnewsqt/playlist.m3u8 | AptvPlayer-UA
+ch053 | 东森新闻 | https://d2jc41c1shgcol.cloudfront.net/live/EBCNews/playlist.m3u8 | AptvPlayer-UA
+ch054 | 华视新闻 | https://d2jc41c1shgcol.cloudfront.net/live/ctsnewsqt/playlist.m3u8 | AptvPlayer-UA
+ch055 | 民视新闻 | https://d2jc41c1shgcol.cloudfront.net/live/ftvnewsqt/playlist.m3u8 | AptvPlayer-UA
+ch056 | 三立新闻 | https://d2jc41c1shgcol.cloudfront.net/live/iNEWS/playlist.m3u8 | AptvPlayer-UA
+ch057 | 中视新闻 | https://d2jc41c1shgcol.cloudfront.net/live/ctvnewsqt/playlist.m3u8 | AptvPlayer-UA
+ch058 | 中天新闻 | https://d2jc41c1shgcol.cloudfront.net/live/CtiNEWS1/playlist.m3u8 | AptvPlayer-UA
+ch059 | CH8 | https://cdn.qd.je/163189/ch8 | AptvPlayer-UA
+ch060 | NewsWorld | https://cdn-uw2-prod.tsv2.amagi.tv/linear/amg01076-lightningintern-newsworld-rakutenjp/playlist.m3u8 | AptvPlayer-UA
+ch061 | NHK World-Japan | https://media-tyo.hls.nhkworld.jp/hls/w/live/master.m3u8 | AptvPlayer-UA
+ch062 | TRT World | https://tv-trtworld.medya.trt.com.tr/master.m3u8 | AptvPlayer-UA
+ch063 | 止戈电影 | https://huyazhibo.de5.net/?id=19863777 | AptvPlayer-UA
+ch064 | 阿良说美剧 | https://huyazhibo.de5.net/?id=20488841 | AptvPlayer-UA
+ch065 | 大象放映室 | https://huyazhibo.de5.net/?id=21277391 | AptvPlayer-UA
+ch066 | 陆家嘴 | https://tftp4ge3drmt1go5nhcju8yzdrptpptwzc3jpq731h45mqpssqmudp7so.100ycdn.com/live-ws.kksmg.com/live/sdi5/playlist.m3u8?wsSession=8a15d23fe661e20e47cce670-177203770982085&wsIPSercert=832abf7ce82ccc02b32b56b105f24835&wsBindIP=2&wsserid=1168187559701054860 | AptvPlayer-UA
+ch067 | 老高与小茉 | http://live.nctv.top/douyu1.php?id=236461 | AptvPlayer-UA
+ch068 | 自说自话的总裁 | http://live.nctv.top/douyu1.php?id=9317739 | AptvPlayer-UA
+ch069 | 风尚音乐 | http://192.187.124.34:81/live/hsfsyy.m3u8 | AptvPlayer-UA
+ch070 | 薛之谦精选30首(2小时) | https://txmov2.a.kwimgs.com/upic/2023/07/28/13/BMjAyMzA3MjgxMzUwMzRfODM0NDUzMTQ2XzEwOTA3NjA4NDU2Nl8wXzM=_b_B480250201ec7378867d92e4d29f7a644.mp4 | AptvPlayer-UA
+ch071 | 五月天精选37首(2小时) | https://txmov2.a.kwimgs.com/upic/2021/12/07/23/BMjAyMTEyMDcyMzU2MzBfMjgwMTM4ODFfNjIzMTcwNTU3MTlfMl8z_b_Bd70a16353267a52b31d11f2cb77c6c5b.mp4 | AptvPlayer-UA
+ch072 | 邓紫棋精选30首(2小时) | https://txmov2.a.kwimgs.com/upic/2023/05/08/12/BMjAyMzA1MDgxMjIwNTNfMzQ4MzI0MjA1OF8xMDI1NjYyMjM5MDZfMF8z_b_B0675fa55fe8ce0583fb05fa02330e9f1.mp4 | AptvPlayer-UA
+ch073 | 周深精选72首(5小时) | https://txmov2.a.kwimgs.com/upic/2023/08/07/21/BMjAyMzA4MDcyMTAzMzZfMzYxMjUyNDA3MV8xMDk5Mjc3MDcwMTFfMF8z_b_B707fdf2100370008b57219d4a1dab568.mp4 | AptvPlayer-UA
+ch074 | 张杰精选40首(2小时) | https://txmov2.a.kwimgs.com/upic/2023/08/06/13/BMjAyMzA4MDYxMzIxNDZfODM0NDUzMTQ2XzEwOTgxMDY1NjE0MF8wXzM=_b_Bd5fedc48db11e5ccd52e4c2de1d8213a.mp4 | AptvPlayer-UA
+ch075 | Beyond精选40首(3小时) | https://txmov2.a.kwimgs.com/upic/2024/01/24/14/BMjAyNDAxMjQxNDQxMjZfODI4NTk1NTQ0XzEyMzAwNzQ1MTk1Ml8yXzM=_b_Bf4811084a61390aced44f1c86a2ebddf.mp4 | AptvPlayer-UA
+ch076 | 周传雄精选84首(6小时) | https://tymov2.a.kwimgs.com/upic/2025/10/23/09/BMjAyNTEwMjMwOTE1NTFfNDQzMTI2Mjg0XzE3ODA0ODgzMDI2NV8yXzM=_b_B2ba9b9699f2554de32104e6bc944bd17.mp4 | AptvPlayer-UA
+ch077 | 王菲精选145首(10小时) | https://tymov2.a.kwimgs.com/upic/2025/06/15/12/BMjAyNTA2MTUxMjQxMzBfNDQzMTI2Mjg0XzE2Njg4MDIxNDA2M18yXzM=_b_B291baabeaab840af0758f797d6b30862.mp4 | AptvPlayer-UA
+ch078 | 张惠妹精选50首(2小时) | https://tymov2.a.kwimgs.com/upic/2023/10/29/15/BMjAyMzEwMjkxNTUzMjJfODc4MDI5MjJfMTE2MDM0MDI2OTYzXzBfMw==_b_Baf9af8d16355a3b6a472969e267cd720.mp4 | AptvPlayer-UA
+ch079 | Al Jazeera English (1080p) | https://live-hls-apps-aje-fa.getaj.net/AJE/index.m3u8 | AptvPlayer-UA
+ch080 | ABC News (720p) | https://abc-news-dmd-streams-1.akamaized.net/out/v1/701126012d044971b3fa89406a440133/index.m3u8 | AptvPlayer-UA
+ch081 | Africa 24 English (1080p) | https://edge20.vedge.infomaniak.com/livecast/ik:africa24english/manifest.m3u8 | AptvPlayer-UA
+ch082 | Al Jazeera English (1080p) | https://live-hls-apps-aje-fa.getaj.net/AJE/index.m3u8 | AptvPlayer-UA
+ch083 | America's Voice News (720p) | https://jmp2.uk/plu-5e1f7da4bc7d740009831259.m3u8 | AptvPlayer-UA
+ch084 | BBC News (1080p) | https://xemzi.short.gy/1000015 | AptvPlayer-UA
+ch085 | BBC News Asia Pacific (576p) | https://thinkkast.dpdns.org/thinkkast/bbcworld_news_sd/versiglia/index.m3u8 | AptvPlayer-UA
+ch086 | BBC News North America (1080p) | http://23.237.104.106:8080/USA_BBC_NEWS/index.m3u8 | AptvPlayer-UA
+ch087 | CBS News 24/7 (720p) | https://jmp2.uk/plu-6350fdd266e9ea0007bedec5.m3u8 | AptvPlayer-UA
+ch088 | Channel8 (720p) | https://live.channel8.com/Channel8-Kurdish/index.fmp4.m3u8 | AptvPlayer-UA
+ch089 | DW English (1080p) | https://amg01644-amg01644c1-amgplt0343.playout.now3.amagi.tv/ts-eu-w1-n2/playlist/amg01644-amg01644c1-amgplt0343/playlist.m3u8 | AptvPlayer-UA
+ch090 | France 24 English (1080p) | https://live.france24.com/hls/live/2037218-b/F24_EN_HI_HLS/master_5000.m3u8 | AptvPlayer-UA
+ch091 | NHK World-Japan (1080p) | https://masterpl.hls.nhkworld.jp/hls/w/live/smarttv.m3u8 | AptvPlayer-UA
+ch092 | Sky News | https://jmp2.uk/plu-55b285cd2665de274553d66f.m3u8 | AptvPlayer-UA

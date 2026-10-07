@@ -1,29 +1,11 @@
-"""Where this computer can be reached from the device, worked out not asked for.
+"""自动识别设备应填写的服务端地址。
 
-The device needs exactly one string: the address of this server. Until now the
-person running it had to supply that themselves, as `--bind`, which assumes they
-already know their own address. Most do not, and the number changes whenever the
-router hands out a new lease -- on the machine this was written on it moved three
-times in one day. Being asked to type something you would have to look up is a
-poor first step, and getting it wrong produces a device that connects to nothing
-and cannot say why.
+给出两种形式：
 
-So the address is discovered here. Two forms are reported, and the difference
-between them matters:
+* 名称（`<主机名>.local`）：填到设备上。路由器重新分配 IP 后名称仍然有效。
+* 数字地址（`192.168.1.20`）：套接字绑定需要字面地址，不能监听名称。
 
-* The **name** (`some-mac.local`) is what the device should be given. It follows
-  the machine when the router renumbers it, so it keeps working without anyone
-  touching either end.
-* The **number** (`192.168.1.20`) is what the socket must bind to. Binding needs
-  a literal address; there is no way to listen on a name.
-
-Both are printed, the name first, with the instruction the reader actually needs.
-
-Nothing here is platform-neutral, which is why the platform is detected rather
-than assumed. The name lookup differs on every system and none of the methods is
-portable; each is tried, and a failure is reported as "name unknown" rather than
-guessed at, because a wrong name is worse than no name -- it looks authoritative
-and does not work.
+名称查询方式因系统而异，逐一尝试；失败就报告"名称未知"，不猜测，错误的名称比没有名称更糟。
 """
 
 from __future__ import annotations
@@ -32,26 +14,19 @@ import platform
 import socket
 import subprocess
 
-# A LAN address is needed, not a public one, and the interfaces are not
-# enumerable with the standard library alone. Connecting a datagram socket to a
-# distant address is the usual trick: no packet is sent, but the kernel picks the
-# interface it would use, and the local end of that socket is the address to
-# advertise. A reserved documentation address is used so that a stray packet --
-# which does not happen, the socket is never written to -- would go nowhere.
+# 标准库无法枚举网卡。把 UDP 套接字 connect 到远端地址不会发包，但内核会选出出口网卡，
+# 取套接字本端地址即可。优先用保留的文档地址，即使误发也不会到达任何主机。
 _PROBE_ADDRESSES = (
     ("192.0.2.1", 9),        # RFC 5737 TEST-NET-1
     ("198.51.100.1", 9),     # RFC 5737 TEST-NET-2
-    ("8.8.8.8", 53),         # last resort: an address that is always routed
+    ("8.8.8.8", 53),         # 最后兜底：总有路由的地址
 )
 
 
 def lan_address() -> str | None:
-    """The IPv4 address a device on the same network would reach this machine at.
+    """同一网络中的设备访问本机所用的 IPv4 地址；没有任何出口路由时返回 None。
 
-    None when there is no route out of the machine at all, which is what an
-    offline computer looks like. The caller reports that rather than substituting
-    a loopback address: 127.0.0.1 is reachable only from this machine, so a
-    device configured with it would fail in a way that looks like a server fault.
+    不用回环地址代替：127.0.0.1 只有本机能访问，填到设备上会表现为服务端故障。
     """
     for address, port in _PROBE_ADDRESSES:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -63,22 +38,16 @@ def lan_address() -> str | None:
             continue
         finally:
             sock.close()
-        # A loopback answer means the probe reached nothing usable; keep looking
-        # rather than handing back an address only this machine can use.
+        # 回环地址说明探测没有得到可用结果，继续尝试下一个。
         if found and not found.startswith("127."):
             return found
     return None
 
 
 def _run(command: list[str]) -> str | None:
-    """First line of a command's output, or None. Never raises: this is a
-    convenience lookup, and a missing or failing tool is an ordinary outcome.
+    """返回命令输出的第一行，失败返回 None，不抛异常。
 
-    The encoding is stated because these commands report a machine's name, and
-    a name is where non-ASCII characters actually turn up -- `COMPUTERNAME` is
-    read from the environment but `scutil` and `avahi-resolve` print. Left to
-    the platform, a Windows machine with a Chinese name would raise inside the
-    reader thread rather than return the name it has.
+    显式指定 UTF-8：机器名可能含非 ASCII 字符，按平台默认编码读取可能在读取线程中抛异常。
     """
     try:
         done = subprocess.run(command, capture_output=True, text=True,
@@ -92,20 +61,13 @@ def _run(command: list[str]) -> str | None:
 
 
 def local_name() -> str | None:
-    """The `.local` name of this machine, or None if it cannot be established.
+    """本机的 `.local` 名称，无法确定时返回 None。
 
-    Each system keeps this in a different place:
+    * macOS：`scutil` 给出 Bonjour 名称。
+    * Linux/BSD：`avahi-resolve` 向运行中的 mDNS 服务询问，没有 avahi 就没有名称。
+    * Windows：取环境变量中的计算机名，系统以 `<名称>.local` 发布 mDNS。
 
-    * macOS: `scutil` reports the Bonjour name directly, which is the name other
-      devices on the network will resolve.
-    * Linux/BSD: `avahi-resolve` asks the running mDNS responder for the host's
-      own name. Without avahi there is no `.local` name to advertise.
-    * Windows: the computer name from the environment, which Windows publishes
-      over mDNS as `<name>.local`.
-
-    A name is returned only with a `.local` suffix attached, or empty. A bare
-    hostname is not useful to the device: it would resolve only if the device's
-    network had a DNS entry for it, which a home network does not.
+    只返回带 `.local` 后缀的名称；裸主机名在家用网络中无法解析。
     """
     system = platform.system()
 
@@ -118,56 +80,39 @@ def local_name() -> str | None:
         name = os.environ.get("COMPUTERNAME")
         return f"{name}.local" if name else None
 
-    # Linux, BSD and anything else that runs an mDNS responder.
+    # Linux、BSD 及其他运行 mDNS 服务的系统。
     name = _run(["avahi-resolve", "--address", "-n", socket.gethostname()])
     if name:
         return name.rstrip(".") + ".local" if not name.endswith(".local") else name
     return None
 
 
-def describe(bind: str | None = None, port: int = 8096) -> list[str]:
-    """The lines to print at start-up so the reader knows what to type.
+def describe(address: str | None = None, port: int = 8096) -> list[str]:
+    """启动时打印的地址提示行。
 
-    In Chinese, because that is who reads it: these lines exist to be carried to
-    the device's setup page, and the project's own instructions are in Chinese.
-    A reader who has just been told in Chinese which page to open should not
-    then be handed the address in a different language.
-
-    `bind` is the address the socket is actually listening on, when the caller
-    has already chosen one; it is preferred over a fresh probe because it is the
-    fact, not an estimate.
+    `address` 为作为备用显示的局域网地址；调用方没找到时为 None（例如监听所有网卡且没有私有地址）。
     """
-    address = bind or lan_address()
     name = local_name()
 
-    # The address being listened on is not printed. It was the first line here,
-    # and it is the machine's own IP -- useful to whoever is running the server
-    # and needed by nobody else: the device is given the name, not the number,
-    # and the number appears below as the fallback when the name fails. As a
-    # leading line it pushed the thing to copy down the output.
+    # 不打印监听地址：设备填的是名称，数字地址只在名称失效时作为备用出现。
     lines: list[str] = []
     if not address:
-        lines.append("没有找到网络地址。这台电脑连上网络了吗？")
+        if name:
+            lines.append("设备上要填的地址：")
+            lines.append(f"    {name}:{port}")
+            lines.append(f"（连不上就换成这台电脑的局域网地址:{port}）")
+        else:
+            lines.append(f"没有识别出这台电脑的局域网地址。设备上填它的局域网地址:{port}。")
+        lines.append("")
         return lines
 
-    # Nothing outside this machine can reach a loopback address, so the advice
-    # below would be wrong for it: the name would resolve to the real interface,
-    # which nothing is listening on, and the device would fail to connect while
-    # the instructions looked correct. Whoever bound to loopback did so on
-    # purpose -- a test, or a deliberate local-only run -- and is told what that
-    # means rather than handed an address that cannot work.
+    # 绑定到回环地址时局域网设备无法连接，下面的填写建议不适用，改为说明原因。
     if address.startswith("127."):
         lines.append("这是一个本机地址（127 开头），只有这台电脑自己能访问，")
         lines.append("局域网里的设备连接不上。")
         return lines
 
-    # One value to copy, and at most one line of explanation under it.
-    #
-    # This block used to spend four lines on the address and three more
-    # explaining when to use which, which reads as a decision to make rather
-    # than an instruction to follow. The reader is holding a phone and about to
-    # type one string into a form; the fallback matters only if the first one
-    # fails, so it is stated as the fallback in a single line.
+    # 只给一个待填的值，下面至多一行备用说明。
     if name:
         lines.append("设备上要填的地址：")
         lines.append(f"    {name}:{port}")
@@ -176,8 +121,6 @@ def describe(bind: str | None = None, port: int = 8096) -> list[str]:
         lines.append("设备上要填的地址：")
         lines.append(f"    {address}:{port}")
         lines.append("（读不到这台电脑的名字；路由器换 IP 后要重新填一次）")
-    # A blank line after, so whatever the server prints next -- the courtesy
-    # note about the network -- is visibly a separate remark rather than another
-    # line of the instruction.
+    # 末尾空行，把后续输出与填写说明隔开。
     lines.append("")
     return lines

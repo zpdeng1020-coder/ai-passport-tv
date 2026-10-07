@@ -82,8 +82,8 @@ from tools.subcommands import CERTS_COMMAND, CONFIG_COMMAND, MEDIA_COMMAND  # no
 # Named in packaging/tv-server.spec's hiddenimports, and imported here only as
 # the names are actually needed -- see _load_server_modules below.
 SERVER_MODULES = (
-    "tv_server", "live", "live_sender", "media", "netident", "protocol",
-    "pts", "rate", "timeline", "usb_link",
+    "tv_server", "live", "frames", "media", "netident", "protocol",
+    "pts", "rate", "timeline", "adpcm", "perceptual", "reconnect", "overlay",
 )
 
 
@@ -182,6 +182,11 @@ def _run_certs() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    os.environ.setdefault("TV_ENCODE", "fill")
+    os.environ.setdefault("TV_DEGRADE", "perceptual")
+    os.environ.setdefault("TV_FRAME_BYTES", "20000")
+    os.environ.setdefault("TV_SEND_BUFFER", "16384")
+
     arguments = list(sys.argv[1:] if argv is None else argv)
 
     # Answered before anything is set up, because it is a question about this

@@ -62,6 +62,7 @@ LITERAL = [
     ("sample_rate", 16000, ""),
     ("channels", 1, "audio channel count, not the channel list"),
     ("sample_bits", 16, ""),
+    ("audio_codec", "ima_adpcm", "firmware strictly requires ima_adpcm"),
     ("audio_chunk_ms", None, "checked against AV_AUDIO_MS"),
     ("start_delay_ms", 200, ""),
 ]

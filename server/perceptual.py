@@ -1,23 +1,23 @@
-"""Give picture detail up perceptually when a frame does not fit its byte target.
+"""帧超出字节目标时，按感知代价逐步舍弃细节。
 
-The frame arrives as ffmpeg's own 3-3-2 indices, and that picture is the
-reference: when it fits the target it is sent unchanged, byte for byte. When it
-does not, `frames.encode_within` used to coarsen it by rounding whole colour
-channels a step at a time, which lands far below the target and falls to noise at
-the tightest ones. Here each pixel may instead keep the value the device already
-shows, or its left neighbour's, when that palette colour is close enough to the
-reference pixel's, so deflate sees more repeats and the picture loses detail
-gradually. How close is a threshold searched per frame, starting from the level
-the previous frame needed.
+输入为 ffmpeg 固定 3-3-2 索引，能放进目标时原样发送。放不下时，每个像素可沿用
+设备已显示的值或左邻像素的值（调色板颜色与参考像素足够接近时），使 deflate 看到
+更多重复；接近程度的阈值按帧搜索，起点为上一帧所需档位。
 
-Needs numpy for speed; `AVAILABLE` says whether it imported.
+三种模式共用逐帧档位搜索：
+
+- `perceptual`：沿用已显示值或左邻。
+- `perceptual_2d`：在此基础上再沿用上邻。
+- `mosaic`：每个 N x N 块取左上角像素的颜色。
+
+依赖 numpy，`AVAILABLE` 表示是否导入成功。
 """
 
 from __future__ import annotations
 
 try:
     import numpy as np
-except ImportError:  # the server stays usable without it, on the colour ladder
+except ImportError:  # 无 numpy 时服务端退回颜色阶梯
     np = None
 
 from . import frames
@@ -26,30 +26,30 @@ AVAILABLE = np is not None
 
 WIDTH, HEIGHT = frames.WIDTH, frames.HEIGHT
 
-# Allowed distance between the reference colour and the one used instead, in
-# weighted squared RGB (green counts most, blue least). The nearest two palette
-# colours are one red step (3888) or one green step (7776) or one blue step (7225)
-# apart, so the levels start there: below it nothing could be replaced. Level 0 is
-# the reference itself.
+# 参考颜色与替代颜色允许的距离，取加权平方 RGB（绿权重最大，蓝最小）。
+# 档位从相邻调色板颜色的最小间距起步，更小则无可替换；0 档为参考本身。
 LEVELS = (0, 3900, 7800, 11700, 15600, 23400, 31200, 46800, 70000, 110000)
 
+# 各马赛克档位的块边长（像素）；0 档为参考本身。
+MOSAIC_BLOCKS = (1, 2, 3, 4, 5, 6, 10)
+
+MODES = ("perceptual", "perceptual_2d", "mosaic")
+
 if AVAILABLE:
-    # The palette both ends implement: red and green in steps of 36, blue in steps
-    # of 85 (frames.palette_bytes documents where those numbers come from), with
-    # the weights folded into the coordinates so a distance is a plain one.
+    # 与设备一致的调色板（红绿步长 36、蓝步长 85，见 frames.palette_bytes），
+    # 权重折进坐标，使距离可直接按欧氏距离计算。
     _ROOT_WEIGHT = np.sqrt(np.array([3.0, 6.0, 1.0], np.float32))
     _PALETTE_W = np.array([((i >> 5) * 36, ((i >> 2) & 7) * 36, (i & 3) * 85)
                            for i in range(256)], np.float32) * _ROOT_WEIGHT
 
 
 def _snap(reference: "np.ndarray", base: "np.ndarray", shown: "np.ndarray | None",
-          held_distance: "np.ndarray | None", threshold: float) -> "np.ndarray":
-    """`base` with pixels replaced by a cheaper index that is close enough.
+          held_distance: "np.ndarray | None", threshold: float,
+          vertical: bool = False) -> "np.ndarray":
+    """把 `base` 中的像素换成距离在 `threshold` 内的更省字节的索引。
 
-    First the value the device already holds, wherever it is within `threshold`
-    of the reference; then, column by column, the pixel to the left. Both make the
-    stripe repeat itself, which is all deflate needs. The left pass is sequential
-    on purpose: a pixel may copy a neighbour that itself just copied its own.
+    顺序为：设备已显示的值；逐列取左邻；`vertical` 时再逐行取上邻。
+    邻居遍历必须顺序进行，像素可沿用刚沿用过邻居的像素。
     """
     out = base.copy()
     if shown is not None:
@@ -62,27 +62,44 @@ def _snap(reference: "np.ndarray", base: "np.ndarray", shown: "np.ndarray | None
         gap = _PALETTE_W[left] - source[x]
         near = (np.einsum("ij,ij->i", gap, gap) <= threshold) & (columns[x] != left)
         np.copyto(columns[x], left, where=near)
-    return np.ascontiguousarray(columns.T)
+    out = np.ascontiguousarray(columns.T)
+    if vertical:
+        for y in range(1, HEIGHT):
+            up = out[y - 1]
+            gap = _PALETTE_W[up] - reference[y]
+            near = (np.einsum("ij,ij->i", gap, gap) <= threshold) & (out[y] != up)
+            np.copyto(out[y], up, where=near)
+    return out
+
+
+def _mosaic(base: "np.ndarray", block: int) -> "np.ndarray":
+    """`base` 中每个 `block` x `block` 方块填成其左上角像素。"""
+    small = base[::block, ::block]
+    return np.repeat(np.repeat(small, block, axis=0), block, axis=1)[:HEIGHT, :WIDTH]
 
 
 def encode_within(raw: bytes, shown: bytes | None, tick: int, target: int,
-                  hint: int = 0,
-                  min_diff: float = frames.DELTA_MAX_DIFF) -> tuple[list[bytes], bytes, int]:
-    """Same contract as `frames.encode_within`: (stripes to send, what they draw, level).
+                  hint: int = 0, min_diff: float = frames.DELTA_MAX_DIFF,
+                  mode: str = "perceptual") -> tuple[list[bytes], bytes, int]:
+    """契约同 `frames.encode_within`，返回（待发条带，设备将显示的画面，档位）。
 
-    Level 0 is the frame as it came, and is always tried first, so a frame that
-    fits costs what `frames.encode_within` costs and content that has become easy
-    is back at full detail at once. Otherwise the search starts at `hint`, the level
-    the previous frame needed, because frames that need one come in runs: if it
-    fits, one level lower is tried, and if not, the levels above it are bisected.
+    先试 0 档（原帧）；放不下则从 `hint`（上一帧所需档位）起搜：放得下就再试低一档，
+    放不下就在更高档位间二分。`mode` 取自 `MODES`，决定档位如何变成画面。
     """
     if len(raw) != frames.FRAME_PIXELS:
         raise ValueError(f"frame is {len(raw)} bytes, expected {frames.FRAME_PIXELS}")
-    top = len(LEVELS) - 1
+    if mode not in MODES:
+        raise ValueError(f"unknown mode {mode!r}")
+    top = (len(MOSAIC_BLOCKS) if mode == "mosaic" else len(LEVELS)) - 1
+
+    def render(level: int) -> bytes:
+        if mode == "mosaic":
+            return _mosaic(base, MOSAIC_BLOCKS[level]).tobytes()
+        return _snap(reference, base, held, held_distance, LEVELS[level],
+                     vertical=mode == "perceptual_2d").tobytes()
 
     def attempt(level: int):
-        drawn = raw if level == 0 else _snap(reference, base, held, held_distance,
-                                             LEVELS[level]).tobytes()
+        drawn = raw if level == 0 else render(level)
         return frames.choose_stripes(drawn, shown, tick, 1 << 30, min_diff), drawn
 
     def fits(result) -> bool:

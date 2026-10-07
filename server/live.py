@@ -1,22 +1,10 @@
-"""Live HLS transcoding into the indexed picture the device draws.
+"""直播 HLS 转码：单个 ffmpeg 进程解码一次，产出设备可绘制的调色板索引画面与 16 kHz 单声道 PCM。
 
-Two ffmpeg processes per channel, because they have different jobs and the
-picture one has to be restarted when the palette changes:
+画面缩放到面板几何并量化到固定 256 色调色板，音频与画面各走一条回环 TCP 连接，
+解码器自身的 pts 由 `showinfo` / `ashowinfo` 记录（见 server/pts.py）。
+两个读取线程负责切包，会话发送端按同一单调时钟调度。设备不做缩放，只解压条带并按调色板查色。
 
-  * one decodes the source, scales it to the panel, maps it onto a 256-colour
-    palette and writes 320x240 index bytes to a pipe, a frame at a time;
-  * one decodes the audio to 16 kHz mono PCM and writes it to another.
-
-Two reader threads frame the bytes; the session sender paces them against one
-monotonic origin so audio PTS stays contiguous and video is never allowed to
-stall the sound.
-
-The picture is full resolution now and the device does no scaling: it inflates
-each stripe and looks each index up in the palette. That is why the palette is
-built per channel and sent to the device before the first frame.
-
-This is a LAN test service, not a hardened transcoder: URLs come only from the
-fixed CHANNELS table, the stream is not recorded, and no credentials are used.
+频道地址只来自频道表白名单，不录制流，不使用凭证。
 """
 
 from __future__ import annotations
@@ -26,319 +14,65 @@ import json
 import os
 import queue
 import re
-import shutil
 import socket
 import subprocess
-import tempfile
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
-from . import frames, pts
-try:
-    from . import perceptual
-except ImportError:
-    perceptual = None
-from .timeline import (BASIS_COMMON_DECODE, BASIS_LAUNCH, ContentTimeline,
+from . import adpcm, frames, perceptual, pts
+from .timeline import (BASIS_COMMON_DECODE, ContentTimeline,
                        SessionClock, SourceState, VERDICT_IN_HOLE,
-                       VERDICT_NOT_YET, VERDICT_PLACED)
-from .media import (AUDIO_CHUNK_MS, AUDIO_LEAD_MS, FPS, START_DELAY_MS,
-                    VIDEO_LEAD_MS, WIDTH as VIDEO_WIDTH)
-from .protocol import AUDIO_BYTES, HEADER, VIDEO_MAX
-# Device-side limits, mirroring main/av_protocol.h. A channel id the firmware
-# would skip must be rejected here instead, where it can be reported; the
-# tests cross-check these against the header so the two cannot drift.
+                       VERDICT_PLACED)
+from .media import AUDIO_CHUNK_MS, FPS, default_palette
+from .protocol import AUDIO_BYTES, AUDIO_PCM_BYTES, HEADER
+# 控制包（CONFIG）字节上限，与固件 main/av_protocol.h 同步修改。
 TV_CONTROL_MAX = 7168
-# Must match main/av_protocol.h. The device rejects a list longer than its own
-# limit, and a server willing to send more turns that difference into a session
-# that dies at the boundary instead of a channel that is simply not offered.
+# 频道数与频道 id 长度上限，与固件同步；设备会拒绝更长的列表，须在服务端先行限制。
 TV_CHANNEL_MAX = 128
 TV_CHANNEL_ID_MAX = 16
-# Ceiling on the bytes one channel table line may occupy, used only to bound the
-# read of channels.txt. It is generous next to a real line (a long name plus a
-# long URL) so a legal file is never truncated, and the four-field form with a
-# User-Agent fits inside it too.
+# 频道表单行的字节上限，仅用于限定 channels.txt 的读取量；留足余量以容纳四字段形式。
 MAX_CHANNEL_LINE_BYTES = 512
-# NOT defined here. It is imported from media.py at the top of this file, and a
-# second definition used to sit on this line saying 20 while the imported one
-# says 40 -- which quietly doubled every quantity in this module derived from a
-# number of chunks.
-#
-# What it cost, measured: `PREBUFFER_CHUNKS` came out at 400 instead of 200, so
-# a session waited for 400 chunks of 40 ms -- sixteen seconds -- where eight was
-# intended, and the wait is the whole of a channel change. That is the "channel
-# changes are slow" the viewer reported. The same shadowing also overstated the
-# audio queue's capacity in the depth calculation and understated the sound's
-# queue depth in `audio_depth_ms`, which is what the picture is aligned to.
-#
-# The lesson is the one this project keeps relearning in a new place: a name
-# defined twice does not fail, it just picks one, and the one it picks is the
-# nearer. The import stays and nothing here may redefine it.
+# AUDIO_CHUNK_MS 取自 media.py，本模块不得重新定义。
 AUDIO_RATE = 16000
-# The send leads come from media.py so the pre-generated scheduler and this live
-# sender cannot disagree about them.
-VIDEO_LATE_DROP_MS = 200
-# Kept below the device's AUDIO_UNDERRUN_MS (300 ms) so the server gives up on a
-# starved origin before the device concludes its stream is broken: otherwise the
-# device logs "audio underrun" while this side still believes it is mid-stream.
-# The device is the one that reconnects, so if it gives up first the server is
-# left holding a socket that nobody is reading.
-AUDIO_LATE_RESET_MS = 250
-# How far the sound may lead the wall clock, and therefore how much of the
-# device's buffer is actually kept full. It matters more than it looks: the
-# sender is one loop, so the sound waits while a picture packet is written, and
-# that wait comes out of this cushion.
-#
-# Sized from the device's own figures rather than from the 400 ms this comment
-# used to name, which was true of an older firmware. The device now queues
-# PCM_QUEUE (48) chunks of 20 ms -- 960 ms -- and its audio task tolerates a
-# further AUDIO_UNDERRUN_MS (300) of silence before ending the session, with
-# about 90 ms of DMA behind that.
-#
-# The failure this prevents, measured: a picture packet is 12 to 17 kB and takes
-# roughly 300 ms to write at the rate this link manages. With the lead at 240 ms
-# the cushion was smaller than one packet, so every frame began by draining it,
-# and the session ended about nine seconds in -- long enough for the deficit to
-# accumulate rather than be ridden out.
-#
-# pocket-tv, for comparison, sends 450 ms ahead into a 512 ms FIFO, and closes
-# the loop by reading the device's reported queue depth. This sender has no such
-# feedback, so the figure has to be chosen to leave room rather than to fill
-# what is there.
-#
-# The device stops reading the socket once its audio queue passes PCM_QUEUE-4,
-# which is 44 of 48 chunks -- 880 ms (main/av_player.c). Filling to that line is
-# therefore not free even though the buffer would hold it: every chunk above it
-# is time the receiver spends in a ten-millisecond sleep with the socket
-# untouched, and a picture packet cannot be read during that sleep. Measured
-# with the lead at 480 ms: 2799 ms of a ten-second window spent in exactly that
-# wait, and the device completed 14 frames where 20 were sent.
-#
-# The figure to keep in mind is not this one on its own but the depth it puts in
-# the device's queue, which is this plus AUDIO_LEAD_MS -- the lead is how far
-# ahead the sender is, and the lookahead is how much further it may run.
-#
-#     queue depth = AUDIO_LEAD_MS + AUDIO_MAX_LOOKAHEAD_MS
-#
-# The device stops reading the socket once its audio queue passes PCM_QUEUE-4,
-# which is 26 chunks of 20 ms. A depth of 200 + 320 = 520 ms is 26 chunks -- on
-# the line exactly -- so the queue arrived at the flow-control threshold and
-# stayed there: measured `queue_high=27` and 2799 ms of a ten-second window
-# spent sleeping in that wait, during which no picture packet could be read
-# either.
-#
-# The depth above is what matters, and 360 ms was too near the line for the
-# reason the picture's packets create. One task reads both streams, so a picture
-# packet in flight is 200 ms or so in which nothing drains the device's queue;
-# the device calls an underrun after 300 ms of silence, so a depth of 360 ms
-# left only 60 ms of real slack. Measured: every underrun was preceded by a
-# ten-second interval with the sound full, and the gap at failure was 305 ms
-# every time.
-#
-# Twelve chunks of lookahead on top of the lead puts the depth at 480 ms, which
-# is twelve of the device's eighteen chunks. The queue is shallower in count
-# than it was (PCM_QUEUE is 18) but each chunk is 40 ms rather than 20, so it
-# holds 720 ms -- more audio than the thirty 20 ms chunks it replaced.
-# Overridable so the depth can be swept without a rebuild, the same reason
-# TV_FPS is: a measurement that needs a rebuild between its two halves is one
-# nobody runs twice.
+# 音频发送端最多可领先实时多少毫秒，设备端队列深度为 AUDIO_LEAD_MS 加本值（见 CLAUDE.md 关键设计决策 5）。
+# 深度须低于设备停止读取套接字的流控线，又要大于写出一个视频包的耗时，否则音频欠载；
+# 没有设备反馈，只能留余量，不能填满。TV_AUDIO_LOOKAHEAD_MS 可覆盖。
 AUDIO_MAX_LOOKAHEAD_MS = int(os.environ.get("TV_AUDIO_LOOKAHEAD_MS", "280"))
-# These queues are the whole reason playback can be steady. An HLS origin does
-# not deliver a smooth stream: each segment arrives as a burst, so ffmpeg emits
-# several seconds of audio at once and then waits for the next segment. With a
-# buffer only a few seconds deep the queue hit its ceiling during a burst (audio
-# was discarded) and then drained to nothing before the next segment, which the
-# device saw as an underrun and reset the session. A deep buffer absorbs the
-# burst and rides out the wait, at the cost of starting some seconds behind the
-# live edge, which is the trade this prototype wants.
-PCM_QUEUE_CHUNKS = int(os.environ.get("TV_PCM_QUEUE_CHUNKS", "400"))  # 16 s at 40 ms/chunk
-# A frame is now a whole 320x240 indexed picture, 76800 bytes, where a JPEG of
-# the same moment was a few kilobytes. The depth is chosen for the burst an HLS
-# origin delivers -- several seconds of pictures at once, then a wait -- so this
-# is about 15 seconds' worth, or 14 MB. The bound matters: unbounded, a stalled
-# reader would grow the queue until the machine ran out of memory.
-# How much picture may be held ready, in frames. This is a LATENCY budget as
-# much as a buffer, and that is what it was getting wrong.
-#
-# It was 180, described as fifteen seconds of pictures to ride out the burst an
-# HLS origin delivers. Two things make that the wrong size now.
-#
-# The sender takes the OLDEST frame in the queue (`pop_video` is a popleft), so
-# whatever the queue holds is how far behind live the picture is. At 180 frames
-# and twelve a second, that is fifteen seconds of delay on a live channel.
-#
-# And the queue only fills at all when production outruns transmission, which is
-# now the normal state: the picture rate is chosen per channel by the rate
-# controller, and ffmpeg produces at the ceiling. Measured with the ceiling at
-# twelve and a channel the controller settles at four: `video_q` sat at 180 of
-# 180 and `prod_drop` climbed to 358 -- every frame produced above what the link
-# carries is discarded at the far end of a fifteen-second queue.
-#
-# Thirty-six frames is about three seconds at the ceiling, which is still more
-# than the second or two of jitter a paced HLS origin produces, and it bounds
-# the delay at a few seconds instead of fifteen. The sound's own queue is
-# untouched: it is the one that has to survive a segment arriving late.
-# Sized to hold VIDEO_QUEUE_SECONDS of content at the rate the producer runs,
-# with margin. It has to exceed what the picture is held to, or the queue fills
-# and discards -- and discarding from the front is exactly the thing that pulls
-# the picture out of step with the sound. At twelve frames a second and sixteen
-# seconds that is 192 frames, against the 180 this used to be: the old figure
-# would have silently truncated the hold on any channel the producer ran fast
-# for.
+# 音频队列容量（块数）：HLS 源按分片突发送出数秒音频，队列需吸收突发并撑过分片间隔，
+# 代价是起播落后直播边缘数秒。
+PCM_QUEUE_CHUNKS = int(os.environ.get("TV_PCM_QUEUE_CHUNKS", "400"))  # 每块 40 ms，合 16 秒
+# 画面队列容量，按内容时长折算为帧数。发送端取队首最旧帧，队列深度即画面落后直播的距离；
+# 深度须与音频队列相当，单独压小只会使画面与声音失步（见 pop_video）。
 VIDEO_QUEUE_SECONDS = float(os.environ.get("TV_VIDEO_QUEUE_S", "16"))
 
-# How far apart the sound's arrival and the picture's may be and still count as
-# the same moment. Wide enough to cover the two files arriving a frame apart
-# from two separate ffmpeg processes, narrow enough that a mismatch shows up as
-# a dropped frame rather than as a drift.
+# 声音与画面的内容时间相差不超过该值（秒）即视为同一时刻；更旧的画面丢弃，更新的等待。
 VIDEO_SYNC_TOLERANCE_S = float(os.environ.get("TV_SYNC_TOLERANCE_S", "0.15"))
 
 VIDEO_QUEUE_FRAMES = int(os.environ.get("TV_VIDEO_QUEUE",
                                         str(int(VIDEO_QUEUE_SECONDS * FPS) + 32)))
-# How deep the picture's queue is held, in SECONDS OF CONTENT -- and it is not a
-# latency setting, which is what it was first written as.
-#
-# The two queues are fed by the same source at the same real-time rate and
-# drained by the same sender, so their depths are not independent: whatever the
-# sound is behind by, the picture has to be behind by too, or the two describe
-# different moments. The sound plays as it arrives and cannot wait; the picture
-# can, and the depth of its queue is the only thing that makes it.
-#
-# Measured, and this is how the mistake was caught. With the queue capped at
-# eight frames (0.7 seconds) against a sound queue holding 15.7 seconds of
-# content, the viewer reported severe desynchronisation and the two figures say
-# why: the picture was running fifteen seconds ahead of the sound. In the
-# configuration before that cap -- no cap at all, so the queue sat at 84 frames,
-# 16.9 seconds against the sound's 16.0 -- the same arithmetic gives 0.9 seconds
-# and the viewer had reported it in sync.
-#
-# So the depth is taken from the sound's own queue rather than being a constant.
-# Capping the picture below the sound does not reduce the delay -- the sound's
-# delay is set by its own queue and is unaffected -- it only pulls the picture
-# out of step with it.
-# How much playback is held ready before the first packet goes out, in seconds.
-# Depth and startup delay are separate decisions and this is the second one: the
-# queues above are capacity, this is what is kept full.
-#
-# It is also the only cushion against a source that stalls. The sender paces at
-# real time and a live source produces at real time, so the level this reaches
-# here is the level it holds: the queue is not fed faster than it is drained,
-# and the reserve is not rebuilt once spent. A source that stops for longer than
-# this empties the queue, and the session then ends at AUDIO_LATE_RESET_MS --
-# which is why raising this is the way to tolerate an unreliable channel, and
-# why raising the queue depths above is not.
-#
-# What it costs is the wait on a channel change, and that is the whole of the
-# trade: the reserve has to fill at real time before a picture appears. So the
-# figure is a setting rather than a constant, because two viewers will weigh it
-# differently.
-#
-#     TV_PREBUFFER_S=4   the default: two seconds either side of a channel change
-#     TV_PREBUFFER_S=8   a slower change, more tolerance of a source that stalls
-#
-# Four rather than eight, and the reason is what the wait is actually for. The
-# reserve exists so a source that stops for a moment does not empty the device's
-# queue, and an HLS segment arrives every two to six seconds -- so four seconds
-# covers one whole segment arriving late, which is the shape of the lapse this
-# protects against. Eight was chosen before the sound's queue was understood to
-# be the thing that rides out a stall, and it doubles the wait a viewer sees on
-# every channel change for margin that the audio queue already provides.
-#
-# It was 3 before. An older version wrote the reserve as 36 frames, which was
-# three seconds at the 12 fps of the day and became eighteen seconds when the
-# rate came down -- a device asked to wait that long reported nothing at all.
-# Both halves are derived from the one number now, so that cannot recur, and
-# they are capped together rather than separately: `prebuffered` waits for the
-# sound and the picture at once and starts when the shallower is full, so a
-# reserve deeper than either queue would never be reached and every session
-# would end at PREBUFFER_TIMEOUT_S reporting "no media from source" -- which
-# reads as a dead channel rather than as a setting that is too ambitious.
-PREBUFFER_SECONDS = min(float(os.environ.get("TV_PREBUFFER_S", "4")),
+# 首包发出前预缓冲的内容时长（秒）：它是换台的等待时间，也是应对源停供的唯一缓冲余量。
+# TV_PREBUFFER_S 取值大则换台慢、更能容忍源停供。与两个队列容量同时封顶，
+# 否则预缓冲永远达不到，会话以 PREBUFFER_TIMEOUT_S 结束。
+PREBUFFER_SECONDS = min(float(os.environ.get("TV_PREBUFFER_S", "3")),
                         PCM_QUEUE_CHUNKS * AUDIO_CHUNK_MS / 1000,
                         VIDEO_QUEUE_FRAMES / FPS)
-PREBUFFER_CHUNKS = int(PREBUFFER_SECONDS * 1000 / AUDIO_CHUNK_MS)   # 20 ms each
-# Frames needed to fill `PREBUFFER_SECONDS`, counted at the rate the SENDER will
-# actually draw on, not at the rate the producer was asked for.
-#
-# These were the same number until the ceiling was raised, and making them differ
-# is a correction with three symptoms behind it. `FPS` follows the rate ceiling
-# (`media.FPS` is read from `rate.MAX_FPS`), so raising the ceiling from five to
-# twelve raised this target from 40 frames to 96 while the source kept producing
-# about six a second -- sixteen seconds of waiting on a channel change instead of
-# eight. Measured on the device: channel changes took visibly longer, the device
-# gave up on a channel before it appeared and moved to the next one, and the
-# picture ran twelve or more seconds behind the sound, because the reserve is
-# filled before the first frame is sent and the sound starts playing into it.
-#
-# The reserve is a DURATION -- enough picture and sound to ride out a stalled
-# source -- and a duration is what it should be counted in. The rate to count it
-# at is the one the link was measured carrying, which is what `START_FPS` is:
-# where the median channel lands, and where a session begins.
+PREBUFFER_CHUNKS = int(PREBUFFER_SECONDS * 1000 / AUDIO_CHUNK_MS)
+# 填满 PREBUFFER_SECONDS 所需的帧数，按 START_FPS 折算：预缓冲是时长，此时源帧率未知。
 from .rate import START_FPS as _START_FPS, start_rate
 
 PREBUFFER_FRAMES = int(PREBUFFER_SECONDS * _START_FPS)
-# Only the backstop for an origin that never produces anything at all: the
-# prebuffer target, not this, decides when playback normally starts.
+# 仅为源始终不出数据时的兜底，正常起播由预缓冲目标决定。
 PREBUFFER_TIMEOUT_S = 60
 
-# A backstop, not a schedule: the palette takes about two seconds on a live
-# channel, and anything past this is a source that is not answering. Without
-# it a channel change would hang instead of failing and letting the device
-# reconnect.
-PALETTE_TIMEOUT_S = 40
-
-# How long the parent waits for the decoder it just launched to connect back to
-# each loopback socket. ffmpeg opens both outputs within its first fraction of
-# a second -- well before it has read a single byte of the source -- so a slow
-# connection here means the process failed to start, not that the channel is
-# slow. Kept well under PALETTE_TIMEOUT_S so a decoder that never connects is
-# reported at start() rather than surfacing later as a silent, empty session.
+# 等待解码器回连两个回环套接字的时限（秒）。ffmpeg 启动后很快连接，超时说明进程没有起来，在 start() 报告。
 DECODER_CONNECT_TIMEOUT_S = 10
 
-# The 256 colours every live picture is drawn in, and the reason they are fixed.
-#
-# An adaptive palette was the obvious design and it was wrong for this medium.
-# It has to be chosen before the first frame and it cannot afterwards change
-# without re-indexing every picture and telling the device -- so it is taken
-# from about a second and a half at the moment a channel opens and then frozen
-# for the whole session. Whatever the viewer is watching later is drawn in the
-# colours of whatever happened to be on screen in those first seconds: a fade,
-# a title card, a studio caption. Nothing about that is stable, and the symptom
-# is exactly what a viewer described as "sometimes it is fine, sometimes it goes
-# grey, sometimes green, sometimes brown".
-#
-# Measured, with a palette sampled from a dim opening scene and applied to a
-# colour-bar frame from the same clip: RMSE 275 out of 255. The same frame
-# quantised against its own palette: RMSE 0. Against the fixed grid: RMSE 57.
-# A stale adaptive palette is not a slight tint, it is a different picture.
-#
-# The fixed grid cannot go stale, because it does not depend on the content at
-# all. It is also cheaper: no second ffmpeg pass, no PNG written and read back,
-# no two-second wait before a channel can open, and no way for the two ends to
-# disagree -- the colours are a rule, not a message.
-#
-# What it gives up is the roughly 2x smaller frames an adaptive palette buys on
-# content with few colours, and section 4 of docs/development/state-20260915.md
-# measures bytes as the real ceiling here. That trade is worth stating plainly:
-# this buys a picture that is always the right colour, and pays for it in frame
-# rate. It is the right way round -- a wrong-coloured picture at 8 frames a
-# second is worse than a correct one at 4.
-FIXED_PALETTE = True
-
-# The channel table can be replaced without touching this file: point
-# TV_CHANNELS_FILE at a text file, or drop a channels.txt beside the working
-# directory, and it is read at startup. Each line is
-#
-#     id | Display name | https://...
-#
-# with blank lines and '#' comments ignored. Source addresses change and expire,
-# so editing a text file is the expected way to maintain them, not a code change.
+# 频道表：TV_CHANNELS_FILE 指向文本文件，或在工作目录放 channels.txt，启动时读取一次。
+# 每行 `id | 显示名 | https://... [| user-agent]`，空行与 '#' 注释行忽略。
 CHANNELS_FILE = "channels.txt"
 CHANNELS_ENV = "TV_CHANNELS_FILE"
-# The built-in fallback uses broadcasters' own public streams. They are more
-# dependable than community relays and their terms are clearer, which matters
-# because the alternative sources are unverified re-streams of unknown standing.
+# 内置兜底频道，取电视台自有的公开流。
 BUILTIN_CHANNELS = {
     "cgtn": ("CGTN", "https://english-livebkali.cgtn.com/live/encgtn.m3u8"),
     "france24": ("France 24",
@@ -349,21 +83,19 @@ BUILTIN_CHANNELS = {
                    "https://tagesschau.akamaized.net/hls/live/2020115/tagesschau/tagesschau_1/master.m3u8"),
 }
 
-# Populated by load_channels(); kept as module-level names because the server,
-# the CONFIG payload and the tests all read them directly.
+# 由 load_channels() 填充；服务端与 CONFIG 载荷直接读取这些模块级名称。
 CHANNELS: dict[str, str] = {}
 CHANNEL_LABELS: dict[str, str] = {}
-# User-Agent per channel id; empty means ffmpeg's default.
+# 频道 id 到 User-Agent 的映射。
 CHANNEL_AGENTS: dict[str, str] = {}
 DEFAULT_CHANNEL = ""
 
 
 def parse_channels(text: str) -> tuple[dict[str, str], dict[str, str]]:
-    """Parse the channel table, rejecting anything the device would discard.
+    """解析频道表，拒绝设备会丢弃的条目。
 
-    The firmware skips an id that is empty, non-printable or 16 bytes or longer,
-    and stops reading the list at 16 entries. Catching that here turns a silently
-    missing channel on the device into an error the operator can see.
+    固件跳过空、不可打印或超长的 id，并只读取有限个频道（TV_CHANNEL_ID_MAX、TV_CHANNEL_MAX）；
+    在此报错，避免频道在设备端悄悄消失。
     """
     channels: dict[str, str] = {}
     labels: dict[str, str] = {}
@@ -375,9 +107,7 @@ def parse_channels(text: str) -> tuple[dict[str, str], dict[str, str]]:
         if not line or line.startswith("#"):
             continue
         parts = [part.strip() for part in line.split("|")]
-        # Four fields when the source needs a specific User-Agent. Many community
-        # mirrors answer only to the player they were captured for and return 403
-        # to anything else, so the agent is part of the source, not a detail.
+        # 第四字段为该源要求的 User-Agent；部分镜像源只认特定播放器，其余返回 403。
         if len(parts) == 3:
             key, label, url = parts
             agent = ""
@@ -392,20 +122,7 @@ def parse_channels(text: str) -> tuple[dict[str, str], dict[str, str]]:
             raise ValueError(f"line {number}: id must be printable ASCII")
         if key in channels:
             raise ValueError(f"line {number}: duplicate id {key!r}")
-        # Past the device's limit the extra entries are dropped rather than
-        # treated as a fatal fault.
-        #
-        # The limit is the device's; so is the consequence of exceeding it, and
-        # the consequence is that the later channels never appear on screen. It
-        # is not a reason for the server to refuse to run: a table that is too
-        # long is a table with channels the device cannot show, not a broken
-        # server, and stopping means nothing plays at all -- including the
-        # hundred-odd channels that are perfectly fine. Refusing also put the
-        # failure at start-up, in a traceback, at the one moment the operator is
-        # least able to tell which of several possible causes it was.
-        #
-        # Reported once, below, with the numbers, so the operator is told rather
-        # than left to notice a channel missing.
+        # 超出设备上限的频道只忽略并在末尾告警，不当作致命错误。
         if len(channels) >= TV_CHANNEL_MAX:
             dropped += 1
             continue
@@ -421,24 +138,14 @@ def parse_channels(text: str) -> tuple[dict[str, str], dict[str, str]]:
             agents[key] = frames.DEFAULT_USER_AGENT
     if not channels:
         raise ValueError("channel table contains no channels")
-    # A list that fits the count but not the packet is the other way to lose
-    # channels, and it is the quieter one: nothing is dropped, so the count looks
-    # right, but the CONFIG packet is refused on the wire and the device shows no
-    # channels at all. Names are what make it long -- each Chinese character is
-    # six bytes once JSON-escaped -- so this is the check that catches a hundred
-    # long names where the count check catches a thousand short ones.
-    #
-    # Reported, not refused, for the same reason as the count: the table is
-    # usable, the packet limit is the device's, and stopping the server would
-    # take away the channels that do fit.
+    # 数量合规但列表超过 CONFIG 包上限时，设备收不到任何频道（JSON 转义后每个汉字占 6 字节）；
+    # 与数量超限一样只告警，不拒绝启动。
     packet = len(json.dumps({"channel_list": [{"id": k, "name": labels[k]}
                                               for k in channels]},
                             ensure_ascii=True, separators=(",", ":")).encode("ascii"))
     if packet > TV_CONTROL_MAX or dropped:
         total = len(channels) + dropped
-        # Two separate faults, said separately. Reporting the count when the
-        # count is fine sends the reader to cut channels they do not need to cut,
-        # and the real cause -- names too long -- goes unfixed.
+        # 数量超限与名称过长分别提示，避免误导操作者。
         if dropped:
             print(f"警告：channels.txt 有 {total} 个频道，设备最多接收 "
                   f"{TV_CHANNEL_MAX} 个。", flush=True)
@@ -451,16 +158,14 @@ def parse_channels(text: str) -> tuple[dict[str, str], dict[str, str]]:
                   f"{TV_CONTROL_MAX} 字节上限，设备可能一个频道都收不到。", flush=True)
             print(f"      每个频道名平均 {packet // max(1, len(channels))} 字节，"
                   f"缩短频道名（尤其是中文名）是有效的办法。", flush=True)
-        print("      用 python3 tools/channel_config.py 调整，或直接编辑 channels.txt。",
-              flush=True)
+        print("      请编辑 channels.txt。", flush=True)
     return channels, labels, agents
 
 
 def load_channels(path: Path | None = None) -> None:
-    """Install the channel table, from a file if one is given or found.
+    """从文件（给定或查找到的）加载频道表，没有文件时用内置频道。
 
-    Called at import so every existing reader of CHANNELS keeps working, and
-    again from main() when --channels-file is passed.
+    导入时调用一次；main() 收到 --channels-file 时再调用。
     """
     global CHANNELS, CHANNEL_LABELS, CHANNEL_AGENTS, DEFAULT_CHANNEL
     source = path
@@ -479,16 +184,8 @@ def load_channels(path: Path | None = None) -> None:
     else:
         if not source.is_file():
             raise ValueError(f"channel file not found: {source}")
-        # Bounded by the channel limit, never by TV_CONTROL_MAX or VIDEO_MAX.
-        # Those are wire limits for a single packet, and using one of them here
-        # silently truncated the file mid-line: the parser then saw a half line
-        # with one field and refused the whole table, so the server exited at
-        # import while the file itself was fine.
-        #
-        # The bound is what the largest legal table can occupy: every entry is at
-        # most this many bytes (id, name, url and agent), so nothing a valid file
-        # can contain is ever cut, while a stray multi-megabyte file still stops
-        # at a known size.
+        # 读取上限由频道数和单行上限决定，不用 TV_CONTROL_MAX 或 VIDEO_MAX（那是单包线路上限）：
+        # 合法文件不会被截断，超大文件在已知大小处停止。
         limit = TV_CHANNEL_MAX * MAX_CHANNEL_LINE_BYTES
         with source.open(encoding="utf-8", errors="strict") as handle:
             text = handle.read(limit + 1)
@@ -502,9 +199,7 @@ def load_channels(path: Path | None = None) -> None:
     CHANNEL_LABELS.update(labels)
     CHANNEL_AGENTS.clear()
     CHANNEL_AGENTS.update(agents)
-    # Keep the previous default when it is still offered, otherwise start at the
-    # top of the list: a default that is not in the table would fail every
-    # connection that named no channel.
+    # 原默认频道仍在表中则保留，否则取表首项；默认频道不在表内会使未指定频道的连接全部失败。
     if DEFAULT_CHANNEL not in channels:
         DEFAULT_CHANNEL = next(iter(channels))
 
@@ -517,18 +212,16 @@ load_channels()
 
 
 class LiveError(RuntimeError):
-    """Transcoding or framing failure; the session ends and the device reconnects."""
+    """转码或切包失败。"""
+
+
+
+# 每个设备音频块的采样数；ffmpeg 的音频帧长固定为此值，使一行 `ashowinfo` 恰好对应一块。
+AUDIO_SAMPLES = AUDIO_PCM_BYTES // 2
 
 
 def read_frames(stream, on_frame, stop) -> None:
-    """Read indexed frames from a raw pipe, one at a time.
-
-    Rawvideo means no markers and no lengths -- just one byte a pixel -- so this
-    reads a fixed number of bytes instead of scanning for anything. That is also
-    why a short read means the pipe has ended, not that a frame was malformed:
-    there is nothing to resynchronise to, and a half frame cannot be drawn, so
-    the tail is dropped rather than padded.
-    """
+    """Read indexed frames from a raw pipe, one at a time."""
     while not stop.is_set():
         frame = frames.read_frame(stream, stop)
         if frame is None:
@@ -540,44 +233,39 @@ def chunk_pcm(stream, on_audio, stop) -> None:
     """Re-block the PCM pipe into exact device chunks (1280 bytes / 40 ms)."""
     buffer = bytearray()
     while not stop.is_set():
-        chunk = stream.read(AUDIO_BYTES * 8)
+        chunk = stream.read(AUDIO_PCM_BYTES * 8)
         if not chunk:
             raise LiveError("transcode audio pipe closed")
         buffer.extend(chunk)
-        while len(buffer) >= AUDIO_BYTES:
-            block = bytes(buffer[:AUDIO_BYTES])
-            del buffer[:AUDIO_BYTES]
+        while len(buffer) >= AUDIO_PCM_BYTES:
+            block = bytes(buffer[:AUDIO_PCM_BYTES])
+            del buffer[:AUDIO_PCM_BYTES]
             on_audio(block)
 
-
-# Samples in one device block. The device takes 1280 bytes of s16 mono, so the
-# audio frame size is fixed to that rather than left to the resampler: it is
-# what makes one `ashowinfo` line describe exactly one block, and the timestamps
-# are read one line per block.
-AUDIO_SAMPLES = AUDIO_BYTES // 2
-
-# One graph, two outputs, and the timestamps read out of the same graph.
-#
-# Two processes used to decode this source, each counting its own frames, with
-# the relationship between the two clocks measured once from `ffprobe`. Counting
-# is a rate and not a clock, and it cannot see a gap at all, so this is now one
-# decode carrying the decoder's own `pts_time` for every item it produces.
-#
-# `format=rgb8` sits before `showinfo` so the logged frame is the frame that is
-# written. `aformat=...mono` before `asetnsamples` is load-bearing and was got
-# wrong first time round: a stereo frame carries two device blocks, so one
-# `ashowinfo` line would cover two blocks and every timestamp after the first
-# would be paired with the wrong payload.
+# 追加在 frames.FIT 之后、format=rgb8 之前的 ffmpeg 视频滤镜，默认为空。
 PRE_FILTER = os.environ.get("TV_PRE_FILTER", "").strip()
-# What is done with a frame that does not fit its byte target. On, it gives detail
-# up perceptually (server/perceptual.py); off, or without numpy, it steps through
-# the colour ladder (frames.encode_within). A frame that fits is sent as ffmpeg
-# made it either way.
-PERCEPTUAL = (perceptual is not None and perceptual.AVAILABLE
-              and os.environ.get("TV_PERCEPTUAL", "1") != "0")
+# 帧超出字节目标时的降质方式：perceptual.MODES 中的模式（需 numpy），或 "ladder"（逐档降色，见 frames.encode_within）。
+# 放得下的帧原样发送。
+DEGRADE_MODES = (*perceptual.MODES, "ladder")
+_DEFAULT_DEGRADE = "perceptual" if perceptual.AVAILABLE else "ladder"
+DEGRADE = os.environ.get("TV_DEGRADE", "").strip() or _DEFAULT_DEGRADE
+if DEGRADE not in DEGRADE_MODES:
+    raise SystemExit(f"TV_DEGRADE={DEGRADE!r} 无效，可选值：{' / '.join(DEGRADE_MODES)}")
+if DEGRADE in perceptual.MODES and not perceptual.AVAILABLE:
+    raise SystemExit(f"TV_DEGRADE={DEGRADE} 需要 numpy，请先安装（pip install numpy）")
 _VIDEO_CHAIN = f"{frames.FIT},{PRE_FILTER}" if PRE_FILTER else frames.FIT
+# 帧放入字节目标后剩余字节的用法：delta 只发变化超过 TV_DELTA_MAX_DIFF 的条带，
+# fill 另按变化量从大到小补发被跳过的条带。
+ENCODE_MODES = ("delta", "fill")
+ENCODE = os.environ.get("TV_ENCODE", "").strip() or "fill"
+if ENCODE not in ENCODE_MODES:
+    raise SystemExit(f"TV_ENCODE={ENCODE!r} 无效，可选值：{' / '.join(ENCODE_MODES)}")
 def source_graph(fps: int) -> str:
-    """The filter graph for a source whose picture is to be produced at `fps`."""
+    """单个滤镜图，两路输出画面与音频。
+
+    format=rgb8 在 showinfo 之前，使记录的帧即写出的帧；aformat=mono 须在 asetnsamples 之前，
+    否则立体声帧含两个设备块，一行 ashowinfo 对应两块，时间戳与载荷错位。
+    """
     return (
         f"[0:v]setpts=PTS-STARTPTS,fps={fps},{_VIDEO_CHAIN},format=rgb8,showinfo[v];"
         f"[0:a]asetpts=PTS-STARTPTS,aresample={AUDIO_RATE},aformat=channel_layouts=mono,"
@@ -585,44 +273,15 @@ def source_graph(fps: int) -> str:
     )
 
 
-SOURCE_GRAPH = source_graph(FPS)
-
 
 def source_command(url: str, video_port: int, audio_port: int, ffmpeg: str,
                    user_agent: str = "", fps: int = FPS) -> list[str]:
-    """Read the source once and produce both payloads and both timestamps.
+    """构造 ffmpeg 命令：读取源一次，画面与音频经两个回环 TCP 端口输出，时间戳由 showinfo 日志给出。
 
-    The picture is decoded, scaled, and quantised onto ffmpeg's own fixed 3-3-2
-    palette. That palette is the same 256 colours `main/av_protocol.c` builds in
-    `av_palette_rgb565` -- 36 and 85 steps, replicated to fill each slot -- and
-    it is fixed rather than generated, because an adaptive palette sampled from
-    the opening seconds of a channel goes stale for every later picture whose
-    colours were not in that sample.
-
-    `-loglevel info` is required and not a debugging leftover: `showinfo` and
-    `ashowinfo` log at INFO, and the timestamps are what this process is here to
-    produce. `-nostats` keeps ffmpeg's progress line out of the same stream.
-
-    The graph's outputs are named because ffmpeg rejects a filter graph whose
-    output label is also its input label. Dithering is off, and that is not a
-    detail: swscale dithers by default, and dithering is noise by construction,
-    so it roughly halves how well a frame compresses -- measured across five
-    channels, worst-case frames fell from about 31 KB to about 23 KB once it was
-    off. It has to be given here, after the conversion, rather than before `-i`,
-    where it parses without complaint and does nothing.
-
-    The two payloads leave over `tcp://127.0.0.1:<port>` rather than an
-    anonymous pipe. A pipe write end handed to the child by number
-    (`pipe:{fd}`, `pass_fds`) is a POSIX-only mechanism: Windows'
-    `subprocess.Popen` refuses any `pass_fds` outright
-    (`assert not pass_fds, "pass_fds not supported on Windows."`, CPython's own
-    `subprocess.py`), so that form cannot run there at all. A loopback TCP
-    connection is a socket on every platform this project targets, ffmpeg
-    already speaks it as an output URL, and the parent identifies each stream
-    by which port accepted the connection rather than by an inherited handle.
-    ffmpeg is the client here; the parent listens on both ports before this
-    command is launched, so the two connections it makes on startup have
-    something to reach.
+    画面量化到 ffmpeg 固定 3-3-2 调色板（与固件 av_palette_rgb565 一致），关闭抖动（见 CLAUDE.md 关键设计决策 1）；
+    `-sws_dither none` 须作为输出选项，放在 `-i` 之前会被忽略。
+    `-loglevel info` 不可去掉，showinfo 在 INFO 级别输出 pts；`-nostats` 避免进度行混入同一路输出。
+    输出走 `tcp://127.0.0.1:<port>` 而非管道（见 CLAUDE.md 关键设计决策 7），ffmpeg 为客户端，调用前父进程须已监听两个端口。
     """
     return [
         ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "info", "-nostats",
@@ -635,120 +294,18 @@ def source_command(url: str, video_port: int, audio_port: int, ffmpeg: str,
     ]
 
 
-# How long ffprobe may take on a source before the answer is treated as absent.
-# A live HLS playlist is the slow case and it is seconds, not minutes; a source
-# that cannot answer inside this is one this server will start without.
-PROBE_TIMEOUT_S = float(os.environ.get("TV_PROBE_TIMEOUT_S", "20"))
 
-
-def stream_start_times(url: str, ffmpeg: str, user_agent: str = "",
-                       diagnostic: list | None = None) -> tuple[float, float] | None:
-    """Ask the media where each stream begins. (video_start_s, audio_start_s)
-
-    This is the **only** thing that can relate the two content clocks, and this
-    function is the only place that answer comes from. `ffprobe` reports each
-    stream's `start_time`, which is a property of the programme: two streams
-    that begin together are simultaneous, and one that begins 600 ms later has
-    600 ms less content.
-
-    Neither of the two things that were tried instead can answer it. The arrival
-    time is about the network, and the process launch time is about the
-    scheduler. An external review disproved the second with real ffmpeg: the
-    same file, with only the audio process launched 600 ms later, produced an
-    offset of +600 ms and discarded the picture's first four frames, although
-    the media had not changed at all. And a file whose audio genuinely starts
-    600 ms in produced an offset of +0.2 ms, erasing a real difference.
-
-    Returns None when the answer is not available -- ffprobe missing, the source
-    unreadable, or a live format that does not report start times. **A caller
-    that gets None must not substitute a guess**: an unexplained offset is worse
-    than an admitted absence of one, which is the whole lesson of the two
-    attempts above.
-
-    `ffmpeg` is the binary path this server already resolved, so ffprobe is
-    looked for beside it before falling back to PATH.
-    """
-    probe = os.path.join(os.path.dirname(ffmpeg), "ffprobe")
-    if not os.path.exists(probe):
-        probe = "ffprobe"
-
-    def failed(reason: str) -> None:
-        # Recorded rather than returned silently. An external review showed the
-        # difference is not academic: a source that answers ffmpeg with a
-        # User-Agent and refuses ffprobe without one looks exactly like a source
-        # that reports no start times, and the code then chose a basis that is
-        # only valid for the other kind of source. "No answer" and "this source
-        # has no start times" are different findings and only one of them is
-        # about the media.
-        if diagnostic is not None:
-            diagnostic.append(reason)
-
-    command = [probe, "-v", "error"]
-    # The same User-Agent the two decoders use. Many sources in the channel
-    # table answer only the player they were captured for and 403 anything
-    # else, which is why the agent travels with the channel in the first place.
-    # Asking without it made the probe fail on sources the picture and sound
-    # decoders could read perfectly well.
-    effective_ua = user_agent or (frames.DEFAULT_USER_AGENT if url.startswith(("http://", "https://")) else "")
-    if effective_ua:
-        command += ["-user_agent", effective_ua]
-    command += ["-show_entries", "stream=codec_type,start_time",
-                "-of", "json", url]
-    try:
-        done = subprocess.run(command, capture_output=True, text=True,
-                              timeout=PROBE_TIMEOUT_S)
-    except FileNotFoundError:
-        failed("ffprobe is not installed")
-        return None
-    except subprocess.TimeoutExpired:
-        failed(f"ffprobe timed out after {PROBE_TIMEOUT_S:g} s")
-        return None
-    except OSError as error:
-        failed(f"ffprobe could not be run: {type(error).__name__}")
-        return None
-    if done.returncode != 0:
-        first = (done.stderr or "").strip().splitlines()
-        failed("ffprobe failed: " + (first[0] if first else
-                                     f"exit {done.returncode}"))
-        return None
-    try:
-        streams = json.loads(done.stdout).get("streams", [])
-    except ValueError:
-        failed("ffprobe returned something that is not JSON")
-        return None
-    found: dict[str, float] = {}
-    for stream in streams:
-        kind = stream.get("codec_type")
-        if kind not in ("video", "audio") or kind in found:
-            continue
-        try:
-            found[kind] = float(stream["start_time"])
-        except (KeyError, TypeError, ValueError):
-            # A live HLS playlist often has no start_time. Absent is absent.
-            failed(f"the source reports no start_time for its {kind} stream")
-            return None
-    if "video" not in found or "audio" not in found:
-        failed("the source does not report both a video and an audio stream")
-        return None
-    return found["video"], found["audio"]
-
-
-# The highest rate a picture is produced at. It is the device's own bound
-# (`json_between(j,"fps",1,30)` in main/av_player.c), and a source above it is
-# brought under it rather than refused.
+# 画面产出帧率上限，即设备的 fps 上限（main/av_player.c，1..30）；更高的源降到它之下，不拒绝。
 MAX_SOURCE_FPS = 30
-# How long ffprobe may spend finding a channel's frame rate. It sits in front of
-# the first picture on every channel change, so it is kept short, and a source
-# that cannot answer in that time is played at the nominal rate instead.
+# ffprobe 探测帧率的时限（秒）：位于每次换台首帧之前，超时则按名义帧率播放。
 FPS_PROBE_TIMEOUT_S = float(os.environ.get("TV_FPS_PROBE_TIMEOUT_S", "5"))
 _FPS_CACHE: dict[str, int] = {}
 
 
 def parse_rate(text: str) -> float | None:
-    """A frame rate as ffprobe writes it, "25/1" or "30000/1001" -- or None.
+    """解析 ffprobe 的帧率文本（如 "25/1"），无法确定时返回 None。
 
-    "0/0" is how ffprobe says it does not know, and it is common on live HLS, so
-    it is an answer of None and not an error.
+    "0/0" 表示未知，在直播 HLS 上常见，按 None 处理而非报错。
     """
     try:
         num, _, den = str(text).partition("/")
@@ -759,13 +316,10 @@ def parse_rate(text: str) -> float | None:
 
 
 def choose_fps(avg: float | None, real: float | None) -> int | None:
-    """The whole-number rate to produce a picture at, from what ffprobe reported.
+    """由 ffprobe 报告的帧率选出产出帧率（整数）。
 
-    The average is preferred, and the difference matters: a 25 fps programme
-    carried as 50 fields reports `r_frame_rate` 50 and `avg_frame_rate` 25, and
-    producing 50 would be twice the frames the channel has. When only the
-    container's rate is known and it is over the bound, it is halved until it is
-    under, so 50 becomes 25 rather than being clipped to 30 and resampled unevenly.
+    优先用平均帧率：25 fps 节目按 50 场承载时，r_frame_rate 为 50，avg_frame_rate 为 25。
+    只有容器帧率且超过上限时逐次减半，不截断到上限。
     """
     rate = avg if avg else real
     if not rate:
@@ -776,12 +330,7 @@ def choose_fps(avg: float | None, real: float | None) -> int | None:
 
 
 def probe_source_fps(url: str, ffmpeg: str, user_agent: str = "") -> int | None:
-    """The frame rate this source's picture should be produced at, or None.
-
-    None means the source did not say, and the caller plays it at the nominal
-    rate. Answers are remembered by URL for the life of the process, so switching
-    back to a channel does not pay for the probe twice.
-    """
+    """探测源的画面帧率，未知返回 None（按名义帧率播放）；结果按 URL 缓存。"""
     if url in _FPS_CACHE:
         return _FPS_CACHE[url]
     probe = os.path.join(os.path.dirname(ffmpeg), "ffprobe")
@@ -812,16 +361,14 @@ def probe_source_fps(url: str, ffmpeg: str, user_agent: str = "") -> int | None:
 
 
 class _QueuedFrame(list):
-    """A frame's packets, carrying the raw frame they were cut from (TV_DELTA)."""
+    """一帧的包列表，附带切包前的原始帧（TV_DELTA）。"""
     raw: bytes | None = None
 
 
 class LiveChannel:
-    """Own one channel: a palette, a picture process, an audio process, and the
-    bounded queues between them and the sender."""
+    """单个频道会话：调色板、解码器进程，以及它与发送端之间的有界队列。"""
 
-    def __init__(self, url: str, ffmpeg: str = "ffmpeg", user_agent: str = "",
-                 palette_dir: Path | None = None):
+    def __init__(self, url: str, ffmpeg: str = "ffmpeg", user_agent: str = ""):
         if url not in CHANNELS.values():
             raise ValueError("channel URL is not in the local allowlist")
         self.url = url
@@ -830,65 +377,25 @@ class LiveChannel:
         self.stop = threading.Event()
         self.audio = collections.deque(maxlen=PCM_QUEUE_CHUNKS)
         self.video = collections.deque(maxlen=VIDEO_QUEUE_FRAMES)
-        # What the device has been sent so far, and a counter that picks which
-        # stripe is refreshed regardless. Unused with TV_DELTA=0, and set up
-        # per channel because a channel is a session: a new one starts from a
-        # panel that shows nothing of ours. See frames.choose_stripes.
+        # 已发给设备的画面与强制刷新条带的轮转计数（见 frames.choose_stripes）；
+        # 每个频道独立，新频道从空白面板开始。未启用增量时不用。
         self._shown: bytes | None = None
         self._delta_tick = 0
         self._snap_level = 0
-        # When each queued item ARRIVED, in step with the two queues above.
-        #
-        # This is what the picture is aligned by, and the reason is that it needs
-        # no knowledge of any frame rate. The sound and the picture come from one
-        # source in real time, so the block and the frame carrying the same
-        # moment of content arrive at the same instant; if the sender emits the
-        # frame whose arrival matches the sound it is emitting, the two describe
-        # the same moment whatever their queues are doing.
-        #
-        # Every earlier attempt here worked from queue DEPTH converted to seconds
-        # by a frame rate, and that conversion is the flaw: the producer's rate,
-        # the ceiling and the controller's rate are three different numbers and
-        # the wrong one was used each time. Measured with the depth method, the
-        # log read `a_lag=15.7s v_lag=15.8s` -- apparently in step, and wrong,
-        # because `v_lag` divided by the SENDING rate (five) while the queue had
-        # been filled at the PRODUCING rate (twelve). The picture was in fact
-        # about nine seconds ahead of the sound.
-        # Each item's CONTENT time: when it arrived, less when its own decoder
-        # was started. NOT the arrival instant, which is a different number for
-        # the two streams by however long they took to launch.
-        self.audio_at: collections.deque = collections.deque(maxlen=PCM_QUEUE_CHUNKS)
-        self.video_at: collections.deque = collections.deque(maxlen=VIDEO_QUEUE_FRAMES)
-        self.video_epoch = time.monotonic()
-        self.audio_epoch = time.monotonic()
-        # The content clock, which is what alignment is now done in. The
-        # arrival deques above remain for exactly one purpose: the single
-        # calibration that relates the two decoders' origins. After that they
-        # are diagnostics.
-        #
-        # See server/timeline.py for why this exists. In one line: arrival time
-        # is a property of the network, content time is a property of the
-        # programme, and only the second can carry a lip-sync relationship.
-        self.timeline = ContentTimeline(
-            video_interval_ms=1000.0 / FPS, audio_interval_ms=AUDIO_CHUNK_MS)
-        # Content time carried into this session's wire clock. One per
-        # channel, because a channel is a session and the device requires the
-        # sound to start at zero in each one.
+        # 内容时间轴：对齐依据解码器 pts 而非到达时间（见 server/timeline.py）。
+        self.timeline = ContentTimeline()
+        # 内容时间映射到本会话的线上时钟；每个频道一份，设备要求每个会话的音频从零开始。
         self.session_clock = SessionClock(chunk_ms=AUDIO_CHUNK_MS)
         self.video_content: collections.deque = collections.deque(maxlen=VIDEO_QUEUE_FRAMES)
         self.audio_content: collections.deque = collections.deque(maxlen=PCM_QUEUE_CHUNKS)
-        # Whether the source is still producing, as distinct from whether the
-        # link is keeping up. The controller is told the difference; see
-        # SourceState for why an empty window is not one reading.
+        # 源是否仍在产出，与链路是否跟得上区分开；见 SourceState。
         self.source = SourceState()
         self._video_advanced = False
         self._audio_advanced = False
-        # The picture's frame rate, fixed for the session. FPS is the nominal
-        # figure until start() has asked the source; see resolve_fps.
+        # 画面帧率，会话内固定；start() 探测前为名义值 FPS，见 resolve_fps。
         self.fps = FPS
-        self.fps_note = "nominal"
-        # The picture's byte rate, set by the sender's controller. Each frame is
-        # compressed to fit rate / fps; see frames.ByteBudget and encode_within.
+        self.fps_note = ""
+        # 画面字节率，由发送端控制器设置；每帧压到 rate / fps 以内，见 frames.ByteBudget。
         self._budget = frames.ByteBudget(start_rate(FPS), FPS)
         self.lock = threading.Lock()
         self.error: Exception | None = None
@@ -899,130 +406,58 @@ class LiveChannel:
         self.encoded_video_bytes = 0
         self.encode_seconds = 0.0
         self.coarse_frames = 0
-        #: The one decoder. It produces both payloads and both timestamps.
+        #: 唯一的解码器进程，同时产出两路载荷与时间戳。
         self.decoder: subprocess.Popen | None = None
         self.timestamps: pts.Timestamps | None = None
         self.pts_reader: pts.Reader | None = None
         self.threads: list[threading.Thread] = []
-        # The two loopback connections the decoder makes back to this process;
-        # see start(). File-object wrappers for reading, kept beside the
-        # sockets underneath them so close() can release both deterministically.
+        # 解码器回连的两个回环连接：文件对象用于读取，与底层套接字一并保存，使 close() 能确定性释放。
         self._video: object | None = None
         self._audio: object | None = None
         self._video_sock: socket.socket | None = None
         self._audio_sock: socket.socket | None = None
+        self._adpcm = adpcm.Encoder()
         self._raw_video: queue.Queue[bytes | None] = queue.Queue(maxsize=120)
         self._raw_audio: queue.Queue[bytes | None] = queue.Queue(maxsize=300)
-        # The colours the device needs before it can draw anything. Filled in by
-        # build_palette(), and sent by the session before the first frame.
+        # 设备绘制前需要的调色板，由 build_palette() 填充，会话在首帧前发送。
         self.palette: bytes | None = None
-        self.palette_path: Path | None = None
-        self._palette_dir = palette_dir or Path(tempfile.gettempdir())
 
-    @staticmethod
-    def has_media_start_times(probe_note: list) -> bool:
-        """Whether the probe's failure was about the media or about the probe.
 
-        Only one failure means "this source has no start times": the media
-        answered and its streams do not report a `start_time`. Every other
-        failure -- no program, a timeout, a refused request, output that is not
-        JSON -- is a failure of the *probe*, and none of them says anything
-        about the source's time semantics.
-
-        Collapsing the two is a defect an external review found twice. The first
-        version read any probe failure as "no start times" and used launch times
-        for a local file; the second read the URL's suffix and was defeated by
-        the same file served from `/watch?id=1` instead of `/source.mkv`.
-        """
-        return any("reports no start_time" in note for note in probe_note)
-
-    @staticmethod
-    def _content_looks_live(url: str) -> bool | None:
-        """Whether the path names a stored file. None means the URL does not say.
-
-        A last resort, and deliberately a weak one: it is consulted only when
-        the probe cannot answer, and its negative answer is what stops the
-        fallback. The positive answer is never sufficient on its own -- see
-        `calibrate_from_source`.
-        """
-        suffix = Path(urlparse(url).path).suffix.lower()
-        if not suffix:
-            return None
-        return suffix not in (".mp4", ".mkv", ".mov", ".ts", ".webm", ".avi",
-                              ".flv", ".m4v")
 
     def calibrate_from_source(self) -> bool:
-        """Relate the two content clocks.
+        """记录两路内容时钟的关联。
 
-        One decoder produces both streams and both timestamps, so there is no
-        offset left to measure: the picture and the sound are already on one
-        clock and the number this sets is zero by construction. What the call
-        still does, and why it is still a call, is record WHICH basis related
-        them. A session that cannot say where its times came from cannot be
-        accepted or rejected on the strength of them.
-
-        Kept as a method rather than inlined so the decision stays exercisable
-        without starting a decoder.
-
-        The bases this replaced are worth naming here, because each was wrong in
-        its own way. Counting each stream's items and relating the two counts
-        once from `ffprobe` cannot see a gap: a count closes a hole rather than
-        recording it. Using the two processes' launch times folds the scheduler
-        into the programme, which an external review disproved twice. Both
-        remain defined in `timeline.py`, where the tests that disproved them
-        live, and `BASIS_LAUNCH` now survives as a *state* rather than a session
-        path -- no session reaches it, and it is kept because "approximate" has
-        to stay distinguishable from "measured" for either word to mean
-        anything.
+        单个解码器产出两路时间戳，二者已在同一时钟上，偏移恒为零；仍调用是为了记录关联依据
+        （BASIS_COMMON_DECODE），无法说明时间来源的会话不应被接受。
         """
         return self.timeline.calibrate(0.0, 0.0, basis=BASIS_COMMON_DECODE)
 
     def build_palette(self) -> bytes:
-        """The colours this channel's indices are drawn in.
-
-        With FIXED_PALETTE this is a constant and there is nothing to build, no
-        sample to wait for, and nothing to go stale. The method keeps its name
-        because the session calls it before the first frame and the contract --
-        "the device has a palette before it is sent an index" -- is unchanged.
-
-        The adaptive version sampled the source here, which is the bug written
-        up at FIXED_PALETTE above.
-        """
-        if FIXED_PALETTE:
-            # Imported here rather than at module scope: media imports live.
-            from .media import default_palette
-            self.palette = default_palette()
-            self.palette_path = None
-            return self.palette
-        self.palette_path = self._palette_dir / f"palette-{abs(hash(self.url)):x}.png"
-        try:
-            self.palette = frames.build_palette(
-                self.url, self.ffmpeg, self.user_agent, str(self.palette_path),
-                timeout=PALETTE_TIMEOUT_S)
-        except (OSError, subprocess.SubprocessError, RuntimeError) as error:
-            raise LiveError(f"palette generation failed: {type(error).__name__}") from None
+        """固定 3-3-2 调色板，不按源取样（见 CLAUDE.md 关键设计决策 1）。"""
+        self.palette = default_palette()
         return self.palette
 
+    def _accept_decoder(self, listener: socket.socket) -> socket.socket:
+        """接受解码器的连接；解码器已退出（如源打不开）则立即失败，不等满超时。"""
+        deadline = time.monotonic() + DECODER_CONNECT_TIMEOUT_S
+        listener.settimeout(0.1)
+        while True:
+            try:
+                return listener.accept()[0]
+            except socket.timeout:
+                pass
+            if self.decoder is not None and self.decoder.poll() is not None:
+                raise ConnectionAbortedError("decoder exited")
+            if time.monotonic() > deadline:
+                raise TimeoutError("decoder connect timeout")
+
     def start(self) -> None:
-        if not FIXED_PALETTE and self.palette_path is None:
-            raise LiveError("start() before build_palette()")
         if self.palette is None:
             raise LiveError("start() before build_palette()")
         self.resolve_fps()
-        # Picture and sound come from a single decoder process, delivered over
-        # two loopback TCP connections rather than the anonymous pipes this
-        # used before. See source_command() for why: Windows' subprocess module
-        # refuses pass_fds outright, so a pipe handed to the child by number
-        # cannot be used on every platform this project targets, and a loopback
-        # socket can.
-        #
-        # The parent listens on both ports and only then launches ffmpeg, which
-        # connects out to them as a TCP client -- the reverse of the usual
-        # server role, chosen because it is the listener that must exist first
-        # for a connection to succeed, and the parent is running before the
-        # decoder is. Every resource is closed on failure: the device
-        # reconnects on error, so a leaking start() would exhaust sockets after
-        # a few attempts.
+        # 画面与音频来自单个解码器，经两个回环 TCP 连接输出（原因见 source_command）。
+        # 父进程先监听两个端口再启动 ffmpeg，由 ffmpeg 作为客户端回连；
+        # 失败时须关闭全部资源，否则设备反复重连会耗尽套接字。
         video_listener = audio_listener = None
         video_sock = audio_sock = None
         success = False
@@ -1039,10 +474,7 @@ class LiveChannel:
             audio_listener.listen(1)
             audio_port = audio_listener.getsockname()[1]
 
-            # stderr is a pipe rather than a file now, because the decoder's
-            # timestamps arrive on it. It is drained by a thread of its own: an
-            # unread pipe blocks ffmpeg at the next log line, and a blocked
-            # ffmpeg is indistinguishable from a stalled source.
+            # stderr 用管道承载时间戳，由专门线程持续读取：管道无人读时 ffmpeg 会阻塞，与源停供无法区分。
             self.timestamps = pts.Timestamps()
             self.decoder = subprocess.Popen(
                 source_command(self.url, video_port, audio_port, self.ffmpeg,
@@ -1051,45 +483,27 @@ class LiveChannel:
                 stderr=subprocess.PIPE)
             self.pts_reader = pts.Reader(self.decoder.stderr, self.timestamps)
             self.pts_reader.start()
-            # One process, so there is one launch instant. Kept because the
-            # approximate basis still names it; see `calibrate_from_source`.
-            self.video_epoch = self.audio_epoch = time.monotonic()
             self.calibrate_from_source()
 
-            # ffmpeg opens both outputs within a fraction of a second of
-            # starting, well before it has decoded anything from the source, so
-            # a timeout here catches a decoder that failed to launch rather
-            # than a slow channel.
-            video_listener.settimeout(DECODER_CONNECT_TIMEOUT_S)
-            audio_listener.settimeout(DECODER_CONNECT_TIMEOUT_S)
+            # ffmpeg 在解码任何内容之前就会打开两路输出，此处超时说明解码器没有起来，而非频道慢。
             try:
-                video_sock, _ = video_listener.accept()
-                audio_sock, _ = audio_listener.accept()
+                video_sock = self._accept_decoder(video_listener)
+                audio_sock = self._accept_decoder(audio_listener)
             except OSError as error:
                 raise LiveError(
                     f"decoder did not connect: {type(error).__name__}") from None
-            # The listening sockets have done their one job -- accepting the
-            # decoder's two connections -- and are not needed again.
+            # 监听套接字已完成任务，关闭。
             video_listener.close()
             audio_listener.close()
             video_listener = audio_listener = None
 
-            # A pipe never delayed a write waiting for more bytes to batch; a
-            # TCP socket can, under Nagle's algorithm, hold a small write for up
-            # to 40 ms hoping for another to coalesce with it. That is exactly
-            # the audio chunk size on this link, so left on it would show up as
-            # sporadic extra latency the sender has no way to see. Disabling it
-            # keeps a socket behaving like the pipe it replaced.
+            # 关闭 Nagle 算法：小写入最多被攒 40 ms，恰为一个音频块长，会带来发送端看不到的随机延迟。
             for sock in (video_sock, audio_sock):
                 try:
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 except OSError:
                     pass
-            # The default receive buffer on some platforms holds barely one
-            # 320x180 RGB8 frame (57.6 kB); the anonymous pipe this replaced
-            # was widened for the same reason. Widen the socket buffer the same
-            # way, best-effort: a platform that refuses the request still works,
-            # just with less slack against a burst.
+            # 加大视频接收缓冲（尽力而为）：部分平台默认值容不下一帧原始画面；设置失败只是突发时余量小。
             try:
                 video_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
             except OSError:
@@ -1132,12 +546,9 @@ class LiveChannel:
         self.stop.set()
 
     def _decoder_time(self, kind: str) -> float:
-        """The timestamp belonging to the item just read, in milliseconds.
+        """取刚读到的条目对应的解码器时间戳（毫秒）。
 
-        Raising rather than substituting is the point. A stream stamped from a
-        substitute clock looks exactly like a stream stamped from a real one,
-        and this project has spent several rounds on the consequences of not
-        being able to tell them apart.
+        取不到时抛错，不用替代时钟：时间戳必须来自解码器 pts（CLAUDE.md 核心设计原则 5）。
         """
         seconds = self.timestamps.take(kind) if self.timestamps else None
         if seconds is None:
@@ -1149,12 +560,9 @@ class LiveChannel:
         return seconds * 1000.0
 
     def _drain_video(self) -> None:
-        """Drain raw frames from ffmpeg video pipe immediately into memory queue.
+        """立即把 ffmpeg 画面输出读进内存队列。
 
-        Decoupling pipe draining from timestamp synchronization is critical on
-        Linux: a 64KB pipe buffer only holds 1.1 frames of 320x180 raw video. If
-        the pipe reader pauses while waiting for a timestamp log line, ffmpeg
-        blocks on write(), freezing the entire transcode process and deadlocking.
+        读取与等待时间戳日志解耦：读取一旦停顿，ffmpeg 的写入阻塞，整个转码随之冻结。
         """
         try:
             while not self.stop.is_set():
@@ -1188,11 +596,11 @@ class LiveChannel:
             self._note(error)
 
     def _drain_audio(self) -> None:
-        """Drain raw audio blocks immediately from ffmpeg audio pipe."""
+        """立即把 ffmpeg 音频输出读进内存队列。"""
         try:
             while not self.stop.is_set():
-                block = frames.read_exactly(self._audio, AUDIO_BYTES)
-                if len(block) != AUDIO_BYTES:
+                block = frames.read_exactly(self._audio, AUDIO_PCM_BYTES)
+                if len(block) != AUDIO_PCM_BYTES:
                     if not self.stop.is_set():
                         self._raw_audio.put(None)
                     break
@@ -1216,41 +624,21 @@ class LiveChannel:
                     if self.stop.is_set():
                         break
                     raise LiveError("transcode audio pipe closed")
-                self._push_audio(block, self._decoder_time("audio"))
+                self._push_audio(self._adpcm.encode_pcm(block), self._decoder_time("audio"))
         except (LiveError, OSError, ValueError, pts.Misaligned) as error:
             self._note(error)
 
-    def _read_video(self) -> None:
-        """Alias for compatibility with external or test invocations."""
-        self._process_video()
 
-    def _read_audio(self) -> None:
-        """Alias for compatibility with external or test invocations."""
-        self._process_audio()
 
     def _push_video(self, frame: bytes, content_ms: float) -> None:
-        """Cut and compress a frame here, not on the sending thread.
+        """入队一帧；`content_ms` 为解码器给出的该帧时间戳，随载荷入队，不重算。
 
-        `content_ms` is the decoder's own timestamp for this frame, which is
-        where it sits on the source's timeline. It is carried through the queue
-        beside the payload and never recomputed; see `_push_audio` for what it
-        replaces.
-
-        The queue holds packets where it used to hold a frame, and the whole
-        frame is compressed before any of it is queued, so the sender never
-        sees half a picture. Compressing here rather than in the sender keeps
-        about a millisecond of work out of the loop that also has to keep the
-        sound fed -- small, but that loop's budget is what the picture is
-        already counted against.
+        整帧处理完才入队，发送端不会看到半幅画面；未启用增量时在此压缩，以免占用发送线程。
         """
         encode_started = time.monotonic()
         if frames.DELTA:
-            # Nothing is compressed here. The raw frame travels alone, and which
-            # stripes to send is decided when the frame is sent, against what was
-            # actually sent before it and what the byte budget has left. Deciding
-            # here would be against the previous frame produced, and the queue
-            # below discards frames. Compressing here as well used to cost every
-            # frame twice, the first time for packets that were then thrown away.
+            # 增量模式只带原始帧入队，发送时再按已发内容与剩余字节预算选条带；
+            # 在此决定会以可能被队列丢弃的帧为基准。
             packets = _QueuedFrame()
             packets.raw = frame
         else:
@@ -1259,104 +647,44 @@ class LiveChannel:
             self.produced_video = getattr(self, "produced_video", 0) + 1
             self.encoded_video_bytes = getattr(self, "encoded_video_bytes", 0) + sum(map(len, packets))
             self.encode_seconds = getattr(self, "encode_seconds", 0.0) + time.monotonic() - encode_started
-            # Frames the link is not going to take are given up here, before
-            # they are queued, rather than kept and dropped at the other end.
-            #
-            # The test is the QUEUE's depth and not the interval since the last
-            # frame, and the difference is not a detail. Measured with an
-            # interval test: a source delivering six frames a second into a
-            # target of twelve had every frame rejected as "too soon", so the
-            # picture ran at 6.2 packets a second with the queue empty and
-            # `prod_drop` climbing by 1900 -- the throttle was discarding the
-            # source rather than the surplus. A source slower than the target has
-            # no surplus to discard and must never be throttled.
-            #
-            # Queue depth is the right test because depth is what this is for:
-            # the producer runs at the ceiling and the sender runs at whatever
-            # the channel's frame size allows, so on any channel held below the
-            # ceiling the queue fills and stays full -- and a full queue is the
-            # picture's distance behind live, because the frame sent is the
-            # oldest one in it.
+            # 队列满时丢弃最旧帧。判断依据是队列深度而非帧间隔：源慢于目标时没有多余帧，不得限流。
             if len(self.video) == self.video.maxlen:
                 self.video.popleft()
-                if self.video_at:
-                    self.video_at.popleft()
                 self.dropped_video += 1
             self.video.append(packets)
-            arrival = time.monotonic() - self.video_epoch
-            self.video_at.append(arrival)
             self.video_content.append(content_ms)
             self._video_advanced = True
 
     def _push_audio(self, block: bytes, content_ms: float) -> None:
-        """Queue one sound block, beside the decoder's timestamp for it.
-
-        The timestamp is the decoder's, not a count of blocks. Counting gave a
-        block the position `blocks_received * 40 ms`, which is the right rate
-        and the wrong clock: a decoder that skips 300 ms of sound still emits
-        one block per 40 ms, so the count closed the hole and moved everything
-        after it, and the sender had no way to see that it had happened.
-        """
+        """入队一个音频块；`content_ms` 为解码器时间戳，而非块计数（计数反映不出解码器跳过的音频）。"""
         with self.lock:
             if len(self.audio) == self.audio.maxlen:
                 self.audio.popleft()
-                if self.audio_at:
-                    self.audio_at.popleft()
                 if self.audio_content:
                     self.audio_content.popleft()
                 self.skipped_audio += 1
             self.audio.append(block)
             self.produced_audio += 1
-            arrival = time.monotonic() - self.audio_epoch
-            self.audio_at.append(arrival)
             self.audio_content.append(content_ms)
             self._audio_advanced = True
 
     def pop_audio(self) -> tuple[bytes, int] | None:
-        """The next sound block, with the session timestamp it is to be sent at.
+        """取下一个音频块及其发送用的会话时间戳。
 
-        The timestamp **is** the count of blocks taken, and that is not the
-        defect it looks like. The device's clock counts sound it has received
-        (`submitted_samples / 16000`) and `av_stream_accept()` requires each
-        block's timestamp to be exactly the previous one plus one chunk, so a
-        block's session position is its index by definition.
-
-        What the count may not do is *stand in for the picture's position*, and
-        that was the earlier defect: the frame's stamp was derived from this same
-        counter, so it described this loop's progress instead of the frame's
-        place in the programme. The picture is stamped from its own content now;
-        see `SessionClock.video`.
-
-        The block's content time is not discarded -- `SessionClock.audio` uses it
-        to detect and measure a source discontinuity, which a count cannot see.
-        The arrival deque is popped alongside because it is the queue's own
-        bookkeeping and leaving it behind would pair one queue's entries with
-        another's.
+        设备要求每块时间戳恰为上一块加一个块长，故块的会话位置即其序号；
+        内容时间交给 `SessionClock.audio` 检测并度量源的不连续。画面时间戳不得由该序号派生。
         """
         with self.lock:
             if not self.audio or not self.audio_content:
-                # The two deques are pushed together and popped together, so an
-                # empty content deque beside a full payload deque cannot arise
-                # from _push_audio. Refusing rather than stamping the block with
-                # a counter: a counter here is the defect this replaced.
+                # 两个队列同进同出，不会出现载荷非空而内容时间为空；出现时拒绝，不用计数代替时间戳。
                 return None
             content = self.audio_content.popleft()
-            if self.audio_at:
-                self.audio_at.popleft()
             return self.audio.popleft(), self.session_clock.audio(content)
 
     def picture_lag_s(self) -> float:
-        """How far behind the sound's head the picture's head is, in seconds.
+        """画面队首落后于声音队首的秒数，正值表示画面落后。
 
-        Both are CONTENT times, so the difference is a real lip-sync error and
-        needs no frame rate to interpret. Positive means the picture is behind
-        the sound.
-
-        This used to subtract two arrival times, which is a delivery
-        measurement wearing a sync measurement's name: it read -0.3 s through a
-        session in which the picture was seconds out of step, because both
-        queues had been filled by the same reader and their arrivals therefore
-        agreed while their content did not.
+        两者均为内容时间；差值反映两个队列的深度差，不是观众感受到的唇音偏差。
         """
         with self.lock:
             if not self.video_content or not self.audio_content:
@@ -1366,33 +694,17 @@ class LiveChannel:
             sound_at = self.timeline.audio_in_video_units(self.audio_content[0])
             return (self.video_content[0] - sound_at) / 1000.0
 
-    def audio_depth_ms(self) -> int:
-        """How much sound is queued, in milliseconds of content.
-
-        The picture's queue is held to this, because the two have to describe the
-        same moment. See VIDEO_QUEUE_SECONDS.
-        """
-        with self.lock:
-            return len(self.audio) * AUDIO_CHUNK_MS
 
     def set_video_rate(self, rate: int) -> None:
-        """Tell the encoder how many bytes a second the picture may cost.
-
-        Called by the sender once a second with what its controller decided. The
-        frame rate is not adjustable and is not offered: the only thing a slow
-        link can take from the picture is detail.
-        """
+        """设置画面每秒字节预算，由发送端每秒调用一次；帧率不可调，慢链路只能牺牲细节。"""
         with self.lock:
             self._budget.set_rate(rate)
 
     def resolve_fps(self) -> int:
-        """Fix this channel's frame rate, once, before anything is produced.
+        """在产出任何内容前确定一次画面帧率。
 
-        `TV_FPS` set explicitly wins outright, so a measurement can force a rate.
-        Otherwise the source is asked and its own rate is used, up to the device's
-        bound; a source that does not answer is played at the nominal rate. The
-        answer is what ffmpeg is told to produce, what the timeline counts in and
-        what the sender paces by, so all three agree by construction.
+        显式设置 `TV_FPS` 时直接采用，否则探测源帧率，探测不到用名义值；
+        该值同时用于 ffmpeg 产出与发送节拍。
         """
         if "TV_FPS" in os.environ:
             fps, note = FPS, "TV_FPS"
@@ -1408,37 +720,11 @@ class LiveChannel:
         return fps
 
     def pop_video(self, keep: int = 0) -> tuple[list[bytes], int] | None:
-        """The frame whose CONTENT matches the sound the sender is about to send.
+        """取与即将发送的声音内容对齐的画面帧，返回其包与会话时间戳，没有则返回 None。
 
-        Alignment is by content time, not by arrival time. Both queues carry,
-        beside each item, the moment of the programme that item belongs to --
-        counted from the stream's own production rate, not read off a clock --
-        and this returns the frame whose content is the sound's, within one
-        audio chunk.
-
-        **What this replaced, and why.** The rule used to be `arrival minus that
-        decoder's own start`, which is still an arrival time: it moves when the
-        network stalls, when the reader is slow, when a process is descheduled.
-        None of those are properties of the programme. An external review built
-        the counterexample that this module now carries as a test -- the same
-        picture, delivered 600 ms late, stopped matching its sound, because
-        600 ms is past `VIDEO_SYNC_TOLERANCE_S`. The two decoders' origins are
-        related once at the start and are constant for the session; treating a
-        later delay as a fresh observation of that relationship is exactly the
-        defect.
-
-        A frame whose content is older than the sound being sent has already
-        been heard by the viewer and is given up. A frame that is newer has not
-        reached its moment, and nothing is returned so the caller waits -- the
-        sound keeps the timeline, which is the rule everywhere else here.
-
-        The answer is the frame's packets **and the session timestamp they are
-        to be sent under**, decided here rather than by the sender. The two must
-        come out of one decision: the packets of a frame all share a timestamp,
-        and a sender free to derive that separately is free to derive it from
-        something else -- which is exactly what the sender used to do, stamping
-        the picture with its own progress instead of the frame's place against
-        the sound. See `SessionClock`.
+        按内容时间对齐，不按到达时间（CLAUDE.md 核心设计原则 5）：内容比声音旧的帧已被听过，丢弃；
+        更新的帧未到时刻，返回 None 等待，以声音为时间主线。帧的会话时间戳由帧自身的内容位置决定，
+        与配对的声音位置无关，包与时间戳在此一并决定，发送端不另行派生。
         """
         with self.lock:
             if not self.video:
@@ -1446,90 +732,59 @@ class LiveChannel:
             if not self.audio_content and self.session_clock._prev_audio_content is None:
                 return None
             if not self.timeline.usable:
-                # Nothing has related the two clocks yet, so there is no basis
-                # for saying which frame and which chunk are the same moment.
-                # Refusing is the answer; the first version of this guessed, and
-                # the startup gap became a lip-sync error.
-                #
-                # `usable` and not `calibrated`, and the difference is a black
-                # screen. An approximate mapping may be used to pair; what it
-                # may not do is pass as a measurement. Gating pairing on the
-                # stricter question left `video_sent` at zero for two minutes
-                # while the sound climbed to 2634 packets.
+                # 两路时钟尚未建立关联时无从判断帧与块是否同一时刻，不猜测。
+                # 判据是 usable 而非 calibrated：近似映射可用于配对，只是不能当作测量值上报。
                 return None
-            # The moment of the programme the sound belongs to, expressed on
-            # the picture's clock so the comparison is direct.
+            # 声音所属的节目时刻，换算到画面时钟以便直接比较。
             ref_audio = self.audio_content[0] if self.audio_content else self.session_clock._prev_audio_content
             head_audio = self.timeline.audio_in_video_units(ref_audio)
-            # A loop rather than a single decision, because a frame that turns
-            # out to be unplaceable is discarded and the next one tried. The
-            # alternative -- returning after the first refusal -- drops at most
-            # one frame per tick, so a run of frames inside one hole would take
-            # as many ticks to clear as it has frames.
+            # 不可放置的帧丢弃后继续试下一帧；每次只处理一帧会使洞内的连续帧要多次调用才能清完。
             while self.video and self.video_content:
                 content = self.video_content[0]
-                # Anything the picture holds that is older than that sound is
-                # content the viewer has already heard, so it goes.
+                # 比该声音旧的内容观众已听过，丢弃。
                 if content < head_audio - VIDEO_SYNC_TOLERANCE_S * 1000:
                     self._give_up_frame()
                     continue
-                # Not yet due: the frame that matches this sound has not arrived.
+                # 未到时刻：与该声音匹配的帧尚未到达。
                 if content > head_audio + VIDEO_SYNC_TOLERANCE_S * 1000:
                     return None
-                # The frame's OWN content position is what decides its wire
-                # timestamp, not the position of the sound it was paired with.
-                # Using the sound's position was the defect an external review
-                # demonstrated by construction: a frame 333 ms older than that
-                # sound was stamped with the sound's moment, so the device drew
-                # it 333 ms late, and the constant -292 ms residual this
-                # produced over five minutes was that tolerance being spent and
-                # then hidden.
+                # 线上时间戳取帧自身的内容位置，不取所配对声音的位置。
                 frame_at = self.timeline.video_in_audio_units(content)
-                # The queue's head is passed in as well as being paired with.
-                # It is the only way the clock can know that a gap has opened
-                # BEFORE the sound after it is taken; without it the open
-                # segment extends across the hole and stamps frames that belong
-                # inside it.
+                # 同时传入队首内容时间，时钟才能在取走后续声音之前发现已出现空洞。
                 verdict, stamp = self.session_clock.placement(
                     frame_at, ref_audio)
                 if verdict == VERDICT_IN_HOLE:
-                    # Sound the sender dropped. The viewer never heard this
-                    # moment, so there is none to draw the frame at.
+                    # 发送端丢弃了这段声音，观众没听过，没有可绘制该帧的时刻。
                     self._give_up_frame()
                     continue
                 if verdict != VERDICT_PLACED:
-                    # Not due yet, or the session has no anchor. Both are
-                    # patience rather than loss, so the frame stays queued.
+                    # 未到时刻或会话尚无锚点，都是等待而非丢失，帧保留在队列中。
                     return None
                 self.video_content.popleft()
-                if self.video_at:
-                    self.video_at.popleft()
                 packets = self._delta_encode(self.video.popleft())
                 self.session_clock.note_pair(frame_at, ref_audio)
                 return packets, stamp
             return None
 
     def _delta_encode(self, packets):
-        """Turn a queued raw frame into the packets that go on the wire.
+        """把队列中的原始帧转成线上包。
 
-        Runs at the moment of sending, holding the lock: the choice depends on
-        what the device has been sent and on what the byte budget has left, and
-        both are only known now. It costs a few milliseconds of Python a frame
-        (measured offline, 0.3 to 3.7 ms across six channels), which the sender's
-        loop can afford at 30 frames a second. Without TV_DELTA the packets were
-        already compressed and are returned untouched.
+        发送时持锁执行：选条带依赖已发内容与剩余字节预算，二者此时才确定；未启用增量时包已压缩，原样返回。
         """
         raw = getattr(packets, "raw", None)
         if raw is None:
             return packets
         started = time.monotonic()
-        if PERCEPTUAL:
+        if DEGRADE in perceptual.MODES:
             chosen, drawn, rung = perceptual.encode_within(
-                raw, self._shown, self._delta_tick, self._budget.target(), self._snap_level)
+                raw, self._shown, self._delta_tick, self._budget.target(), self._snap_level,
+                mode=DEGRADE)
             self._snap_level = rung
         else:
             chosen, drawn, rung = frames.encode_within(raw, self._shown, self._delta_tick,
                                                        self._budget.target())
+        if ENCODE == "fill":
+            chosen = frames.fill_stripes(drawn, self._shown, chosen, self._budget.target())
         self._delta_tick += 1
         self._shown = frames.apply_stripes(drawn, self._shown, chosen)
         out = frames.pack_stripes(chosen)
@@ -1540,25 +795,16 @@ class LiveChannel:
         return out
 
     def _give_up_frame(self) -> None:
-        """Discard the frame at the head of the picture queue. Caller holds the lock."""
+        """丢弃画面队首帧；调用者持锁。"""
         self.video.popleft()
         self.video_content.popleft()
-        if self.video_at:
-            self.video_at.popleft()
         self.dropped_video += 1
 
     def source_state(self, queue_over_bound: bool = False) -> str:
-        """Classify the window that just ended and clear the per-window flags.
+        """给刚结束的窗口分类并清除窗口标志，由发送端在通知控制器前调用一次。
 
-        Called once per decision window by the sender, before it tells the
-        controller anything. The flags are per-window and are consumed here, so
-        a stale True from a window three seconds ago cannot make a quiet window
-        look busy.
-
-        The three answers are not decoration: `starved` is what stops an empty
-        window being read as spare capacity, and `congested` is the case the
-        rate is supposed to answer. Before this existed the controller had one
-        number for both.
+        标志按窗口消费，避免陈旧的 True 使空闲窗口显得繁忙；`starved` 使空窗口不被当作富余容量，
+        `congested` 才是速率调整要应对的情形。
         """
         with self.lock:
             state = self.source.observe(self._video_advanced, self._audio_advanced,
@@ -1567,43 +813,20 @@ class LiveChannel:
             self._audio_advanced = False
             return state
 
-    def flow_snapshot(self) -> dict:
-        """Producer totals and queue depth; these are not device counters."""
+    @property
+    def shown(self) -> bytes | None:
+        """设备当前显示的画面，首帧前为 None。"""
         with self.lock:
-            return dict(audio_produced=self.produced_audio, video_produced=self.produced_video,
-                        video_encoded_bytes=self.encoded_video_bytes,
-                        video_encode_wall_s=round(self.encode_seconds, 4),
-                        audio_queue_ms=len(self.audio) * AUDIO_CHUNK_MS,
-                        video_queue_frames=len(self.video), audio_skipped=self.skipped_audio,
-                        video_discarded=self.dropped_video, video_coarse=self.coarse_frames)
+            return self._shown
 
-    def trim_backlog(self, maximum_ms: int = 8000, retain_ms: int = 4000) -> int:
-        """Trim both streams at one content edge; call between complete frames.
-
-        SessionClock observes the next audio content jump and retains
-        contiguous wire PCM stamps. This can skip content when overloaded.
-        """
-        if not 0 < retain_ms < maximum_ms:
-            raise ValueError("invalid live backlog bounds")
+    @shown.setter
+    def shown(self, picture: bytes | None) -> None:
         with self.lock:
-            if len(self.audio) * AUDIO_CHUNK_MS <= maximum_ms:
-                return 0
-            count = len(self.audio) - max(1, retain_ms // AUDIO_CHUNK_MS)
-            for _ in range(count):
-                self.audio.popleft()
-                self.audio_content.popleft()
-                if self.audio_at:
-                    self.audio_at.popleft()
-            self.skipped_audio += count
-            if self.audio_content and self.timeline.usable:
-                edge = self.timeline.audio_in_video_units(self.audio_content[0])
-                while self.video_content and self.video_content[0] < edge:
-                    self._give_up_frame()
-            return count
+            self._shown = picture
 
     def has_data(self) -> bool:
         with self.lock:
-            # Video can be paired if audio queue has data or if previous audio was already anchored.
+            # 声音队列有数据，或声音已锚定且画面队列有数据，即可配对。
             return bool(self.audio or (self.video and self.session_clock._prev_audio_content is not None))
 
     def audio_pending(self) -> bool:
@@ -1622,22 +845,45 @@ class LiveChannel:
         with self.lock:
             return len(self.audio) >= PREBUFFER_CHUNKS and len(self.video) >= PREBUFFER_FRAMES
 
-    def wait_for_failure(self) -> None:
-        """Block until the transcode stops, for a supervisor thread."""
-        self.stop.wait()
+    def trim_backlog(self, maximum_ms: int = 8000, retain_ms: int = 4000) -> int:
+        if not 0 < retain_ms < maximum_ms:
+            raise ValueError("invalid live backlog bounds")
+        with self.lock:
+            if len(self.audio) * AUDIO_CHUNK_MS <= maximum_ms:
+                return 0
+            count = len(self.audio) - max(1, retain_ms // AUDIO_CHUNK_MS)
+            for _ in range(count):
+                self.audio.popleft()
+                if self.audio_content:
+                    self.audio_content.popleft()
+            self.skipped_audio = getattr(self, "skipped_audio", 0) + count
+            if self.audio_content and getattr(self.timeline, "usable", False):
+                edge = self.timeline.audio_in_video_units(self.audio_content[0])
+                while self.video_content and self.video_content[0] < edge:
+                    self._give_up_frame()
+            elif self.audio_content and self.video_content:
+                edge = self.audio_content[0]
+                while self.video_content and self.video_content[0] < edge:
+                    self._give_up_frame()
+            return count
+
+    @staticmethod
+    def has_media_start_times(probe_note: list) -> bool:
+        return any("reports no start_time" in note for note in probe_note)
+
 
     @staticmethod
     def _sanitize_diagnostics(text: str) -> str:
-        """Strip tokens, passwords, and sensitive parameters from diagnostic text."""
-        # Redact URL query parameters (e.g. ?token=... or &key=...)
+        """去除诊断文本中的令牌、密码与敏感参数。"""
+        # 抹去 URL 查询参数（如 ?token=...）
         text = re.sub(r"([?&][a-zA-Z0-9_.-]+=)[^\s&'\"<>]+", r"\1<redacted>", text)
-        # Redact user:pass in URLs
+        # 抹去 URL 中的 user:pass
         text = re.sub(r"(https?://)([^:@\s/]+:[^:@\s/]+@)", r"\1<auth>@", text)
         return text
 
 
     def diagnostics(self) -> str:
-        """Transcode error text for logs: ffmpeg stderr only, never media."""
+        """转码错误文本，用于日志：只含 ffmpeg stderr，不含媒体内容。"""
         parts = []
         error = self.failure()
         if error is not None:
@@ -1657,10 +903,6 @@ class LiveChannel:
                 parts.append(f"decoder: {tail_text.replace(chr(10), ' ')[-300:]}")
         return " | ".join(parts)
 
-    def _processes(self):
-        """Single decoder process, kept for compatibility if needed."""
-        proc = getattr(self, "decoder", None)
-        return (("decoder", proc, None),)
 
     def close(self) -> None:
         self.stop.set()
@@ -1670,13 +912,7 @@ class LiveChannel:
                 ts.close()
             except Exception:
                 pass
-        # Close the file objects first so the decoder is not blocked writing
-        # and the reader threads see EOF, then the sockets underneath them.
-        # makefile()'s close() drops this object's own reference to the
-        # socket, and the fd is only released once every reference is gone --
-        # closing just the file object would leave the fd open for as long as
-        # the garbage collector takes to notice. Closing the socket explicitly
-        # here makes that deterministic rather than incidental.
+        # 先关文件对象，使读线程见到 EOF，再显式关套接字：只关文件对象不会释放 fd，要等垃圾回收。
         for stream in (getattr(self, "_video", None), getattr(self, "_audio", None)):
             if stream is not None:
                 try:
@@ -1725,10 +961,60 @@ class LiveChannel:
                 proc.stderr.close()
             except OSError:
                 pass
-        palette_path = getattr(self, "palette_path", None)
-        if palette_path is not None:
-            try:
-                palette_path.unlink()
-            except OSError:
-                pass
-            self.palette_path = None
+
+
+PROBE_TIMEOUT_S = float(os.environ.get("TV_PROBE_TIMEOUT_S", "20"))
+
+
+def stream_start_times(url: str, ffmpeg: str, user_agent: str = "",
+                       diagnostic: list | None = None) -> tuple[float, float] | None:
+    probe = os.path.join(os.path.dirname(ffmpeg), "ffprobe")
+    if not os.path.exists(probe):
+        probe = "ffprobe"
+
+    def failed(reason: str) -> None:
+        if diagnostic is not None:
+            diagnostic.append(reason)
+
+    command = [probe, "-v", "error"]
+    effective_ua = user_agent or (frames.DEFAULT_USER_AGENT if url.startswith(("http://", "https://")) else "")
+    if effective_ua:
+        command += ["-user_agent", effective_ua]
+    command += ["-show_entries", "stream=codec_type,start_time",
+                "-of", "json", url]
+    try:
+        done = subprocess.run(command, capture_output=True, text=True,
+                              timeout=PROBE_TIMEOUT_S)
+    except FileNotFoundError:
+        failed("ffprobe is not installed")
+        return None
+    except subprocess.TimeoutExpired:
+        failed(f"ffprobe timed out after {PROBE_TIMEOUT_S:g} s")
+        return None
+    except OSError as error:
+        failed(f"ffprobe could not be run: {type(error).__name__}")
+        return None
+    if done.returncode != 0:
+        first = (done.stderr or "").strip().splitlines()
+        failed("ffprobe failed: " + (first[0] if first else f"exit {done.returncode}"))
+        return None
+    try:
+        streams = json.loads(done.stdout).get("streams", [])
+    except ValueError:
+        failed("ffprobe returned something that is not JSON")
+        return None
+    found: dict[str, float] = {}
+    for stream in streams:
+        kind = stream.get("codec_type")
+        if kind not in ("video", "audio") or kind in found:
+            continue
+        try:
+            found[kind] = float(stream["start_time"])
+        except (KeyError, TypeError, ValueError):
+            failed(f"the source reports no start_time for its {kind} stream")
+            return None
+    if "video" not in found or "audio" not in found:
+        failed("the source does not report both a video and an audio stream")
+        return None
+    return found["video"], found["audio"]
+

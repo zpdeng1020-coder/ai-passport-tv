@@ -1,30 +1,13 @@
-"""The indexed picture: how a frame is cut, compressed and packed.
+"""索引画面：帧的切条、压缩与打包。
 
-The device draws a 320x240 picture from 256-colour indices, one byte a pixel.
-Indices rather than colours because the picture then compresses like a fax
-rather than like a photograph, and because turning an index into a colour on
-the device is a table lookup instead of an inverse transform. The device has no
-JPEG decoder in this path at all.
+画面为 256 色调色板索引，每像素 1 字节，按条带独立 deflate 压缩。
+几何见 GEOMETRIES，默认 320x180、每条带 12 行、共 15 条带。
 
-A frame is cut into fifteen stripes of sixteen rows -- 320x16, so 5120 index
-bytes each -- and each stripe is compressed on its own. Fifteen because 240
-rows divided by sixteen is fifteen, and the panel takes its rows in sixteens:
+视频包载荷格式（长度为大端，单位为其后压缩数据的字节数）：
 
-  * the panel starts updating while the rest of the frame is still arriving,
-    which matters on a link that takes tens of milliseconds per frame;
-  * the device needs no scratch buffer larger than one stripe.
+    [u8 首条带][u8 条带数][u16 长度 * 条带数][压缩条带]
 
-Splitting costs 2.2% more bytes than compressing the frame in one stream,
-measured, which is a good price for both.
-
-Packets carry a run of consecutive stripes:
-
-    [u8 first stripe][u8 count][u16 length * count][compressed stripes]
-
-The lengths are big-endian and count the compressed bytes that follow. A
-constant number of stripes per packet is safe rather than a budget worked out
-at run time: deflate cannot inflate incompressible input by more than a few
-bytes per block, so the worst a stripe can be is its own size plus a handful.
+长度为 0 的条带表示未变化，设备不重绘。
 """
 
 from __future__ import annotations
@@ -33,41 +16,10 @@ import os
 import shutil
 import struct
 import subprocess
-import time
 import zlib
 
-# What arrives on the wire, at the panel's own size. See the note at
-# AV_VIDEO_WIDTH in main/av_protocol.h: the device enlarges this by the ratio in
-# AV_ENLARGE_NUM/AV_ENLARGE_DEN on its way to the panel, and at 1/1 it enlarges
-# nothing, which is what puts a source pixel in every screen pixel. Sending
-# fewer columns and stretching them buys frame rate and spends sharpness; the
-# viewer, shown that trade, asked for the sharpness.
-# The two ends must agree exactly -- the device checks the size in CONFIG and
-# refuses a stream that disagrees -- so these are the values in that header.
-# The geometry the firmware was built with, named rather than specified as
-# three numbers that have to agree.
-#
-# The device compiles its geometry in, so the two ends must match exactly or
-# every session is refused -- and a mismatch does not announce itself as a
-# configuration error, it looks like a broken link: the device connects,
-# authenticates and drops. One name is one chance to get it right.
-#
-#     320x240   the default: every screen pixel is the source's own
-#     280x210   seven eighths the source's own, 36% more content pixels
-#     240x180   three quarters the source's own, the fastest of the three
-#
-# 320x240 is the default because every other ratio leaves an artefact. Spreading
-# fewer columns across 320 copies some source pixels once and their neighbours
-# twice, and the irregularity reads as a grid of dots over the whole picture --
-# worse, not better, the closer the ratio is to one. The viewer rejected both
-# 8/7 and 4/3 on sight for exactly that and asked for native.
-#
-# The cost is frame rate, paid in bytes rather than in computation: a native
-# frame is 20.4 kB against 12.1 kB at 240x180, so the same link carries about
-# half as many.
-#
-# tools/check_config_agreement.py prints which pane the firmware was built for,
-# so the two can be compared without flashing anything.
+# 画面几何：名称 -> (宽, 高, 每条带行数)。必须与固件编译时的几何一致，
+# 否则设备在 CONFIG 校验时拒绝会话。四项均为 15 条带；320x180 为 16:9 默认值，其余为 4:3。
 GEOMETRIES = {"320x240": (320, 240, 16), "280x210": (280, 210, 14),
               "240x180": (240, 180, 12), "320x180": (320, 180, 12)}
 _NAME = os.environ.get("TV_GEOMETRY", "320x180")
@@ -79,96 +31,30 @@ STRIPES = HEIGHT // STRIPE_ROWS
 STRIPE_PIXELS = WIDTH * STRIPE_ROWS
 FRAME_PIXELS = WIDTH * HEIGHT
 
-# How ffmpeg hands the picture over: one index byte a pixel and nothing else.
-#
-# This used to be pal8, which carries a palette and writes it once per frame
-# after the pixels -- a stride of 77824, of which the last 1024 bytes were read
-# and dropped. rgb8 carries no palette at all, so the trailer is gone and the
-# frame is exactly its pixels.
-#
-# The two formats were once argued about in the other direction, and the history
-# is worth keeping because the conclusion reversed. rgb8 is not "8-bit colour":
-# it is ffmpeg's own fixed 3-3-2 grid, so asking for it quantises every pixel
-# onto that grid. When the palette was adaptive that was fatal -- the indices
-# were chosen against a palette-sampled image and would then be looked up in a
-# different table. It is now the point: the grid is the palette, both ends know
-# it without being told, and it cannot go stale. See FIXED_PALETTE in live.py.
+# ffmpeg 输出 rgb8：固定 3-3-2 网格即调色板（见 LiveChannel.build_palette），
+# 每帧恰为 FRAME_PIXELS 字节，无调色板尾部。
 TRAILER_BYTES = 0
 FRAME_BYTES = FRAME_PIXELS + TRAILER_BYTES
 
-# How large a packet may be, and how large the packer aims for.
-#
-# **The numbers in this paragraph are from an older geometry and the paragraph
-# is kept only as the history of how the ceiling was set. Do not use them.**
-#
-# It was written when the picture was 240x180 with a 12288-byte packet ceiling,
-# and it says the device is short of packets a second rather than bytes: its
-# receive path tops out near 72 a second whatever their size, with the sound
-# spending 50 of those at one 640-byte chunk every 20 ms. **The audio chunk is
-# 40 ms and 1280 bytes now, not 20 ms and 640**, so that arithmetic describes a
-# protocol this one is not; and at 320x240 with a 22528-byte ceiling, five
-# frames a second costs five picture packets, not five of a scarce twenty.
-#
-# What was measured since does agree with the conclusion: splitting a frame into
-# two packets made things distinctly worse (underruns 5 to 9, resets 11 to 24,
-# twelve of thirteen sessions failed), so "packets are not the constraint, bytes
-# are" holds. That is a measurement about this geometry; the 72 is not.
-#
-# The other direction is bounded too, and this is the part that took longest to
-# see. One task reads the socket, so while a picture packet is arriving the sound
-# is not being read at all. A packet that takes longer to cross than the sound
-# can go without therefore costs the sound, and the device ends the session on
-# that. Measured: a 23232-byte packet was still only 3790 bytes read after
-# 563 ms, and the audio underran behind it.
-#
-# A frame of live television measures 29 to 43 KB. Packing to the protocol
-# ceiling gives one or two packets of 20 to 42 kB, which is into that second
-# limit; packing to 4 KB gives eleven small packets, which blows the packet
-# budget and starves the picture. Twelve kilobytes is the middle: the same frame
-# becomes three packets of 10 to 12 kB, each crossing in about 200 ms.
-#
-# VIDEO_MAX must equal AV_VIDEO_MAX in main/av_protocol.h. A packet over it ends
-# the session rather than being trimmed, so it is a hard limit and not a target.
+# 视频包上限，必须等于固件 AV_VIDEO_MAX；超限会话被结束，不会被截断。
 VIDEO_MAX = 22528
 
-# What the packer aims for. Lower than VIDEO_MAX on purpose: the ceiling is what
-# the device will accept, this is what keeps each packet short enough for the
-# sound to keep flowing. See above for how the figure was arrived at.
-#
-# Overridable so the two sizes can be compared on one machine without editing a
-# tracked file -- the same reason TV_FPS is. A measurement that needs a rebuild
-# between its two halves is a measurement that cannot be repeated.
+# 打包目标，刻意低于 VIDEO_MAX：单包过大会使读取期间音频无人读取，
+# 见 CLAUDE.md 关键设计决策 3。
 PACKET_TARGET_BYTES = int(os.environ.get("TV_PACKET_TARGET", "12288"))
 
-# Must equal AV_PALETTE_ENTRIES in main/av_protocol.h.
+# 必须等于固件 AV_PALETTE_ENTRIES。
 PALETTE_ENTRIES = 256
 PALETTE_BYTES = PALETTE_ENTRIES * 2
 
 _HEADER = struct.Struct(">BB")
 
-# Compression level 6, and the figure that chose it is worth re-measuring
-# whenever the geometry changes -- it did, and it moved.
-#
-# Level 1 was chosen when a frame was 320x240 of JPEG-era data and the gap to
-# level 6 measured under a fifth of a percent, which was not worth the processor
-# time. At 240x180 indexed that is no longer true: measured over 24 frames of a
-# live channel, level 1 costs 13412 bytes a frame, level 3 costs 12905, level 6
-# costs 12147, and level 9 costs 12141. Six is 9.4% off every frame for 0.9 ms
-# of compression instead of 0.4 -- under a hundredth of a frame's slot on a
-# machine that is merely decoding one stream.
-#
-# What those bytes buy is frame rate directly, since the link's capacity is what
-# it is: 9.4% fewer bytes per frame is 9.4% more frames for the same link.
+# deflate 级别，见 CLAUDE.md 关键设计决策 2。
 _COMPRESS_LEVEL = 6
 
 
 def compress_stripes(frame: bytes, send: list[bool] | None = None) -> list[bytes]:
-    """Cut a frame into stripes and compress each one.
-
-    `send` says which stripes go out; a stripe that does not is an empty entry,
-    which the length table describes as length zero. The device leaves the panel
-    alone for those, so they cost neither bandwidth nor inflate time.
-    """
+    """切条并逐条压缩；`send` 为 False 的条带输出空串（长度 0，设备不重绘）。"""
     if len(frame) != FRAME_PIXELS:
         raise ValueError(f"frame is {len(frame)} bytes, expected {FRAME_PIXELS}")
     return [
@@ -178,32 +64,16 @@ def compress_stripes(frame: bytes, send: list[bool] | None = None) -> list[bytes
     ]
 
 
-# Sending only the stripes that changed, and only as many as the byte budget pays
-# for. On unless TV_DELTA=0, and that is a change of default: the frame rate is
-# held fixed now, so the only thing left to give when the link is short is bytes
-# per frame, and without this a frame is always every stripe. It has to ship with
-# firmware that accepts a zero-length stripe -- an older one ends the session on
-# the first such stripe -- which is why the switch still exists.
-#
-# "Changed" is a count of differing indices against what the device has been sent,
-# not equality. Measured on real channels, only 15-34% of stripes are
-# byte-identical to the previous frame's (compression noise flips a few pixels
-# everywhere), but 43-50% differ in 3% of pixels or fewer. Below `DELTA_MAX_DIFF`
-# a stripe is not worth its bytes and waits; above it, stripes compete for the
-# budget in order of how many pixels differ. One percent rather than three: on
-# quiet channels it lifts the picture from 61-62 dB to 72-79 dB against the source
-# for 6-17% more bytes, and on busy ones the budget decides and it changes nothing
-# (offline, tools/budget_lab.py, 200 frames of three channels).
+# 增量发送：只发相对设备已有画面有变化的条带。TV_DELTA=0 关闭。
+# 依赖固件接受零长度条带，旧固件遇到会结束会话。
+# 变化量按差异索引数衡量，不比对相等；差异占比不超过 DELTA_MAX_DIFF 的条带不发，
+# 其余按差异数从大到小竞争字节预算。
 DELTA = os.environ.get("TV_DELTA", "1") != "0"
 DELTA_MAX_DIFF = float(os.environ.get("TV_DELTA_MAX_DIFF", "0.01"))
 
-# What a frame is allowed to cost is simply the byte rate over the frame rate. A
-# frame is compressed at the best quality that fits that, found afresh for every
-# frame (`encode_within`): busy content comes out coarser than quiet content, and
-# nothing is remembered from one frame to the next. There is no quality state to
-# raise or lower, so there is nothing to smooth.
+
 class ByteBudget:
-    """The picture's byte rate and frame rate, and the frame size they imply."""
+    """画面字节率与帧率，及由此得到的单帧字节目标。"""
 
     def __init__(self, rate: float, fps: float):
         self.rate, self.fps = float(rate), float(fps)
@@ -219,12 +89,7 @@ class ByteBudget:
 
 
 def _ladder() -> list[bytes]:
-    """Lookup tables that coarsen a 3-3-2 index, gentlest first; [0] is lossless.
-
-    Each colour channel is rounded to a multiple of its step, so smooth gradients
-    turn into a few flat bands that deflate far better. Steps are (red/green,
-    blue): the last rung leaves two levels of red and green.
-    """
+    """从粗到细排列的 3-3-2 索引映射表，[0] 为无损；每档把各颜色通道舍入到步长的倍数。"""
     def table(rg: int, b: int) -> bytes:
         def snap(v: int, top: int, step: int) -> int:
             return min(top, (v + step // 2) // step * step)
@@ -239,14 +104,9 @@ LADDER = _ladder()
 
 def encode_within(raw: bytes, shown: bytes | None, tick: int, target: int,
                   min_diff: float = DELTA_MAX_DIFF) -> tuple[list[bytes], bytes, int]:
-    """Compress `raw` to fit `target` bytes: (stripes to send, what they draw, rung).
+    """压缩 `raw` 使其不超过 `target` 字节，返回（待发条带，设备将显示的画面，档位）。
 
-    Tries the picture as it is, then coarser and coarser, and takes the first that
-    fits, counting only the stripes that would actually be sent. So every stripe
-    sent is from this frame -- the picture gets coarser, it does not get patched
-    together from old and new. Only if even the coarsest does not fit does it fall
-    back to leaving stripes out, biggest change first. The second value is the
-    coarsened frame: what the device shows afterwards, and the next `shown`.
+    先原样尝试，再逐档降质，取第一个放得下的档位；最粗仍放不下才按变化量丢条带。
     """
     chosen, drawn = [], raw
     for rung, table in enumerate(LADDER):
@@ -263,11 +123,7 @@ def _wire_size(chosen: list[bytes]) -> int:
 
 
 def differing_pixels(a: bytes, b: bytes) -> int:
-    """How many indices differ, at C speed and with the standard library only.
-
-    XOR the two as integers and count the zero bytes of the result. The server
-    has no third-party dependencies, so this is what stands in for numpy.
-    """
+    """统计两帧不同的索引个数：异或后数零字节，只用标准库。"""
     x = int.from_bytes(a, "big") ^ int.from_bytes(b, "big")
     return len(a) - x.to_bytes(len(a), "big").count(0)
 
@@ -278,21 +134,12 @@ def _deflate(raw: bytes, at: int) -> bytes:
 
 def choose_stripes(raw: bytes, shown: bytes | None, tick: int, allowed: int,
                    min_diff: float = DELTA_MAX_DIFF) -> list[bytes]:
-    """The compressed stripes of `raw` that are worth sending, within `allowed` bytes.
+    """在 `allowed` 字节内选出值得发送的压缩条带；未选中的条带为空串。
 
-    `shown` is what the device has been sent so far, or None before the first
-    frame, when everything goes. An entry that is not sent is empty, which the
-    length table describes as length zero and the device leaves alone.
-
-    One stripe is refreshed regardless, in turn (`tick`), and it is not counted
-    against `allowed`: it is what repairs a stripe the device lost a whole frame
-    of, and what makes a frame with nothing new still a frame.
-
-    The rest are ranked by how many pixels differ from what the device has, and
-    sent biggest-change first until the next one would not fit. A stripe that
-    misses out is not lost and needs no bookkeeping: what the device holds for it
-    is unchanged, so next frame it differs by at least as much and ranks at least
-    as high. Compression happens once, on the stripes actually considered.
+    `shown` 为设备已收到的画面，None 表示首帧，全部发送。
+    按 `tick` 轮转强制刷新一条，不计入 `allowed`，用于修复设备丢失的条带。
+    其余条带按与 `shown` 的差异数从大到小发送，直到放不下为止；落选条带
+    无需记账，下一帧差异只增不减。
     """
     if len(raw) != FRAME_PIXELS:
         raise ValueError(f"frame is {len(raw)} bytes, expected {FRAME_PIXELS}")
@@ -321,9 +168,33 @@ def choose_stripes(raw: bytes, shown: bytes | None, tick: int, allowed: int,
     return out
 
 
+def fill_stripes(raw: bytes, shown: bytes | None, chosen: list[bytes],
+                 allowed: int) -> list[bytes]:
+    """在 `chosen` 之外，用 `allowed` 的剩余字节补发被跳过且有差异的条带，差异大者优先。"""
+    if shown is None:
+        return chosen
+    spent = _wire_size(chosen)
+    ranked = []
+    for at in range(STRIPES):
+        if chosen[at]:
+            continue
+        lo, hi = at * STRIPE_PIXELS, (at + 1) * STRIPE_PIXELS
+        changed = differing_pixels(raw[lo:hi], shown[lo:hi])
+        if changed:
+            ranked.append((-changed, at))
+    ranked.sort()
+    out = list(chosen)
+    for _, at in ranked:
+        z = _deflate(raw, at)
+        if spent + len(z) > allowed:
+            continue
+        out[at] = z
+        spent += len(z)
+    return out
+
+
 def apply_stripes(raw: bytes, shown: bytes | None, sent: list[bytes]) -> bytes:
-    """What the device shows after receiving `sent`: `shown` with those stripes of
-    `raw` written over it."""
+    """设备收到 `sent` 后显示的画面：`shown` 上覆盖 `raw` 中对应的条带。"""
     merged = bytearray(shown if shown is not None else raw)
     for at, stripe in enumerate(sent):
         if stripe:
@@ -333,7 +204,7 @@ def apply_stripes(raw: bytes, shown: bytes | None, sent: list[bytes]) -> bytes:
 
 
 def packet(first: int, compressed: list[bytes]) -> bytes:
-    """Build one payload from consecutive compressed stripes."""
+    """由连续的压缩条带构造一个载荷。"""
     if not compressed:
         raise ValueError("a packet carries at least one stripe")
     if first + len(compressed) > STRIPES:
@@ -346,31 +217,21 @@ def packet(first: int, compressed: list[bytes]) -> bytes:
 
 
 def frame_packets(frame: bytes) -> list[bytes]:
-    """Everything a frame needs, in order.
-
-    Packed to a byte budget rather than to a number of stripes, because what a
-    packet costs the device is the time it takes to read, and that is bytes.
-    A count of stripes is a different read time on every channel: measured from
-    300 bytes to 3 KB for one stripe, so the same count is 100 ms on one channel
-    and a second on another, and only the slow one is felt.
-
-    A single stripe larger than the budget still goes out on its own -- there is
-    nothing to split it into -- which is why the per-stripe sizes are checked
-    against the protocol ceiling as well.
-    """
+    """整帧压缩并打包。"""
     return pack_stripes(compress_stripes(frame))
 
 
 def pack_stripes(compressed: list[bytes]) -> list[bytes]:
-    """Pack already-compressed stripes into packets. An empty entry is a stripe
-    that is not being sent this frame; it takes two bytes of length table."""
+    """按字节预算把已压缩条带打包成多个载荷；空条带占 2 字节长度表。
+
+    单条带超过预算时独自成包，超过 VIDEO_MAX 则抛错。
+    """
     packets: list[bytes] = []
     run: list[bytes] = []
     run_bytes = 0
     at = 0
     for stripe in compressed:
-        # The header and its length table grow by two bytes a stripe, so the
-        # budget for the stripes themselves is what is left after them.
+        # 长度表每条带增加 2 字节，预算先扣除包头与长度表。
         overhead = _HEADER.size + 2 * (len(run) + 1)
         if run and overhead + run_bytes + len(stripe) > PACKET_TARGET_BYTES:
             packets.append(packet(at, run))
@@ -389,13 +250,7 @@ def pack_stripes(compressed: list[bytes]) -> list[bytes]:
 
 
 def read_exactly(stream, size: int) -> bytes:
-    """Read `size` bytes from a pipe, or fewer if it ends first.
-
-    A pipe hands back whatever is ready, so one read of a whole frame returns a
-    short piece as a matter of course and a reader that trusted it would see
-    endless truncated frames. The loop lives here rather than in the frame
-    reader because that reader is about frames and this is about pipes.
-    """
+    """从管道读 `size` 字节，管道结束时可能不足；管道单次读取可能返回短数据，故循环。"""
     data = bytearray()
     while len(data) < size:
         chunk = stream.read(size - len(data))
@@ -406,34 +261,22 @@ def read_exactly(stream, size: int) -> bytes:
 
 
 def read_frame(stream, stop) -> bytes | None:
-    """Read exactly one indexed frame from a raw pipe.
-
-    The stream is rawvideo: no markers, no lengths, just one fixed number of
-    bytes a frame. So this reads that number rather than scanning for anything,
-    which is also why a short read means the pipe has ended rather than that a
-    frame is malformed -- there is nothing to resynchronise to.
-
-    Returns None when the stream ends, including a partial frame at the end: a
-    half frame cannot be drawn and is better dropped than padded.
-    """
+    """从 rawvideo 管道读一帧；流结束或只读到半帧时返回 None，半帧不补齐。"""
     if stop.is_set():
         return None
     raw = read_exactly(stream, FRAME_PIXELS)
     if len(raw) != FRAME_PIXELS:
         return None
     if TRAILER_BYTES:
-        # pal8 wrote a palette block here. rgb8 does not, so this is now dead
-        # code kept only so that the two constants stay meaningful together;
-        # it is reached the moment TRAILER_BYTES is given a value.
         if len(read_exactly(stream, TRAILER_BYTES)) != TRAILER_BYTES:
             return None
     return raw
 
 
-# --- Reading a packet back, for tests and for anything that has to check ---
+# --- 载荷解包（测试与校验用） ---
 
 def unpack(payload: bytes) -> list[bytes]:
-    """Split a payload into its decompressed stripes."""
+    """把载荷拆成解压后的条带。"""
     if len(payload) < _HEADER.size:
         raise ValueError("payload shorter than its own header")
     first, count = _HEADER.unpack_from(payload)
@@ -457,13 +300,9 @@ def unpack(payload: bytes) -> list[bytes]:
 
 
 def palette_bytes(rgb24: bytes) -> bytes:
-    """Turn 256 RGB triples into the big-endian RGB565 pairs the device wants.
+    """把 256 个 RGB 三元组转成设备要的大端 RGB565。
 
-    ffmpeg's 3-3-2 does not simply scale by 255/7; it multiplies by 36 and 85.
-    The two disagree by one count on 220 of the 256 entries and then agree
-    again once quantised to RGB565 -- checked against the palette read back out
-    of ffmpeg's own rgb8 output, where all 256 matched. So the shift below is
-    the same colour as ffmpeg's multiply, and cheaper.
+    ffmpeg 的 3-3-2 网格按 36 与 85 倍乘，量化到 RGB565 后与下面的移位结果一致。
     """
     if len(rgb24) < PALETTE_ENTRIES * 3:
         raise ValueError("a palette is 256 RGB triples")
@@ -474,26 +313,14 @@ def palette_bytes(rgb24: bytes) -> bytes:
     return bytes(out)
 
 
-# --- Choosing the 256 colours -------------------------------------------------
+# --- 缩放与补边 ---
 
-# How much of a source to watch before choosing its palette, and how often to
-# sample it while doing so. Long enough to cover more than one shot, short
-# enough that changing channel does not feel like a wait: measured at about two
-# seconds on a live channel, most of which is spent waiting for the source.
-SAMPLE_SECONDS = 1.5
-SAMPLE_FPS = 6
-# The scale-and-letterbox both the sampler and the picture reader use, so the
-# palette is chosen for what is actually shown rather than for the raw frame.
-#
-# Both, and by construction rather than by agreement. The sampler used to fit
-# the frame without first squaring the pixels, while the picture reader did
-# both: an anamorphic source was therefore sampled as a full white frame and
-# then shown letterboxed, so the palette contained no black, and the black bars
-# -- which are part of what the viewer sees -- were mapped to the nearest colour
-# they could find, which was white. The bars above and below the picture came
-# out white and the whole panel looked lit. Deriving both from one string is
-# what stops that from being possible again.
-SCALER_FLAGS = os.environ.get("TV_SCALER_FLAGS", "bicubic")
+# 取色样与出图共用同一条滤镜串，保证二者看到的是同一幅补边后的画面。
+SCALE_MODES = ("bicubic", "lanczos", "bilinear", "area", "neighbor")
+SCALE = os.environ.get("TV_SCALE", "").strip() or "bicubic"
+if SCALE not in SCALE_MODES:
+    raise SystemExit(f"TV_SCALE={SCALE!r} 无效，可选值：{' / '.join(SCALE_MODES)}")
+SCALER_FLAGS = SCALE
 FIT = (f"scale=iw*sar:ih,setsar=1,"
        f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease:flags={SCALER_FLAGS},"
        f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1")
@@ -502,19 +329,13 @@ DEFAULT_USER_AGENT = "AptvPlayer-UA"
 
 
 def input_options(url: str, user_agent: str = "", paced: bool = False) -> list[str]:
-    """Options for reading a source, network or local.
+    """读取源的 ffmpeg 输入参数。
 
-    The reconnect options are for a network source and are rejected outright by
-    a local file -- "Option reconnect not found", after which the input never
-    opens at all -- so they are added only when the source is remote. Tests run
-    against local files, which makes the distinction load-bearing rather than
-    theoretical.
+    reconnect 选项仅网络源可用，本地文件会因未知选项而打不开。
     """
     options: list[str] = []
     if paced:
-        # -re paces input at its native rate. Without it ffmpeg decoded a whole
-        # HLS window at once, filled the queues within three seconds and then
-        # went quiet, so the device drained them and stalled.
+        # -re 按原生速率读入，否则 HLS 窗口被一次解完，队列很快填满后断供。
         options += ["-re", "-flags", "low_delay"]
     if url.startswith(("http://", "https://", "rtsp://", "rtmp://")):
         options += ["-reconnect", "1", "-reconnect_streamed", "1",
@@ -527,48 +348,27 @@ def input_options(url: str, user_agent: str = "", paced: bool = False) -> list[s
     return options
 
 
+SAMPLE_SECONDS = 1.5
+SAMPLE_FPS = 6
+
+
 def palette_command(url: str, ffmpeg: str, user_agent: str, destination: str,
                     sample_seconds: float = SAMPLE_SECONDS) -> list[str]:
-    """Ask ffmpeg for a palette suited to this source, written as a PNG.
-
-    A second and a half is sampled rather than a single frame: one frame can be
-    an outlier -- a title card, a fade, a graphic -- and the palette chosen from
-    it would then be wrong for everything that follows.
-
-    The duration is an INPUT option and has to stay before -i. As an output
-    option it does nothing, and the process then reads a live stream for ever:
-    palettegen emits one frame, at the very end, so anything waiting for its
-    output to finish waits for the channel to stop broadcasting. Measured both
-    ways -- 2.2 seconds before -i, hung indefinitely after it.
-    """
+    """Ask ffmpeg for a palette suited to this source, written as a PNG."""
     return [
         ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
         "-t", str(sample_seconds),
         *input_options(url, user_agent),
         "-i", url,
-        # reserve_transparent is on by default, which spends the last of the
-        # 256 entries on a transparency colour the device has no use for --
-        # and spends it on lime green, so if the encoder ever did emit that
-        # index the picture would carry a bright green pixel that is nowhere
-        # in the source. Measured on a white test card: with the default the
-        # palette came back black + 254 greys + lime, and with it off, black
-        # + 255 greys. Every entry is then a colour from the source.
         "-vf", f"fps={SAMPLE_FPS},{FIT},"
                f"palettegen=max_colors={PALETTE_ENTRIES}:stats_mode=single:"
                f"reserve_transparent=0",
-        # -update 1 because a still-image muxer refuses to write a second file
-        # over the first; palettegen emits one frame and it still has to be told.
         "-frames:v", "1", "-update", "1", "-y", destination,
     ]
 
 
 def read_palette(png: str, ffmpeg: str) -> bytes:
-    """The palette as 256 big-endian RGB565 pairs.
-
-    Read back out of the PNG rather than generated a second time, so the
-    palette the device is given and the one the picture is mapped onto are the
-    same bytes by construction rather than because two calculations agree.
-    """
+    """The palette as 256 big-endian RGB565 pairs."""
     raw = subprocess.run(
         [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
          "-i", png, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
@@ -579,13 +379,7 @@ def read_palette(png: str, ffmpeg: str) -> bytes:
 
 def build_palette(url: str, ffmpeg: str, user_agent: str, png: str,
                   timeout: float = 40) -> bytes:
-    """Sample the source, write a palette PNG, and return the device's copy.
-
-    The timeout is a backstop, not a schedule: this takes about two seconds on a
-    live channel, and anything past the timeout is a source that is not
-    answering. Without one, changing to a dead channel would hang instead of
-    failing where the device can see it and reconnect.
-    """
+    """Sample the source, write a palette PNG, and return the device's copy."""
     if shutil.which(ffmpeg) is None and not ffmpeg.startswith("/"):
         raise RuntimeError(f"ffmpeg not found: {ffmpeg}")
     try:
@@ -595,3 +389,6 @@ def build_palette(url: str, ffmpeg: str, user_agent: str, png: str,
     except subprocess.TimeoutExpired:
         raise RuntimeError("palette generation timed out") from None
     return read_palette(png, ffmpeg)
+
+
+

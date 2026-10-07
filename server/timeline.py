@@ -130,7 +130,7 @@ class ContentTimeline:
     lip-sync error.
     """
 
-    def __init__(self, video_interval_ms: float, audio_interval_ms: float,
+    def __init__(self, video_interval_ms: float = 1000.0 / 25, audio_interval_ms: float = 40.0,
                  tolerance_ms: float = DEFAULT_TOLERANCE_MS):
         self.video = Stream("video", video_interval_ms)
         self.audio = Stream("audio", audio_interval_ms)

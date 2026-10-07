@@ -47,8 +47,8 @@ jobs:
 
       # PyInstaller builds for the machine it runs on; there is no cross-build
       # here, which is why this is a matrix rather than one job with flags.
-      - name: Install PyInstaller
-        run: python -m pip install --disable-pip-version-check pyinstaller
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check pyinstaller numpy
 
       - name: Build
         run: python tools/build_server.py

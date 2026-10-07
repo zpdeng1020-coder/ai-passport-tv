@@ -18,7 +18,7 @@ from server.live import (LiveChannel, LiveError, read_frames, chunk_pcm,
                          CHANNELS, VIDEO_SYNC_TOLERANCE_S)
 from server.timeline import (BASIS_COMMON_DECODE, BASIS_LAUNCH,
                              BASIS_MEDIA_START, ContentTimeline, SessionClock)
-from server.protocol import AUDIO_BYTES, VIDEO_CONTINUES, VIDEO_MAX
+from server.protocol import AUDIO_BYTES, AUDIO_PCM_BYTES, VIDEO_CONTINUES, VIDEO_MAX
 from server.media import AUDIO_CHUNK_MS
 from server import frames as format
 
@@ -127,9 +127,9 @@ class FramingTests(unittest.TestCase):
     def test_pcm_reblocking_is_exact(self):
         blocks, stop = [], threading.Event()
         with self.assertRaises(LiveError):
-            chunk_pcm(_feed(bytes(AUDIO_BYTES * 3 + 5)), blocks.append, stop)
+            chunk_pcm(_feed(bytes(AUDIO_PCM_BYTES * 3 + 5)), blocks.append, stop)
         self.assertEqual(len(blocks), 3)  # the 5-byte tail is never emitted
-        self.assertTrue(all(len(b) == AUDIO_BYTES for b in blocks))
+        self.assertTrue(all(len(b) == AUDIO_PCM_BYTES for b in blocks))
 
 
 @unittest.skipUnless(os.environ.get("TV_LIVE_TEST") == "1",
