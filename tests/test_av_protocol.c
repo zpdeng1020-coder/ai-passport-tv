@@ -184,6 +184,41 @@ static void expansion_tests(void) {
     av_expand_indexed(none,0,table);
     assert(none[0]==0xaa && none[1]==0xbb);
 }
+// The four-at-a-time expander has to agree with the plain one on every input it
+// will be given: byte for byte, in place, for every remainder of the pixel count.
+// The alignment is asked for explicitly because the contract requires it and a
+// stack array need not have it.
+static void wire_expansion_tests(void) {
+    static uint16_t host[AV_PALETTE_ENTRIES], wire[AV_PALETTE_ENTRIES];
+    for(unsigned i=0;i<AV_PALETTE_ENTRIES;i++) host[i]=av_palette_rgb565((uint8_t)i);
+    memcpy(wire,host,sizeof host);
+    av_palette_wire_order(wire);
+    for(unsigned i=0;i<AV_PALETTE_ENTRIES;i++) {
+        assert(wire[i]==(uint16_t)((host[i]<<8)|(host[i]>>8)));
+    }
+
+    static uint8_t plain[AV_STRIPE_PIXELS*2+8] __attribute__((aligned(4)));
+    static uint8_t fast [AV_STRIPE_PIXELS*2+8] __attribute__((aligned(4)));
+    // Every count from empty through a few whole groups and each remainder,
+    // then a full stripe. A wrong remainder handler only shows at 1, 2 or 3.
+    const size_t counts[]={0,1,2,3,4,5,6,7,8,9,255,256,257,AV_STRIPE_PIXELS};
+    for(unsigned c=0;c<sizeof counts/sizeof counts[0];c++) {
+        size_t n=counts[c];
+        for(size_t i=0;i<n;i++) plain[i]=fast[i]=(uint8_t)((i*37+11)&0xff);
+        // Guard bytes just past the output: a write beyond 2*n would show here.
+        memset(plain+2*n,0xa5,8);
+        memset(fast +2*n,0xa5,8);
+        av_expand_indexed(plain,n,host);
+        av_expand_indexed_wire(fast,n,wire);
+        if(memcmp(plain,fast,2*n+8)) printf("  wire expander differs at %zu pixels\n",n);
+        assert(memcmp(plain,fast,2*n+8)==0);
+    }
+    // Every index value present, so no palette entry goes untested.
+    for(size_t i=0;i<AV_PALETTE_ENTRIES*4;i++) plain[i]=fast[i]=(uint8_t)(i&0xff);
+    av_expand_indexed(plain,AV_PALETTE_ENTRIES*4,host);
+    av_expand_indexed_wire(fast,AV_PALETTE_ENTRIES*4,wire);
+    assert(memcmp(plain,fast,AV_PALETTE_ENTRIES*8)==0);
+}
 static void video_payload_tests(void) {
     // A well-formed packet: three stripes whose lengths account for exactly the
     // bytes that follow them.
@@ -312,6 +347,7 @@ int main(void) {
     stream_tests();
     palette_tests();
     expansion_tests();
+    wire_expansion_tests();
 
     video_payload_tests();
     channel_tests();

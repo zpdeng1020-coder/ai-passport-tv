@@ -1,0 +1,2 @@
+# Overlay: boot the minimal network playback benchmark (main/net_demo.c).
+CONFIG_AV_NET_DEMO=y

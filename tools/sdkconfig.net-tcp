@@ -1,0 +1,5 @@
+# Experiment overlay on top of sdkconfig.net-demo: larger TCP receive window and
+# mailboxes. Measurement only; the product keeps sdkconfig.defaults.
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64

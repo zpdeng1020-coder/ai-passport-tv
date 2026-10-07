@@ -17,6 +17,10 @@
 
 ## 项目状态
 
+- [handoff-20260928.zh_CN.md](handoff-20260928.zh_CN.md)：**做性能优化或换架构时先读这个。**从硬件推出的 320×180 播放理论上限、参考项目、以及真机基准测试计划。
+- [hardware-benchmark-results-20260929.zh_CN.md](hardware-benchmark-results-20260929.zh_CN.md)：那份交接文档要求的测量，已在真机上取到。与它第 4 节冲突之处以本文件为准。
+- [tcp-delta-progress-20260930.zh_CN.md](tcp-delta-progress-20260930.zh_CN.md)：**继续做 TCP 方向优化前先读这个。**UDP 改造已搁置；本文记录产品 TCP 路径上做过的改动（delta 编码）、实测结果（没有稳定提升，约 7–11 fps）、当前问题和后续候选。均为单次运行。
+- [server-optimisation-handoff-20260930.zh_CN.md](server-optimisation-handoff-20260930.zh_CN.md)：**做服务端或画质相关工作前先读这个。**固定帧率的服务端、测到了什么、什么还没确认（按字节目标压缩时画面变粗肉眼可见），以及按顺序的下一步。固件侧认为已经做完。
 - [state-20260916.zh_CN.md](state-20260916.zh_CN.md)：**先读这个。**已修什么、坏着什么、量到了什么、什么还没有结论，以及下一步的顺序。动手改代码之前先拿它跟代码核对。
 - [metrics-dictionary.zh_CN.md](metrics-dictionary.zh_CN.md)：两端每个计数器到底在数什么，以及不能把它读成什么。
 

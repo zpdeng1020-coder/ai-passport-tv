@@ -125,10 +125,10 @@ class TcpIntegration(unittest.TestCase):
                 for i in range(200): self._push_audio(bytes(1280), i * 40)
                 for i in range(96): self._push_video(raw, i * 1000 / 12)
 
-        env = {'TV_LIVE_ENGINE': 'v2', 'TV_LIVE_PACKET_BYTES': '6144', 'TV_STRIPE_PACE_MS': '5'}
+        env = {'TV_LIVE_ENGINE': 'v2', 'TV_LIVE_PACKET_BYTES': '6144', 'TV_STRIPE_PACE_MS': '5', 'TV_DELTA': '0'}
         url = 'http://127.0.0.1/host-tcp-fixture'
         logs = []
-        with patch.dict('os.environ', env), patch.dict(live.CHANNELS, {'test_v2': url}):
+        with patch.dict('os.environ', env), patch.object(frames, 'DELTA', False), patch.dict(live.CHANNELS, {'test_v2': url}):
             server = tv_server.AVServer(None, None, '127.0.0.1', 0, logger=logs.append)
             server.live_enabled = True
             server.channel_name = 'test_v2'

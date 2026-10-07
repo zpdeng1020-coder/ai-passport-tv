@@ -14,6 +14,14 @@ run_static_checks() {
 
     python3 tools/check_repo.py
 
+    # The hardware benchmark's compressed stripes are generated, and the C side
+    # regenerates the source they must inflate to. Nothing else connects the two:
+    # the generator writes a header, the mirror lives in av_player.c, and a drift
+    # between them would show up as a failed check on the device -- or worse, as
+    # a believable cycle count. Regenerating here is cheap and the comparison is
+    # exact.
+    python3 tools/make_bench_blobs.py --check
+
     actionlint_bin="${ACTIONLINT_BIN:-}"
     if [[ -z "${actionlint_bin}" ]]; then
         actionlint_bin="$(command -v actionlint || true)"
@@ -32,6 +40,10 @@ run_static_checks() {
         tests/test_av_protocol.c main/av_protocol.c \
         -o "${test_dir}/test_av_protocol"
     "${test_dir}/test_av_protocol"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_av_adpcm.c main/av_adpcm.c \
+        -o "${test_dir}/test_av_adpcm"
+    "${test_dir}/test_av_adpcm"
     # Overlay text and menu state: pure logic, so they run without a device.
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_ui_text.c main/ui_text.c \

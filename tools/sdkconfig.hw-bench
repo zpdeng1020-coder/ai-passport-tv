@@ -1,0 +1,14 @@
+# Measurement overlay: the hardware benchmark, on.
+#
+# Passed as a third SDKCONFIG_DEFAULTS entry after sdkconfig.defaults and
+# sdkconfig.av-prototype, so a build that wants the benchmark does not have to
+# edit the prototype config that ships. Kept out of the two files under version
+# control on purpose: AV_HW_BENCH is off in both, and it has to stay off there
+# because a device that benchmarks on every boot is not a television.
+#
+# The option cannot be turned on with `idf.py -D CONFIG_AV_HW_BENCH=y`. That
+# form sets a CMake cache variable, not a Kconfig symbol, and the build silently
+# succeeds with the option still off -- measured, by building exactly that way
+# and finding "# CONFIG_AV_HW_BENCH is not set" in the generated sdkconfig and
+# no hw_bench symbol in the map.
+CONFIG_AV_HW_BENCH=y

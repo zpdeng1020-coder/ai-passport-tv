@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "av_adpcm.h"
 #define AV_HEADER_BYTES 24u
 // Control payload ceiling. It has to hold the channel list, which the server
 // sends in the CONFIG packet: about 47 bytes of JSON per channel plus the fixed
@@ -66,7 +67,15 @@
 #ifndef AV_VIDEO_BUFFERS
 #define AV_VIDEO_BUFFERS 2u
 #endif
-#define AV_AUDIO_BYTES 1280u
+// One audio packet is 40 ms of 16 kHz mono sound, 640 samples, sent as IMA ADPCM:
+// a four-byte state header and four bits a sample, 324 bytes against the 1280 the
+// same sound takes as PCM. `AV_AUDIO_BYTES` is the length the packet header
+// carries -- what crosses the wire -- and `AV_AUDIO_PCM_BYTES` is what the codec
+// is fed after decoding. They are different numbers and the code that confuses
+// them still compiles, so each use should say which one it means.
+#define AV_AUDIO_SAMPLES 640u
+#define AV_AUDIO_PCM_BYTES (AV_AUDIO_SAMPLES * 2u)
+#define AV_AUDIO_BYTES (AV_ADPCM_HEADER_BYTES + AV_AUDIO_SAMPLES / 2u)
 #define AV_WIDTH 320u
 #define AV_HEIGHT 240u
 // How much picture arrives, and how much the device makes of it.
@@ -272,4 +281,18 @@ uint16_t av_palette_rgb565(uint8_t index);
 // buffer serves both as the decompressed stripe and as the bytes handed to the
 // panel. Forwards, the first step would overwrite buf[1] before it was read.
 void av_expand_indexed(uint8_t *buf, size_t pixels, const uint16_t *palette);
-void av_expand_indexed(uint8_t *buf, size_t pixels, const uint16_t *palette);
+
+// The same expansion, four pixels a step, for a palette already in wire order.
+//
+// `av_palette_wire_order` turns the table `av_palette_decode` produced into one
+// whose entries hold each colour's two bytes high-then-low in memory, which on
+// the little-endian core reads as the byte-swapped value. With that, one 16-bit
+// store writes a pixel the way the panel wants it and two 32-bit stores write
+// four, where the plain version does two byte stores a pixel. Measured on the
+// device: 14.15 -> 7.61 cycles a pixel, 4.7 -> 2.6 ms a frame, byte for byte the
+// same output. It is the same backwards walk, for the same reason.
+//
+// `buf` must be 4-byte aligned; any pixel count is accepted, and the up-to-three
+// pixels past the last whole group are done one at a time first, from the top.
+void av_palette_wire_order(uint16_t table[AV_PALETTE_ENTRIES]);
+void av_expand_indexed_wire(uint8_t *buf, size_t pixels, const uint16_t *wire_palette);

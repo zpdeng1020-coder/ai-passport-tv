@@ -7,6 +7,9 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
+// LCD_CMD_CASET / LCD_CMD_RASET, the raw window address commands. The vendor
+// driver uses the same two constants through this header.
+#include "esp_lcd_panel_commands.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -219,6 +222,66 @@ esp_err_t bsp_display_raw_drain(unsigned transfers, uint32_t timeout_ms) {
     return ESP_OK;
 }
 
+// One window for the whole run, then pixels only.
+//
+// panel_st7789_draw_bitmap sends CASET, RASET and then the pixels, and esp_lcd
+// waits for every transfer already in flight before each of those commands goes
+// out. Fifteen stripes a frame therefore pay fifteen of those synchronisation
+// points on top of the pixels. The benchmark needs to know how much of the
+// 30.7 ms floor that is, and the only way to find out is to stop paying it.
+//
+// The window has to cover the whole picture, not one stripe. Inside an open
+// window the controller advances the write address on its own and wraps at the
+// end of the window, so pushes land consecutively and each striped slice goes
+// where the previous one ended. Addressing per stripe would re-pay the very
+// cost this exists to remove.
+//
+// `window_push` hands the pixels over with -1 as the command, which is the
+// documented way to send colours with no command in front, so nothing
+// re-addresses and nothing forces a drain. What must not happen is a
+// draw_bitmap landing between begin() and the pushes: it would move the window
+// out from under them. The benchmark owns the panel for the whole run, so it
+// does not.
+static bool s_raw_window_open;
+
+esp_err_t bsp_display_raw_window_begin(int y, int rows) {
+    if (!s_raw || !s_panel || !s_io) return ESP_ERR_INVALID_STATE;
+    if (y < 0 || rows <= 0 || y + rows > BSP_LCD_W) return ESP_ERR_INVALID_ARG;
+    // CASET addresses columns, RASET rows -- panel_st7789_draw_bitmap sends
+    // them in that order with x in CASET. The panel is already swapped to
+    // landscape by raw_claim, so the caller's rows are the panel's y, and the
+    // window spans the panel's full height in x.
+    //
+    // The gap is not added: this board's is zero (bsp_display_init calls
+    // set_gap(0,0)). A panel that needed one would have to add it here exactly
+    // as panel_st7789_draw_bitmap adds its own.
+    const uint8_t caset[] = {
+        0, 0,
+        (uint8_t)((BSP_LCD_H - 1) >> 8), (uint8_t)((BSP_LCD_H - 1) & 0xff),
+    };
+    const uint8_t raset[] = {
+        (uint8_t)(y >> 8), (uint8_t)(y & 0xff),
+        (uint8_t)((y + rows - 1) >> 8), (uint8_t)((y + rows - 1) & 0xff),
+    };
+    esp_err_t e = esp_lcd_panel_io_tx_param(s_io, LCD_CMD_CASET, caset, sizeof(caset));
+    if (e != ESP_OK) return e;
+    e = esp_lcd_panel_io_tx_param(s_io, LCD_CMD_RASET, raset, sizeof(raset));
+    if (e != ESP_OK) return e;
+    s_raw_window_open = true;
+    return ESP_OK;
+}
+
+esp_err_t bsp_display_raw_window_push(int rows, const void *rgb565_be) {
+    if (!s_raw || !s_io || !s_raw_window_open) return ESP_ERR_INVALID_STATE;
+    if (!rgb565_be || rows <= 0) return ESP_ERR_INVALID_ARG;
+    // -1: pixels with no command in front, so the window stands and no
+    // outstanding-transfer wait is forced.
+    esp_err_t e = esp_lcd_panel_io_tx_color(s_io, -1, rgb565_be,
+                                            (size_t)BSP_LCD_H * (size_t)rows * 2);
+    if (e == ESP_OK) s_raw_outstanding++;
+    return e;
+}
+
 esp_err_t bsp_display_raw_release(void) {
     if (!s_raw || s_raw_outstanding) return ESP_ERR_INVALID_STATE;
     esp_lcd_panel_io_callbacks_t cb = {0};
@@ -228,6 +291,10 @@ esp_err_t bsp_display_raw_release(void) {
     esp_lcd_panel_mirror(s_panel, false, false);
     vSemaphoreDelete(s_raw_done); s_raw_done = NULL; s_raw = false;
     s_raw_outstanding = 0;
+    // A window left open would still be in force for the next owner, which
+    // expects to address its own; the panel is restored above but the window is
+    // a property of the panel's controller, not of this driver.
+    s_raw_window_open = false;
     return ESP_OK;
 }
 

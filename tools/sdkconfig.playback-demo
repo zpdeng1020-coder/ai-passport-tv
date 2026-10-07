@@ -1,0 +1,4 @@
+# Overlay: boot the self-contained playback demo (network-free, shows FPS).
+# Use as a third SDKCONFIG_DEFAULTS entry; see tools/sdkconfig.hw-bench for why
+# `idf.py -D CONFIG_...=y` does not work.
+CONFIG_AV_DEMO_PLAYBACK=y

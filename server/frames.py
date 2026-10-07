@@ -33,6 +33,7 @@ import os
 import shutil
 import struct
 import subprocess
+import time
 import zlib
 
 # What arrives on the wire, at the panel's own size. See the note at
@@ -161,14 +162,174 @@ _HEADER = struct.Struct(">BB")
 _COMPRESS_LEVEL = 6
 
 
-def compress_stripes(frame: bytes) -> list[bytes]:
-    """Cut a frame into stripes and compress each one."""
+def compress_stripes(frame: bytes, send: list[bool] | None = None) -> list[bytes]:
+    """Cut a frame into stripes and compress each one.
+
+    `send` says which stripes go out; a stripe that does not is an empty entry,
+    which the length table describes as length zero. The device leaves the panel
+    alone for those, so they cost neither bandwidth nor inflate time.
+    """
     if len(frame) != FRAME_PIXELS:
         raise ValueError(f"frame is {len(frame)} bytes, expected {FRAME_PIXELS}")
     return [
         zlib.compress(frame[at * STRIPE_PIXELS:(at + 1) * STRIPE_PIXELS], _COMPRESS_LEVEL)
+        if send is None or send[at] else b""
         for at in range(STRIPES)
     ]
+
+
+# Sending only the stripes that changed, and only as many as the byte budget pays
+# for. On unless TV_DELTA=0, and that is a change of default: the frame rate is
+# held fixed now, so the only thing left to give when the link is short is bytes
+# per frame, and without this a frame is always every stripe. It has to ship with
+# firmware that accepts a zero-length stripe -- an older one ends the session on
+# the first such stripe -- which is why the switch still exists.
+#
+# "Changed" is a count of differing indices against what the device has been sent,
+# not equality. Measured on real channels, only 15-34% of stripes are
+# byte-identical to the previous frame's (compression noise flips a few pixels
+# everywhere), but 43-50% differ in 3% of pixels or fewer. Below `DELTA_MAX_DIFF`
+# a stripe is not worth its bytes and waits; above it, stripes compete for the
+# budget in order of how many pixels differ. One percent rather than three: on
+# quiet channels it lifts the picture from 61-62 dB to 72-79 dB against the source
+# for 6-17% more bytes, and on busy ones the budget decides and it changes nothing
+# (offline, tools/budget_lab.py, 200 frames of three channels).
+DELTA = os.environ.get("TV_DELTA", "1") != "0"
+DELTA_MAX_DIFF = float(os.environ.get("TV_DELTA_MAX_DIFF", "0.01"))
+
+# What a frame is allowed to cost is simply the byte rate over the frame rate. A
+# frame is compressed at the best quality that fits that, found afresh for every
+# frame (`encode_within`): busy content comes out coarser than quiet content, and
+# nothing is remembered from one frame to the next. There is no quality state to
+# raise or lower, so there is nothing to smooth.
+class ByteBudget:
+    """The picture's byte rate and frame rate, and the frame size they imply."""
+
+    def __init__(self, rate: float, fps: float):
+        self.rate, self.fps = float(rate), float(fps)
+
+    def set_rate(self, rate: float) -> None:
+        self.rate = float(rate)
+
+    def set_fps(self, fps: float) -> None:
+        self.fps = float(fps)
+
+    def target(self) -> int:
+        return int(self.rate / self.fps)
+
+
+def _ladder() -> list[bytes]:
+    """Lookup tables that coarsen a 3-3-2 index, gentlest first; [0] is lossless.
+
+    Each colour channel is rounded to a multiple of its step, so smooth gradients
+    turn into a few flat bands that deflate far better. Steps are (red/green,
+    blue): the last rung leaves two levels of red and green.
+    """
+    def table(rg: int, b: int) -> bytes:
+        def snap(v: int, top: int, step: int) -> int:
+            return min(top, (v + step // 2) // step * step)
+        return bytes((snap(i >> 5, 7, rg) << 5) | (snap((i >> 2) & 7, 7, rg) << 2)
+                     | snap(i & 3, 3, b) for i in range(256))
+    return [bytes(range(256))] + [table(rg, b) for rg, b in
+                                  ((2, 1), (3, 1), (3, 2), (4, 2), (7, 3))]
+
+
+LADDER = _ladder()
+
+
+def encode_within(raw: bytes, shown: bytes | None, tick: int, target: int,
+                  min_diff: float = DELTA_MAX_DIFF) -> tuple[list[bytes], bytes, int]:
+    """Compress `raw` to fit `target` bytes: (stripes to send, what they draw, rung).
+
+    Tries the picture as it is, then coarser and coarser, and takes the first that
+    fits, counting only the stripes that would actually be sent. So every stripe
+    sent is from this frame -- the picture gets coarser, it does not get patched
+    together from old and new. Only if even the coarsest does not fit does it fall
+    back to leaving stripes out, biggest change first. The second value is the
+    coarsened frame: what the device shows afterwards, and the next `shown`.
+    """
+    chosen, drawn = [], raw
+    for rung, table in enumerate(LADDER):
+        drawn = raw.translate(table) if rung else raw
+        chosen = choose_stripes(drawn, shown, tick, 1 << 30, min_diff)
+        if _wire_size(chosen) <= target:
+            return chosen, drawn, rung
+    return (choose_stripes(drawn, shown, tick, target, min_diff), drawn,
+            len(LADDER) - 1)
+
+
+def _wire_size(chosen: list[bytes]) -> int:
+    return _HEADER.size + 2 * len(chosen) + sum(map(len, chosen))
+
+
+def differing_pixels(a: bytes, b: bytes) -> int:
+    """How many indices differ, at C speed and with the standard library only.
+
+    XOR the two as integers and count the zero bytes of the result. The server
+    has no third-party dependencies, so this is what stands in for numpy.
+    """
+    x = int.from_bytes(a, "big") ^ int.from_bytes(b, "big")
+    return len(a) - x.to_bytes(len(a), "big").count(0)
+
+
+def _deflate(raw: bytes, at: int) -> bytes:
+    return zlib.compress(raw[at * STRIPE_PIXELS:(at + 1) * STRIPE_PIXELS], _COMPRESS_LEVEL)
+
+
+def choose_stripes(raw: bytes, shown: bytes | None, tick: int, allowed: int,
+                   min_diff: float = DELTA_MAX_DIFF) -> list[bytes]:
+    """The compressed stripes of `raw` that are worth sending, within `allowed` bytes.
+
+    `shown` is what the device has been sent so far, or None before the first
+    frame, when everything goes. An entry that is not sent is empty, which the
+    length table describes as length zero and the device leaves alone.
+
+    One stripe is refreshed regardless, in turn (`tick`), and it is not counted
+    against `allowed`: it is what repairs a stripe the device lost a whole frame
+    of, and what makes a frame with nothing new still a frame.
+
+    The rest are ranked by how many pixels differ from what the device has, and
+    sent biggest-change first until the next one would not fit. A stripe that
+    misses out is not lost and needs no bookkeeping: what the device holds for it
+    is unchanged, so next frame it differs by at least as much and ranks at least
+    as high. Compression happens once, on the stripes actually considered.
+    """
+    if len(raw) != FRAME_PIXELS:
+        raise ValueError(f"frame is {len(raw)} bytes, expected {FRAME_PIXELS}")
+    if shown is None:
+        return compress_stripes(raw)
+    floor = int(STRIPE_PIXELS * min_diff)
+    refresh = tick % STRIPES
+    out = [b""] * STRIPES
+    out[refresh] = _deflate(raw, refresh)
+    spent = _HEADER.size + 2 * STRIPES + len(out[refresh])
+    ranked = []
+    for at in range(STRIPES):
+        if at == refresh:
+            continue
+        lo, hi = at * STRIPE_PIXELS, (at + 1) * STRIPE_PIXELS
+        changed = differing_pixels(raw[lo:hi], shown[lo:hi])
+        if changed > floor:
+            ranked.append((-changed, at))
+    ranked.sort()
+    for _, at in ranked:
+        z = _deflate(raw, at)
+        if spent + len(z) > allowed:
+            continue
+        out[at] = z
+        spent += len(z)
+    return out
+
+
+def apply_stripes(raw: bytes, shown: bytes | None, sent: list[bytes]) -> bytes:
+    """What the device shows after receiving `sent`: `shown` with those stripes of
+    `raw` written over it."""
+    merged = bytearray(shown if shown is not None else raw)
+    for at, stripe in enumerate(sent):
+        if stripe:
+            lo = at * STRIPE_PIXELS
+            merged[lo:lo + STRIPE_PIXELS] = raw[lo:lo + STRIPE_PIXELS]
+    return bytes(merged)
 
 
 def packet(first: int, compressed: list[bytes]) -> bytes:
@@ -197,7 +358,12 @@ def frame_packets(frame: bytes) -> list[bytes]:
     nothing to split it into -- which is why the per-stripe sizes are checked
     against the protocol ceiling as well.
     """
-    compressed = compress_stripes(frame)
+    return pack_stripes(compress_stripes(frame))
+
+
+def pack_stripes(compressed: list[bytes]) -> list[bytes]:
+    """Pack already-compressed stripes into packets. An empty entry is a stripe
+    that is not being sent this frame; it takes two bytes of length table."""
     packets: list[bytes] = []
     run: list[bytes] = []
     run_bytes = 0

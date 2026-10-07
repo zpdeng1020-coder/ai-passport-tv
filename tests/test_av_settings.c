@@ -19,7 +19,12 @@ static void check(int condition, const char *what)
 
 static void test_levels_are_ordered_and_in_range(void)
 {
-    check(AV_BRIGHTNESS_COUNT == 5, "five levels as chosen");
+    check(AV_BRIGHTNESS_COUNT == 10, "ten levels as chosen");
+    check(AV_BRIGHTNESS_LEVELS[0] == 100, "the brightest level is 100%");
+    for (unsigned i = 1; i < AV_BRIGHTNESS_COUNT; i++) {
+        check(AV_BRIGHTNESS_LEVELS[i - 1] - AV_BRIGHTNESS_LEVELS[i] == 10,
+              "levels are 10% apart");
+    }
     for (unsigned i = 0; i < AV_BRIGHTNESS_COUNT; i++) {
         uint8_t level = AV_BRIGHTNESS_LEVELS[i];
         check(level > 0 && level <= 100, "every level is a usable percentage");
@@ -97,11 +102,11 @@ static void test_nearest_index_finds_every_level(void)
 
 static void test_nearest_index_handles_values_between_levels(void)
 {
-    // 75 is 5 below 80 and 15 above 60, so it belongs to 80 (index 1).
-    check(av_brightness_nearest_index(75) == 1, "a value between levels picks the closer one");
-    // 50 is 10 from both 60 and 40. Ties must resolve to something stable, and
+    // 73 is 3 above 70 and 7 below 80, so it belongs to 70 (index 3).
+    check(av_brightness_nearest_index(73) == 3, "a value between levels picks the closer one");
+    // 75 is 5 from both 80 and 70. Ties must resolve to something stable, and
     // the first match wins, which is the brighter of the two.
-    check(av_brightness_nearest_index(50) == 1 || av_brightness_nearest_index(50) == 2,
+    check(av_brightness_nearest_index(75) == 2 || av_brightness_nearest_index(75) == 3,
           "a tie resolves to one of the adjacent levels");
     check(av_brightness_nearest_index(0) == AV_BRIGHTNESS_COUNT - 1,
           "zero maps to the dimmest level, never below it");
@@ -111,7 +116,8 @@ static void test_nearest_index_handles_values_between_levels(void)
 static void test_valid_percent_rejects_anything_not_a_level(void)
 {
     check(av_brightness_valid_percent(100), "100 is a level");
-    check(av_brightness_valid_percent(20), "20 is a level");
+    check(av_brightness_valid_percent(50), "50 is a level");
+    check(av_brightness_valid_percent(10), "10 is a level");
     check(!av_brightness_valid_percent(0), "0 is not a level");
     check(!av_brightness_valid_percent(55), "an in-between value is not a level");
 }
@@ -122,6 +128,7 @@ static void test_default_is_a_real_level(void)
     // otherwise a fresh device would be rejected by its own check.
     check(av_brightness_valid_percent((uint8_t)AV_BRIGHTNESS_DEFAULT_PERCENT),
           "the default brightness is one of the levels");
+    check(AV_BRIGHTNESS_DEFAULT_PERCENT == 50u, "the default brightness is 50%");
 }
 
 int main(void)

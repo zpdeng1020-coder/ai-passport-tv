@@ -20,10 +20,20 @@
 // entry point is used; the mem_to_mem convenience wrapper puts an 11 KB
 // tinfl_decompressor on the caller's stack, and this task has four kilobytes.
 #include "miniz.h"
+// The compressed stripes the hardware benchmark inflates, generated on the host
+// because the ROM's tdefl cannot run here. Included unconditionally: it is
+// inert data and the compiler drops it when the benchmark is off, so guarding
+// the include would only add a second place that knows the option.
+#include "bench_blobs.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+// esp_cpu_get_cycle_count(), used only by the hardware benchmark to turn its
+// work into cycles per byte and cycles per pixel. Included unconditionally
+// because the header is free and a conditional include would be a second place
+// that knows which option is on.
+#include "esp_cpu.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -158,14 +168,15 @@ _Static_assert(AV_WIDTH == BSP_LCD_H && AV_HEIGHT == BSP_LCD_W, "Landscape geome
 _Static_assert(AV_PALETTE_ENTRIES == 256, "An 8-bit index needs 256 colours");
 // The panel's floor, and it is asserted rather than trusted because the
 // expression printing it has been wrong twice in the same direction: 3 ms for a
-// bus that takes 30.7. A byte is eight bits and the clock is in Hz; leave the
-// eight out and the floor reads a tenth of the truth, which is worse than no
-// number at all because every later judgement is made against it.
+// bus that takes 15.4 (then 30.7, at the old 40 MHz clock). A byte is eight bits
+// and the clock is in Hz; leave the eight out and the floor reads a tenth of the
+// truth, which is worse than no number at all because every later judgement is
+// made against it.
 //
-// 320*240*2*8 bits at 40 MHz is 30720 us. Checked as a millisecond figure with
-// a tolerance of one, since the integer division in the log line truncates.
+// 320*240*2*8 bits at 80 MHz is 15360 us. Checked as a whole millisecond figure,
+// since the integer division truncates it to 15.
 #define PANEL_FLOOR_MS ((AV_WIDTH * AV_HEIGHT * 2 * 8) * 1000u / BSP_LCD_PCLK_HZ)
-_Static_assert(PANEL_FLOOR_MS == 30u,
+_Static_assert(PANEL_FLOOR_MS == 15u,
                "The panel floor changed: every per-frame figure is compared against it");
 static const char *TAG = "av_raw";
 // What a session knows about reaching the server.
@@ -188,19 +199,32 @@ typedef enum {
     LINK_DOWN,
 } link_state_t;
 
-typedef struct { uint32_t pts; uint8_t pcm[AV_AUDIO_BYTES]; } audio_t;
+// One audio packet as it arrived: IMA ADPCM, decoded to PCM by the audio task
+// just before it is written. The queue holds the compressed form, 324 bytes a
+// chunk against the 1280 of the PCM it stands for.
+typedef struct { uint32_t pts; uint8_t block[AV_AUDIO_BYTES]; } audio_t;
 // One packet, as the transmitter sends it. A frame is several of these and the
 // receiver gathers them into the session's buffers; `slot` is which one this is
 // and `parts` how many make up the frame, which is known only once the last has
 // arrived. `bytes` is the frame's compressed size, summed as it lands, and it is
 // the number that says how much has to be inflated for each picture drawn.
+//
+// The unit that crosses from the receiver to the picture task is one STRIPE, not
+// one packet. A packet used to be read whole into a buffer sized for the worst
+// case (22 KB, two of them) although a stripe is about 1 KB and a packet about
+// 12: the receiver now reads the length table, then each stripe straight into a
+// small byte ring, and the picture task inflates from the ring. `data` is NULL
+// for a stripe of length zero (already on the panel) and for one that was
+// dropped because the ring stayed full.
 typedef struct {
-    uint8_t *jpeg; uint32_t length, pts;
-    // True only on the packet that opens a frame. Every packet of a frame
+    uint8_t *data; uint16_t length; uint8_t stripe;
+    uint32_t pts;
+    // True only on the stripe that opens a frame. Every packet of a frame
     // carries the frame's presentation time, so this is what says which of
     // them the clock is waited on for: waiting on each of the five waited for
     // a moment that had already passed. See video_task.
     bool frame_start;
+    bool packet_start, packet_end, dropped;
 } video_t;
 // A queued button gesture. Carrying the event type (not just the key) is what
 // lets a click mean "next channel" while a long press means "volume".
@@ -214,7 +238,7 @@ typedef struct { bsp_btn_t key; bsp_btn_ev_t ev; } key_ev_t;
 typedef struct { char id[AV_CHANNEL_ID_MAX]; char name[UI_MENU_NAME_MAX]; } channel_t;
 typedef struct {
     EventGroupHandle_t events;
-    QueueHandle_t audio, video, free_video, keys;
+    QueueHandle_t audio, video, keys;
     // jpeg[] holds incoming video payloads and stripe[] the panel rows built
     // from them. One stripe buffer is enough now that each stripe is drawn
     // complete before the next is touched: the old pair existed because a
@@ -254,7 +278,14 @@ typedef struct {
     // What it costs is 10 KB of a heap with none to spare -- the packet buffers
     // had to be cut from three to two to pay for it, and that cut is visible as
     // 141 dropped frames against 38. Reverted.
-    uint8_t *jpeg[AV_VIDEO_BUFFERS], *stripe[2];
+    uint8_t *stripe[2];
+    // The byte ring the receiver fills with compressed stripes and the picture
+    // task drains. `ring_head` belongs to the receiver alone; `ring_tail` is the
+    // end of the last stripe the picture task finished with, and `ring_inflight`
+    // counts stripes whose bytes are still in the ring.
+    uint8_t *ring;
+    uint32_t ring_head;
+    atomic_uint_least32_t ring_tail, ring_inflight;
     // Which of the two the next stripe is built in. They alternate; a stripe
     // is only overwritten once the transfer that read it has been drained.
     unsigned stripe_next;
@@ -269,7 +300,9 @@ typedef struct {
     // reach a channel.
     tinfl_decompressor *inflate;
     // The colours a 256-index picture is drawn with, sent by the server before
-    // the first frame because the palette is chosen per channel.
+    // the first frame because the palette is chosen per channel. Held in WIRE
+    // order (each entry byte-swapped, see av_palette_wire_order), which is what
+    // av_expand_indexed_wire reads; nothing else uses this table.
     uint16_t palette[AV_PALETTE_ENTRIES];
     bool palette_ready;
     // Stripes drawn since the current frame began. A frame arrives as several
@@ -339,6 +372,9 @@ typedef struct {
     // not the link's: the two differ by everything thrown away, and telling them
     // apart is the difference between "the network is slow" and "we are slow".
     atomic_uint_least32_t rx_video_bytes, rx_video_packets, rx_audio_packets;
+    // One-second readings for the screen, written by the session loop: frames a
+    // second times ten, and bytes a second off the socket, audio included.
+    atomic_uint_least32_t fps_x10, rx_bytes_per_s;
     // Where the receive task's time actually goes, in microseconds, measured
     // rather than reasoned about. The three parts answer three different
     // questions and want three different fixes: `io` is time inside recv(),
@@ -347,6 +383,26 @@ typedef struct {
     // loop, which is this chip being slow. Without the split every one of those
     // looks the same from outside -- the picture does not arrive fast enough.
     atomic_uint_least32_t rx_io_us, rx_wait_us, rx_overhead_us, rx_iterations;
+#ifdef CONFIG_AV_HW_BENCH
+    // Cycles the receive loop actually spent inside its socket reads, and the
+    // bytes those reads produced. The handoff's step 3 exists because "how much
+    // CPU does receiving cost" was the least certain figure in the whole plan --
+    // estimated at 20 to 36 cycles a byte and never observed.
+    //
+    // Counted here rather than with an idle spin task, which is what the
+    // handoff proposed. Two reasons. This board's task watchdog (5 s) checks the
+    // idle task, so a lowest-priority task that never blocks would starve idle
+    // and reset the chip rather than measure it; and a spin task measures the
+    // whole system's stolen cycles, which then has to be attributed back to
+    // causes by inference. Counting inside the read attributes nothing: it is
+    // the cycles that read cost, and the count is reported beside the bytes that
+    // came out of it.
+    //
+    // What it does NOT include is stated where it is reported: lwIP's own work
+    // for packets this loop never asks for, and any Wi-Fi driver time spent
+    // outside this task's context.
+    atomic_uint_least32_t rx_cycles;
+#endif
     // Why frames do not finish.
     //
     // `decoded` counts completed pictures and `dropped` counts the ones thrown
@@ -446,6 +502,11 @@ static char shown_channel[AV_CHANNEL_ID_MAX];
 // draw the waiting screen even though its channel id is still empty and equals
 // shown_channel. See the use site.
 static bool waiting_drawn;
+// Whether the black bars above and below the picture currently carry readings,
+// and when they were last painted. The picture never covers the bars, so during
+// playback they are only touched by refresh_info_bars().
+static bool bars_drawn;
+static int64_t bars_painted_us;
 // Which overlay the waiting screen was last painted with, and when.
 //
 // The waiting screen is a still image, so it is painted when something it shows
@@ -494,6 +555,50 @@ static bool rx_done(void) { return xEventGroupGetBits(s.events) & RX_DONE; }
 static void fail(const char *reason) {
     ESP_LOGW(TAG, "Session reset: %s", reason); // Never log remote JSON/secrets.
     xEventGroupSetBits(s.events, STOP);
+}
+// Sized by what a frame costs, not by the largest packet the protocol allows:
+// a frame is about 12-18 KB of stripes and this holds most of one, and the
+// receiver waits briefly for space rather than dropping.
+#ifndef AV_VIDEO_RING_BYTES
+#define AV_VIDEO_RING_BYTES 16384u
+#endif
+// Stripes (including empty ones) that can be queued between the two tasks.
+#define AV_VIDEO_ITEMS 32u
+// Largest compressed stripe accepted. 3840 index bytes stored raw by zlib come
+// to about 3.86 KB, so anything above this is not something the server cut.
+#define AV_STRIPE_CMAX 4096u
+// How long the receiver waits for ring or queue space before giving a stripe up.
+#define AV_VIDEO_WAIT_US 100000
+// One producer (receiver), one consumer (picture task). Allocation is
+// contiguous, wrapping to the start when the tail of the ring is too short, and
+// frees happen in the order of allocation, so `ring_tail` is always the start of
+// the oldest stripe still held.
+static bool ring_alloc(uint32_t n, uint32_t *off) {
+    n=(n+3u)&~3u;
+    const uint32_t cap=AV_VIDEO_RING_BYTES;
+    if(atomic_load(&s.ring_inflight)==0) { s.ring_head=0; atomic_store(&s.ring_tail,0u); }
+    uint32_t head=s.ring_head, tail=atomic_load(&s.ring_tail);
+    if(head>=tail) {
+        if(cap-head>=n) { *off=head; s.ring_head=head+n; return true; }
+        if(tail>n) { *off=0; s.ring_head=n; return true; }
+        return false;
+    }
+    if(tail-head>n) { *off=head; s.ring_head=head+n; return true; }
+    return false;
+}
+static void ring_release(const video_t *v) {
+    uint32_t end=(uint32_t)(v->data-s.ring)+(((uint32_t)v->length+3u)&~3u);
+    atomic_store(&s.ring_tail,end);
+    atomic_fetch_sub(&s.ring_inflight,1u);
+}
+static bool video_enqueue(const video_t *v) {
+    int64_t give_up=esp_timer_get_time()+AV_VIDEO_WAIT_US*2;
+    while(!stopping()) {
+        if(xQueueSend(s.video,v,0)) return true;
+        if(esp_timer_get_time()>=give_up) return false;
+        vTaskDelay(1);
+    }
+    return false;
 }
 static bool delay_until(int64_t us) {
     while (!stopping() && esp_timer_get_time()<us) vTaskDelay(pdMS_TO_TICKS(5));
@@ -626,6 +731,17 @@ static bool usb_until(void *buf, size_t n, bool sending, int64_t deadline) {
 }
 
 // Socket owner only. An absolute deadline also covers all discard fragments.
+// A single syscall's cost, in core cycles. Declared here rather than beside the
+// benchmark block further down because io_until() needs it and that is far
+// earlier in the file; the guard matches the only place that calls it.
+//
+// esp_cpu_get_cycle_count() advances every clock whether the core is working or
+// not, so it must wrap a specific operation and never a blocking wait -- around
+// a recv() it measures the copy lwIP did, around the loop that contains one it
+// would measure wall time instead.
+#ifdef CONFIG_AV_HW_BENCH
+static inline uint32_t bench_cycles(void) { return esp_cpu_get_cycle_count(); }
+#endif
 static bool io_until(int fd, void *buf, size_t n, bool sending, int64_t deadline) {
     if (transport_is_usb(fd)) return usb_until(buf,n,sending,deadline);
     size_t off=0;
@@ -633,7 +749,25 @@ static bool io_until(int fd, void *buf, size_t n, bool sending, int64_t deadline
     const char *reason="deadline";
     int error=0;
     while (off<n && !stopping() && esp_timer_get_time()<deadline) {
+#ifdef CONFIG_AV_HW_BENCH
+        // Cycles around one syscall, not around the whole loop.
+        //
+        // esp_cpu_get_cycle_count() advances every clock whether the core is
+        // working or not, so a difference taken across io_until() would be wall
+        // time -- it would include the select() waits, and the inflate running
+        // on the other task while this one is descheduled. None of that is
+        // receive work.
+        //
+        // These sockets are non-blocking -- the EAGAIN branch below is the proof
+        // -- so a single recv() returns promptly having either copied bytes or
+        // found none, and what it costs is lwIP walking the segment and copying
+        // it. That is exactly the figure the handoff wanted and never had.
+        uint32_t cycles_before=bench_cycles();
         ssize_t r=sending ? send(fd,(uint8_t *)buf+off,n-off,0) : recv(fd,(uint8_t *)buf+off,n-off,0);
+        atomic_fetch_add(&s.rx_cycles, bench_cycles()-cycles_before);
+#else
+        ssize_t r=sending ? send(fd,(uint8_t *)buf+off,n-off,0) : recv(fd,(uint8_t *)buf+off,n-off,0);
+#endif
         if (r>0) off+=(size_t)r;
         else if (r==0) { reason="EOF"; break; }
         else if (errno!=EAGAIN && errno!=EWOULDBLOCK && errno!=EINTR) {
@@ -737,7 +871,12 @@ static int connect_server(void) {
     // unless a build turns it on. See CONFIG_AV_USB_TRANSPORT.
 #ifdef CONFIG_AV_USB_TRANSPORT
     if (usb_serial_jtag_is_driver_installed() && usb_serial_jtag_is_connected()) {
-        ESP_LOGI(TAG,"Transport: USB (host connected)");
+        // Whatever the host wrote before this session began belongs to a
+        // session that is over. The ring is not flushed by a session ending, and
+        // a header read that lands in the middle of old media never resyncs.
+        uint8_t stale[64]; unsigned dropped=0; int got;
+        while ((got=usb_serial_jtag_read_bytes(stale,sizeof(stale),0))>0) dropped+=(unsigned)got;
+        ESP_LOGI(TAG,"Transport: USB (host connected), dropped %u stale bytes",dropped);
         atomic_store(&s.link,(int)LINK_UP);
         return AV_TRANSPORT_USB;
     }
@@ -798,6 +937,18 @@ static bool json_between(const cJSON *j, const char *key, uint32_t low, uint32_t
     const cJSON *v=cJSON_GetObjectItemCaseSensitive(j,key);
     return cJSON_IsNumber(v) && v->valuedouble>=(double)low && v->valuedouble<=(double)high;
 }
+static bool json_string(const cJSON *j, const char *key, const char *expected) {
+    const cJSON *v=cJSON_GetObjectItemCaseSensitive(j,key);
+    return cJSON_IsString(v) && v->valuestring && !strcmp(v->valuestring,expected);
+}
+// The product refuses an announced rate above 30. A measurement build that
+// carries the media over USB lifts that, so the cable can be pushed past what the
+// panel was sized for and the point where it stops keeping up can be found.
+#ifdef CONFIG_AV_USB_TRANSPORT
+#define AV_CONFIG_FPS_MAX 60
+#else
+#define AV_CONFIG_FPS_MAX 30
+#endif
 static bool config_valid(char *buf, size_t n, uint32_t session) {
     if (!av_json_depth_safe(buf,n,4)) {
         ESP_LOGW(TAG,"CONFIG rejected: json depth/parse guard");
@@ -820,8 +971,14 @@ static bool config_valid(char *buf, size_t n, uint32_t session) {
         //
         // The bounds still catch a server sending nonsense, and the ceiling
         // keeps a stream from announcing a rate the panel could never draw.
-        json_between(j,"fps",1,30) && json_number(j,"sample_rate",16000) && json_number(j,"channels",1) &&
-        json_number(j,"sample_bits",16) && json_number(j,"audio_chunk_ms",AV_AUDIO_MS) &&
+        json_between(j,"fps",1,AV_CONFIG_FPS_MAX) && json_number(j,"sample_rate",16000) && json_number(j,"channels",1) &&
+        // sample_bits is the decoded sound, not what travels: the packets are
+        // ADPCM, and "audio_codec" is what says so. A server that still sends
+        // PCM would otherwise connect, pass every other check, and be dropped
+        // at its first audio packet for a length no header can have -- with the
+        // log saying nothing about why.
+        json_number(j,"sample_bits",16) && json_string(j,"audio_codec","ima_adpcm") &&
+        json_number(j,"audio_chunk_ms",AV_AUDIO_MS) &&
         json_number(j,"video_max_bytes",AV_VIDEO_MAX) && json_number(j,"session",session) &&
         // The picture's stripe height, not the panel's. The two were the same
         // number until the picture started arriving smaller than the panel, and
@@ -863,6 +1020,11 @@ static bool config_valid(char *buf, size_t n, uint32_t session) {
                 if (!cJSON_IsNumber(v) || v->valuedouble!=(double)want[i])
                     ESP_LOGW(TAG,"CONFIG field %s: server=%d device=%u",names[i],
                              cJSON_IsNumber(v)?(int)v->valuedouble:-1,(unsigned)want[i]);
+            }
+            if (!json_string(j,"audio_codec","ima_adpcm")) {
+                const cJSON *c=cJSON_GetObjectItemCaseSensitive(j,"audio_codec");
+                ESP_LOGW(TAG,"CONFIG field audio_codec: server=%s device=ima_adpcm",
+                         cJSON_IsString(c)&&c->valuestring?c->valuestring:"(missing)");
             }
             const cJSON *ss=cJSON_GetObjectItemCaseSensitive(j,"session");
             if (!cJSON_IsNumber(ss) || ss->valuedouble!=(double)session)
@@ -1059,7 +1221,16 @@ static void receive_task(void *arg) {
         memset(&h,0,sizeof(h));
         if (!io_all(fd,wire,sizeof(wire),false,header_deadline_ms)) break;
         s_rx_stage="header-decode";
-        if(!av_header_decode(wire,&h)) break;
+        if(!av_header_decode(wire,&h)) {
+#ifdef CONFIG_AV_USB_TRANSPORT
+            // A byte lost on the cable shifts every later header, and a bare
+            // "header-decode" cannot tell that from a bad packet.
+            char hex[AV_HEADER_BYTES*3+1];
+            for (unsigned i=0;i<AV_HEADER_BYTES;i++) snprintf(hex+i*3,4,"%02x ",wire[i]);
+            ESP_LOGW(TAG,"RX header rejected: %s",hex);
+#endif
+            break;
+        }
         // The gap is taken here, between two headers that both arrived: a
         // read that timed out ends the session, so it would otherwise be
         // recorded as one enormous gap that means nothing.
@@ -1117,98 +1288,99 @@ static void receive_task(void *arg) {
             if (stopping()) break;
             s_rx_stage="audio-read";
             int64_t io_start=esp_timer_get_time();
-            bool audio_ok=io_all(fd,a.pcm,sizeof(a.pcm),false,AV_READ_DEADLINE_MS);
+            bool audio_ok=io_all(fd,a.block,sizeof(a.block),false,AV_READ_DEADLINE_MS);
             atomic_fetch_add(&s.rx_io_us,(uint32_t)(esp_timer_get_time()-io_start));
             atomic_fetch_add(&s.rx_iterations,1u);
             if (!audio_ok) break;
+            // A header no encoder wrote is a stream that is not the one agreed
+            // in CONFIG; ending the session here is the same rule a malformed
+            // video table gets, and keeps garbage out of the decoder.
+            s_rx_stage="audio-header";
+            if (!av_adpcm_header_valid(a.block)) break;
             atomic_fetch_add(&s.rx_audio_packets,1u);
             if (!xQueueSend(s.audio,&a,0)) { fail("bounded PCM queue full"); break; }
             unsigned q=uxQueueMessagesWaiting(s.audio); if(q>s.audio_high) s.audio_high=q;
         } else if (h.type==AV_VIDEO) {
-            // A frame is several consecutive packets under one timestamp, and
-            // every one of them carries that same timestamp. Which of them
-            // opens the frame is what the video task needs to know, so it is
-            // passed along rather than left to be inferred from the timestamp:
-            // consecutive frames can share one when the frame rate is not a
-            // whole number of milliseconds, and a frame whose start went
-            // unrecognised is a frame nothing waits for.
-            video_t v={0};
-            v.length=h.length; v.pts=h.pts_ms;
-            v.frame_start=!(h.flags&AV_VIDEO_CONTINUES);
-            if(v.frame_start) atomic_fetch_add(&s.rx_frame_starts,1u);
+            // A packet is [first][count][u16 length * count][stripes]. The table
+            // is read first, then each stripe goes straight into the ring, so no
+            // buffer is ever sized for a whole packet. Stripes of one packet are
+            // consecutive on the wire and nothing else may be read between them.
+            const bool frame_start=!(h.flags&AV_VIDEO_CONTINUES);
+            if(frame_start) atomic_fetch_add(&s.rx_frame_starts,1u);
             else atomic_fetch_add(&s.rx_stray_packets,1u);
             atomic_store(&s.media_started,true);
-            if (!xQueueReceive(s.free_video,&v.jpeg,0)) {
-                // No buffer free: the picture task is still holding both.
-                //
-                // Counted separately from the drops the video task makes,
-                // because the two are different faults with different fixes:
-                // this one is the sender outrunning the renderer, and the
-                // other is a frame arriving too late to draw. Both show up as
-                // a frame that never completes, and without this count there
-                // was no way to tell which was happening -- measured, 78
-                // packets arriving against 56 accepted, and nothing in the log
-                // saying where the other 22 went.
-                atomic_fetch_add(&s.rx_nobuf_packets,1u);
-                // Never block audio behind rendering. Discard entire bounded payload.
-                uint8_t discard[256]; uint32_t left=h.length;
-                int64_t deadline=esp_timer_get_time()+1500000;
-                s_rx_stage="video-discard";
-                int64_t io_start=esp_timer_get_time();
-                while (left && !stopping()) {
-                    unsigned n=left<sizeof(discard)?left:sizeof(discard);
-                    if (!io_until(fd,discard,n,false,deadline)) break;
-                    left-=n;
-                }
-                atomic_fetch_add(&s.rx_io_us,(uint32_t)(esp_timer_get_time()-io_start));
-                if (left) break;
-                // Counted once for the frame when it is the frame's opening
-                // packet: what the picture loses is a frame, and counting each
-                // packet of it would report five losses for one missing
-                // picture.
-                if(v.frame_start) s.dropped++;
-                continue;
-            }
-            s_rx_stage="video-read";
-            // Read straight into the packet's payload, with nothing in between.
-            //
-            // There used to be a loop here that drained "whatever audio has
-            // already arrived" before starting the picture, so that a slow
-            // video read would not hold the sound up. It cannot work, and the
-            // reason is the order of the bytes rather than the intent: the
-            // header of this packet has just been read, and the sender writes
-            // a packet's header and payload as one contiguous write
-            // (protocol.py, send_packet). The very next bytes on the socket
-            // are therefore this packet's payload -- never an audio packet.
-            // Anything the loop took, it took out of the payload it was about
-            // to read, so the picture was assembled from bytes 640 further on
-            // and the decoder refused it.
-            //
-            // Measured before it was removed: every session ended in "indexed
-            // stripe decode" with decode_max_ms reading 0, which is the
-            // decoder rejecting the payload before doing any work, and the
-            // picture's own timestamp agreeing exactly with the sound's at the
-            // moment it failed. The fault only appears once picture packets
-            // actually flow, which is why it survived every session in which
-            // they did not.
-            //
-            // The gap this loop was built for is real but it is the sender's
-            // to close, and the sender closes it: the frame's packets are
-            // separated by audio whenever a chunk falls due mid-frame. Reading
-            // one packet at a time in order is what makes that work.
+            s_rx_stage="video-table";
             int64_t io_start=esp_timer_get_time();
-            bool video_ok=io_all(fd,v.jpeg,v.length,false,AV_READ_DEADLINE_MS);
-            atomic_fetch_add(&s.rx_io_us,(uint32_t)(esp_timer_get_time()-io_start));
-            atomic_fetch_add(&s.rx_iterations,1u);
-            if (!video_ok) {
-                xQueueSend(s.free_video,&v.jpeg,0); break;
+            int64_t wait_total=0;
+            uint8_t table[2+2*AV_STRIPES_PER_PACKET];
+            uint16_t len[AV_STRIPES_PER_PACKET];
+            unsigned first=0,count=0;
+            uint32_t total=0;
+            if(h.length<2 || !io_all(fd,table,2,false,AV_READ_DEADLINE_MS)) break;
+            first=table[0]; count=table[1];
+            if(!count || count>AV_STRIPES_PER_PACKET || first>=AV_STRIPES || first+count>AV_STRIPES
+               || h.length<2u+2u*count) break;
+            if(!io_all(fd,table+2,2u*count,false,AV_READ_DEADLINE_MS)) break;
+            for(unsigned i=0;i<count;i++) {
+                len[i]=(uint16_t)(((unsigned)table[2+2*i]<<8)|table[3+2*i]);
+                if(len[i]>AV_STRIPE_CMAX) goto done;
+                total+=len[i];
             }
+            // The lengths must account for the payload exactly, as av_video_decode
+            // requires: a frame that does not add up is not the one that was sent.
+            if(total!=h.length-(2u+2u*count)) break;
+            bool nobuf=false;
+            for(unsigned n=0;n<count;n++) {
+                video_t v={.data=NULL,.length=len[n],.stripe=(uint8_t)(first+n),.pts=h.pts_ms,
+                           .frame_start=frame_start && n==0,.packet_start=(n==0),
+                           .packet_end=(n+1==count),.dropped=false};
+                if(len[n]) {
+                    s_rx_stage="video-ring";
+                    uint32_t off=0;
+                    bool got=false;
+                    int64_t wait0=esp_timer_get_time();
+                    int64_t give_up=wait0+AV_VIDEO_WAIT_US;
+                    while(!stopping()) {
+                        if(uxQueueSpacesAvailable(s.video)>0 && ring_alloc(len[n],&off)) { got=true; break; }
+                        if(esp_timer_get_time()>=give_up) break;
+                        vTaskDelay(1);
+                    }
+                    int64_t waited=esp_timer_get_time()-wait0;
+                    wait_total+=waited;
+                    atomic_fetch_add(&s.rx_wait_us,(uint32_t)waited);
+                    if(stopping()) goto done;
+                    if(got) {
+                        s_rx_stage="video-read";
+                        if(!io_all(fd,s.ring+off,len[n],false,AV_READ_DEADLINE_MS)) goto done;
+                        v.data=s.ring+off;
+                        atomic_fetch_add(&s.ring_inflight,1u);
+                    } else {
+                        // No room: the picture task is behind. Discard this
+                        // stripe's bytes and say so with a marker, so the frame
+                        // is counted incomplete and its start is not lost.
+                        s_rx_stage="video-discard";
+                        uint8_t discard[256]; uint32_t left=len[n];
+                        int64_t deadline=esp_timer_get_time()+1500000;
+                        while (left && !stopping()) {
+                            unsigned k=left<sizeof(discard)?left:sizeof(discard);
+                            if (!io_until(fd,discard,k,false,deadline)) goto done;
+                            left-=k;
+                        }
+                        v.length=0; v.dropped=true; nobuf=true;
+                    }
+                }
+                if(!video_enqueue(&v)) {
+                    if(v.data) atomic_fetch_sub(&s.ring_inflight,1u);
+                    goto done;
+                }
+            }
+            atomic_fetch_add(&s.rx_io_us,(uint32_t)(esp_timer_get_time()-io_start-wait_total));
+            atomic_fetch_add(&s.rx_iterations,1u);
             atomic_fetch_add(&s.rx_video_packets,1u);
-            atomic_fetch_add(&s.rx_video_bytes,v.length);
-            if (!xQueueSend(s.video,&v,0)) {
-                xQueueSend(s.free_video,&v.jpeg,0);
-                if(v.frame_start) s.dropped++;
-                continue;
+            atomic_fetch_add(&s.rx_video_bytes,h.length);
+            if(nobuf) {
+                atomic_fetch_add(&s.rx_nobuf_packets,1u);
+                if(frame_start) s.dropped++;
             }
             unsigned q=uxQueueMessagesWaiting(s.video); if(q>s.video_high) s.video_high=q;
         } else if (h.type==AV_PALETTE) {
@@ -1220,6 +1392,7 @@ static void receive_task(void *arg) {
             s_rx_stage="palette-read";
             if (!io_all(fd,raw,sizeof(raw),false,AV_READ_DEADLINE_MS)) break;
             av_palette_decode(raw,s.palette);
+            av_palette_wire_order(s.palette);
             s.palette_ready=true;
         } else if (h.type==AV_END) { clean=true; break; }
     }
@@ -1249,9 +1422,12 @@ static void audio_task(void *arg) {
     opened=true; bsp_audio_set_mute(true); bsp_audio_set_volume(s.volume);
     // Clear any prior-session DMA audio while muted. >90ms, finite writes.
     audio_t a={0};
+    // What the codec is fed. The queue holds ADPCM; this is the one chunk of it
+    // that has been expanded, and it is also the silence buffer.
+    int16_t pcm[AV_AUDIO_SAMPLES]={0};
     for (int i=0;i<6 && !stopping();i++) {
         size_t written=0;
-        if (bsp_audio_write_timeout(a.pcm,sizeof(a.pcm),&written,100)!=ESP_OK || written!=sizeof(a.pcm)) {
+        if (bsp_audio_write_timeout(pcm,sizeof(pcm),&written,100)!=ESP_OK || written!=sizeof(pcm)) {
             fail("I2S reset write"); goto done;
         }
     }
@@ -1326,15 +1502,19 @@ static void audio_task(void *arg) {
                     starved_ms);
                 fail("audio starved beyond budget; reconnect/rebuffer"); break;
             }
-            // The chunk that is fed instead of a real one. `a` already holds the
+            // The chunk that is fed instead of a real one. `pcm` still holds the
             // last one that played, so it is zeroed rather than left as it was
             // -- feeding the previous chunk again would repeat 40 ms of sound.
-            memset(a.pcm,0,sizeof(a.pcm));
+            memset(pcm,0,sizeof(pcm));
             silent=true;
         } else {
             starved_since=0;
             starved_reported=false;
             silent=false;
+            // Each block carries its own decoder state, so no state is kept
+            // from one chunk to the next, and a stretch of silence in between
+            // leaves nothing for the next block to inherit.
+            av_adpcm_decode(a.block,AV_AUDIO_SAMPLES,pcm);
         }
         if (!unmuted) {
             unmuted=true;
@@ -1357,7 +1537,7 @@ static void audio_task(void *arg) {
             if (gap>AUDIO_FEED_GAP_MS) { fail("audio feed gap exceeds DMA budget"); break; }
         }
         size_t written=0;
-        esp_err_t e=bsp_audio_write_timeout(a.pcm,sizeof(a.pcm),&written,100);
+        esp_err_t e=bsp_audio_write_timeout(pcm,sizeof(pcm),&written,100);
         taskENTER_CRITICAL(&clock_lock);
         s.submitted_samples+=written/2;
         // Charged apart. This write went to the codec and really did play, so
@@ -1367,7 +1547,7 @@ static void audio_task(void *arg) {
         if(silent) s.silence_samples+=written/2;
         taskEXIT_CRITICAL(&clock_lock);
         last_feed=esp_timer_get_time();
-        if (e!=ESP_OK || written!=sizeof(a.pcm)) { fail("I2S timeout/partial write"); break; }
+        if (e!=ESP_OK || written!=sizeof(pcm)) { fail("I2S timeout/partial write"); break; }
     }
     if (!stopping()) delay_until(esp_timer_get_time()+100000); // Estimated final drain.
 done:
@@ -1375,6 +1555,8 @@ done:
         bsp_audio_set_mute(true);
         if (bsp_audio_stream_close()!=ESP_OK) fail("codec close");
     }
+    ESP_LOGI(TAG,"audio task stack high-water=%u bytes free",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     xEventGroupSetBits(s.events,AUDIO_DONE);
     vTaskDelete(NULL);
 }
@@ -1495,6 +1677,123 @@ static unsigned wifi_bars(void) {
     return 1;
 }
 
+static void drain_display(void);
+
+// Readings for the black bars around the picture, drawn into whichever stripe
+// overlaps a bar and nothing else. The picture covers rows
+// [AV_VIDEO_Y_OFFSET, AV_HEIGHT-AV_VIDEO_Y_OFFSET), so these rows belong to the
+// overlay alone: WiFi and battery in the top bar, frame rate and receive rate in
+// the bottom one. A bar too thin to hold a line of text is left alone.
+static void info_bars_stripe(ui_surface_t surface) {
+    // Text sits 16 px from each edge: the panel's corners are rounded, and the
+    // bars are exactly where they cut in.
+    const int edge=UI_TEXT_PAD_X+2+8;   // half a 16 px glyph
+    const int bar=(int)AV_VIDEO_Y_OFFSET;
+    const int box_h=(int)UI_TEXT_LINE_H+2*UI_TEXT_PAD_Y;
+    if (bar<box_h) return;
+    const int first=surface.origin_y, last=surface.origin_y+surface.rows;
+    const int pad=(bar-(int)UI_TEXT_LINE_H)/2;
+    char text[24];
+
+    const int top_y=pad;
+    if (first<bar && last>top_y-UI_TEXT_PAD_Y) {
+        unsigned bars=wifi_bars();
+        if (bars) snprintf(text,sizeof(text),"WiFi %u/4",bars);
+        else snprintf(text,sizeof(text),"WiFi --");
+        ui_text_draw(surface,edge,top_y,text,UI_COLOR_DIM,UI_COLOR_BOX);
+        int soc=atomic_load(&s.battery_soc);
+        if (soc>=0) snprintf(text,sizeof(text),"Battery %d%%",soc);
+        else snprintf(text,sizeof(text),"Battery --");
+        ui_text_draw(surface,(int)AV_WIDTH-edge-ui_text_width(text),top_y,
+                     text,UI_COLOR_DIM,UI_COLOR_BOX);
+    }
+
+    const int bottom=(int)AV_HEIGHT-bar;
+    const int bottom_y=bottom+pad;
+    if (last>bottom) {
+        // Cleared first: the list's last row can run into this band on a screen
+        // that paints the whole height, and it must not show through.
+        ui_text_fill(surface,0,bottom,(int)AV_WIDTH,bar,UI_COLOR_BOX);
+        uint32_t fps=atomic_load(&s.fps_x10);
+        snprintf(text,sizeof(text),"FPS %u.%u",(unsigned)(fps/10u),(unsigned)(fps%10u));
+        ui_text_draw(surface,edge,bottom_y,text,UI_COLOR_DIM,UI_COLOR_BOX);
+        snprintf(text,sizeof(text),"Net %u KB/s",
+                 (unsigned)((atomic_load(&s.rx_bytes_per_s)+512u)/1024u));
+        ui_text_draw(surface,(int)AV_WIDTH-edge-ui_text_width(text),bottom_y,
+                     text,UI_COLOR_DIM,UI_COLOR_BOX);
+    }
+}
+
+// Draw the channel list's readings on the bars, or blank them, between frames.
+// Called from the video task, which owns the panel: the queue is drained first so
+// the stripe buffer is free, then each band is built in s.stripe[0] and sent the
+// way the first frame blackens the bars. Does nothing until the picture owns the
+// panel; before that the waiting screen paints the bars itself.
+static bool refresh_info_bars(void) {
+    if (!atomic_load(&s.media_started)) return true;
+    const bool want=s.menu.view==UI_VIEW_MENU;
+    const int64_t now=esp_timer_get_time();
+    if (want) {
+        if (bars_drawn && now-bars_painted_us<1000000) return true;
+    } else if (!bars_drawn) {
+        return true;
+    }
+    const unsigned bar=(unsigned)AV_VIDEO_Y_OFFSET;
+    if (bar==0) return true;
+    drain_display();
+    const unsigned starts[2]={0u,(unsigned)AV_HEIGHT-bar};
+    for (unsigned b=0;b<2;b++) {
+        for (unsigned y=starts[b];y<starts[b]+bar;y+=AV_STRIPE_ROWS) {
+            unsigned rows=starts[b]+bar-y;
+            if (rows>AV_STRIPE_ROWS) rows=AV_STRIPE_ROWS;
+            memset(s.stripe[0],0,STRIPE_BYTES);
+            if (want) info_bars_stripe(stripe_surface(y,s.stripe[0]));
+            if (bsp_display_raw_submit_nowait(y,rows,s.stripe[0])!=ESP_OK ||
+                bsp_display_raw_drain(1,200)!=ESP_OK) {
+                fail("info bar DMA");
+                return false;
+            }
+        }
+    }
+    bars_drawn=want;
+    bars_painted_us=now;
+    return true;
+}
+
+// The status page's text, rebuilt at most once a second and read by every
+// stripe. Only the video task touches it: both callers of overlay_stripe run
+// there.
+#define STATUS_LINES 4u
+static char status_text[STATUS_LINES][UI_MENU_NAME_MAX+24];
+static int64_t status_text_us;
+static bool status_text_valid;
+
+static void refresh_status_text(void) {
+    const int64_t now=esp_timer_get_time();
+    if (status_text_valid && now-status_text_us<1000000) return;
+    status_text_valid=true;
+    status_text_us=now;
+
+    // Copied out under the table lock: the receive task may be replacing the
+    // table while this runs.
+    char name[UI_MENU_NAME_MAX];
+    current_channel_name(name,sizeof(name));
+    snprintf(status_text[0],sizeof(status_text[0]),"Channel  %s",name);
+
+    unsigned bars=wifi_bars();
+    if (bars) snprintf(status_text[1],sizeof(status_text[1]),"WiFi     %u/4",bars);
+    else snprintf(status_text[1],sizeof(status_text[1]),"WiFi     --");
+
+    int soc=atomic_load(&s.battery_soc);
+    if (soc>=0) snprintf(status_text[2],sizeof(status_text[2]),"Battery  %d%%",soc);
+    else snprintf(status_text[2],sizeof(status_text[2]),"Battery  --");
+
+    // It says "WiFi" rather than "network" because that is the word on the
+    // setup page the viewer will land on, and it says which arrow because the
+    // other one does nothing here.
+    snprintf(status_text[3],sizeof(status_text[3]),"Hold UP: set up WiFi");
+}
+
 // Draw one stripe's worth of overlay, if this stripe is one the overlay occupies.
 // Everything is positioned from absolute screen rows so a stripe can be drawn in
 // isolation without knowing what came before it.
@@ -1577,6 +1876,7 @@ static void overlay_stripe(unsigned stripe_y, uint8_t *pixels) {
                          chosen?UI_COLOR_SELECT_TEXT:UI_COLOR_TEXT,
                          chosen?UI_COLOR_SELECT:UI_COLOR_BOX);
         }
+        info_bars_stripe(surface);
     } else if (s.menu.view==UI_VIEW_BRIGHTNESS) {
         // The backlight page. Deliberately the same shape as the volume
         // indicator: a labelled level over a filled bar, because they are the
@@ -1624,43 +1924,22 @@ static void overlay_stripe(unsigned stripe_y, uint8_t *pixels) {
         if (first<(unsigned)header+1u && last>(unsigned)header) {
             ui_text_fill(surface,0,header,(int)AV_WIDTH,1,UI_COLOR_RULE);
         }
-        // Sized for the label plus a full-length channel name (UI_MENU_NAME_MAX).
-        // The name is bounded by the table, not by this line, so a buffer that
-        // holds only the label is a truncation warning the compiler is right to
-        // raise.
-        char text[UI_MENU_NAME_MAX+24];
         // Four lines: three readings and the gesture that leaves for setup. The
-        // fourth is not decoration -- the setup gesture is a long press on an
+        // last is not decoration -- the setup gesture is a long press on an
         // arrow, which nothing else on this page uses and which nobody would
         // guess, so the page has to say it.
-        for (unsigned i=0;i<4;i++) {
+        //
+        // The text is built once a second by refresh_status_text() and only
+        // drawn here. This runs for every stripe of every frame, and building
+        // the lines in place meant a WiFi driver call and a critical section
+        // several times a frame.
+        refresh_status_text();
+        for (unsigned i=0;i<STATUS_LINES;i++) {
             int y=header+8+(int)i*line;
             if ((int)last<=y-UI_TEXT_PAD_Y || (int)first>=y+(UI_TEXT_LINE_H+UI_TEXT_PAD_Y)) continue;
-            uint16_t colour=UI_COLOR_TEXT;
-            if (i==0) {
-                // Copied out under the table lock: this runs on the video task
-                // while the receive task may be replacing the table.
-                char name[UI_MENU_NAME_MAX];
-                current_channel_name(name,sizeof(name));
-                snprintf(text,sizeof(text),"Channel  %s",name);
-            } else if (i==1) {
-                unsigned bars=wifi_bars();
-                if (bars) snprintf(text,sizeof(text),"WiFi     %u/4",bars);
-                else snprintf(text,sizeof(text),"WiFi     --");
-            } else if (i==2) {
-                int soc=atomic_load(&s.battery_soc);
-                if (soc>=0) snprintf(text,sizeof(text),"Battery  %d%%",soc);
-                else snprintf(text,sizeof(text),"Battery  --");
-            } else {
-                // Dimmed, because it is an instruction rather than a reading.
-                //
-                // It says "WiFi" rather than "network" because that is the word
-                // on the setup page the viewer will land on, and it says which
-                // arrow because the other one does nothing here.
-                colour=UI_COLOR_DIM;
-                snprintf(text,sizeof(text),"Hold UP: set up WiFi");
-            }
-            ui_text_draw(surface,14,y,text,colour,UI_COLOR_BACKDROP);
+            // The instruction is dimmed, because it is not a reading.
+            ui_text_draw(surface,14,y,status_text[i],
+                         i==STATUS_LINES-1u?UI_COLOR_DIM:UI_COLOR_TEXT,UI_COLOR_BACKDROP);
         }
     }
     #undef LINE_HEIGHT
@@ -1807,10 +2086,14 @@ static void enlarge_stripe(uint8_t *buf) {
     }
 #endif
 }
-static bool push_stripe(const av_video_t *v, unsigned n, unsigned y) {
-    const uint8_t *source=NULL;
-    size_t available=0;
-    if(!av_video_stripe(v,n,&source,&available) || !available) return false;
+// The four-pixels-a-step expander is written for whole groups on a 4-byte
+// boundary; the heap gives that for a DMA-capable buffer and this pins the count.
+_Static_assert(AV_STRIPE_PIXELS%4u==0u,"stripe pixel count must be a multiple of four");
+static bool push_stripe(const uint8_t *source, size_t available, unsigned n, unsigned y) {
+    // A stripe of length zero is one the sender chose not to resend because the
+    // panel already shows it (TV_DELTA on the server). Nothing to inflate and
+    // nothing to put on the bus; it is not an error.
+    if(!available) return true;
     // Take the next buffer in turn, and wait for its previous transfer only
     // now -- here, where it is about to be written over. The panel has had the
     // whole of the last stripe's build time to finish sending it, so this
@@ -1860,7 +2143,7 @@ static bool push_stripe(const av_video_t *v, unsigned n, unsigned y) {
     // this chip.
     {
         int64_t t=esp_timer_get_time();
-        av_expand_indexed(buf,AV_STRIPE_PIXELS,s.palette);
+        av_expand_indexed_wire(buf,AV_STRIPE_PIXELS,s.palette);
         atomic_fetch_add(&s.expand_us,(uint32_t)(esp_timer_get_time()-t));
     }
     {
@@ -1944,9 +2227,9 @@ static void drain_display(void) {
 // decodes, nothing here receives, and nothing here can be paced by a sender.
 //
 // The number it produces is the answer to "how fast can this device draw",
-// and the number to compare it against is 153600 bytes over 40 MHz of four-wire
-// SPI: 30.7 ms a frame, which until now has been arithmetic rather than an
-// observation.
+// and the number to compare it against is 153600 bytes over four-wire SPI at
+// BSP_LCD_PCLK_HZ (80 MHz): 15.4 ms a frame (30.7 ms at the old 40 MHz), which
+// until now has been arithmetic rather than an observation.
 static void display_bench(void) {
     if(bsp_display_raw_claim()!=ESP_OK) {
         ESP_LOGE(TAG,"display bench: panel busy");
@@ -1999,8 +2282,8 @@ done:;
         " floor_ms=%u heap=%u",
         frames,AV_STRIPES,total_us/1000,total_us/1000/frames,
         fill_us/1000,submit_us/1000,wait_us/1000,
-        // 153600 bytes, eight bits each, at 40 MHz: 320*240*2*8/40000000
-        // seconds, which is 30.72 ms. Written out in full rather than
+        // 153600 bytes, eight bits each, at 80 MHz: 320*240*2*8/80000000
+        // seconds, which is 15.36 ms. Written out in full rather than
         // simplified, because this line has now been wrong twice.
         //
         // It first printed 3 ms -- a tenth of the truth, the divide-by-1000
@@ -2073,6 +2356,344 @@ piped:;
         }
     }
     free(buf);
+    bsp_display_raw_release();
+}
+#endif
+#ifdef CONFIG_AV_HW_BENCH
+// The hardware benchmark: what the panel, the CPU and the receive path each
+// cost, measured rather than derived.
+//
+// Every figure the handoff of 2026-09-28 carries is arithmetic. The CPU table
+// says "20/25/8 cycles per byte/pixel" and then admits the numbers are
+// estimates; the panel floor of 30.7 ms has never been the wire and always been
+// the multiplication. The optimisation order in section 9 depends on which of
+// the three actually binds, and nothing in the repository can currently say.
+//
+// Runs before any socket exists, like display_bench(), so nothing here can be
+// paced by a sender. Prints one `BENCH name=... key=value` line per item for
+// tools/bench_summary.py to tabulate; the format is fixed because a script
+// reads it and a human does not.
+//
+// Cycles come from esp_cpu_get_cycle_count(), which counts every cycle the
+// core retires -- not wall time, and not including time the core is idle. That
+// is the right instrument for a cost per byte or per pixel, because it does not
+// change with what else the scheduler is doing.
+
+// How many times to repeat each CPU measurement. Enough that one interrupt
+// cannot move the mean by a visible amount, few enough that the whole benchmark
+// finishes before a human gives up waiting.
+#define BENCH_CPU_REPEATS 4
+
+static void bench_display_variant(const char *name, int stripe_rows) {
+    // The video's own geometry, not the panel's. The product draws a letterboxed
+    // 320x180 picture, so a variant measured across the full 240 panel rows is
+    // measuring something the product never does -- and the first version of
+    // this swept the panel and produced a baseline that could not be compared
+    // with anything.
+    const int video_rows = (int)AV_VIDEO_HEIGHT;
+    const unsigned stripes = (unsigned)video_rows / (unsigned)stripe_rows;
+    const size_t bytes = (size_t)AV_WIDTH * (size_t)stripe_rows * 2u;
+    uint8_t *buf = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!buf) { ESP_LOGW(TAG,"BENCH name=%s skipped=no_memory",name); return; }
+    for (size_t i = 0; i < bytes; i++) buf[i] = (uint8_t)(i ^ (i >> 5));
+    const unsigned frames = 60;
+    int64_t start = esp_timer_get_time();
+    unsigned submitted = 0;
+    for (unsigned f = 0; f < frames; f++) {
+        for (unsigned s = 0; s < stripes; s++) {
+            for (size_t i = 0; i < bytes; i += 64) buf[i] = (uint8_t)(f + s + i);
+            if (bsp_display_raw_submit((int)AV_VIDEO_Y_OFFSET
+                                           + (int)(s * (unsigned)stripe_rows),
+                                       stripe_rows, buf, 200) != ESP_OK) {
+                ESP_LOGE(TAG,"BENCH name=%s submit_failed frame=%u stripe=%u",name,f,s);
+                goto done;
+            }
+            if (bsp_display_raw_wait(200) != ESP_OK) {
+                ESP_LOGE(TAG,"BENCH name=%s wait_failed frame=%u stripe=%u",name,f,s);
+                goto done;
+            }
+            submitted++;
+        }
+    }
+done:;
+    {
+        uint32_t total_us = (uint32_t)(esp_timer_get_time() - start);
+        ESP_LOGW(TAG,"BENCH name=%s stripes=%u stripe_rows=%d frames=%u submitted=%u"
+            " total_ms=%"PRIu32" per_frame_ms=%"PRIu32" bytes_per_frame=%u floor_ms=%u",
+            name, stripes, stripe_rows, frames, submitted,
+            total_us / 1000u, submitted ? (uint32_t)(total_us / 1000u / frames) : 0u,
+            (unsigned)(bytes * stripes), (unsigned)PANEL_FLOOR_MS);
+    }
+    free(buf);
+}
+
+// The whole picture in one window, pixels only. Two buffers, one transfer kept
+// outstanding, which is the depth the product uses -- so the number is reachable
+// rather than a laboratory maximum.
+static void bench_display_onewindow(void) {
+    const size_t bytes = STRIPE_BYTES;
+    uint8_t *a = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    uint8_t *b = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!a || !b) {
+        ESP_LOGW(TAG,"BENCH name=disp_onewindow skipped=no_memory");
+        free(a); free(b);
+        return;
+    }
+    for (size_t i = 0; i < bytes; i++) { a[i] = (uint8_t)(i ^ (i >> 5)); b[i] = (uint8_t)(i * 3u + 1u); }
+    uint8_t *buffers[2] = { a, b };
+    const unsigned frames = 60;
+    // The window covers the whole picture, so the y it is opened at is the
+    // letterbox offset this project draws the video at.
+    if (bsp_display_raw_window_begin((int)AV_VIDEO_Y_OFFSET,
+                                     (int)AV_VIDEO_HEIGHT * (int)AV_ENLARGE_NUM
+                                         / (int)AV_ENLARGE_DEN) != ESP_OK) {
+        ESP_LOGE(TAG,"BENCH name=disp_onewindow window_begin_failed");
+        free(a); free(b);
+        return;
+    }
+    int64_t start = esp_timer_get_time();
+    unsigned pushed = 0;
+    for (unsigned f = 0; f < frames; f++) {
+        for (unsigned s = 0; s < AV_STRIPES; s++) {
+            if (bsp_display_raw_window_push((int)AV_STRIPE_ROWS, buffers[s & 1u]) != ESP_OK) {
+                ESP_LOGE(TAG,"BENCH name=disp_onewindow push_failed frame=%u stripe=%u",f,s);
+                goto done;
+            }
+            pushed++;
+            if (s >= 1) {
+                if (bsp_display_raw_drain(1, 200) != ESP_OK) {
+                    ESP_LOGE(TAG,"BENCH name=disp_onewindow drain_failed frame=%u stripe=%u",f,s);
+                    goto done;
+                }
+            }
+        }
+        if (bsp_display_raw_drain(1, 200) != ESP_OK) goto done;
+    }
+done:;
+    {
+        uint32_t total_us = (uint32_t)(esp_timer_get_time() - start);
+        ESP_LOGW(TAG,"BENCH name=disp_onewindow stripes=%u stripe_rows=%u frames=%u pushed=%u"
+            " total_ms=%"PRIu32" per_frame_ms=%"PRIu32" bytes_per_frame=%u floor_ms=%u",
+            (unsigned)AV_STRIPES, (unsigned)AV_STRIPE_ROWS, frames, pushed,
+            total_us / 1000u, pushed ? (uint32_t)(total_us / 1000u / frames) : 0u,
+            // The video's own bytes, which is what the window actually covers:
+            // STRIPE_BYTES * AV_STRIPES would count panel rows the picture does
+            // not occupy and make this line disagree with its neighbours.
+            (unsigned)(AV_VIDEO_WIDTH * AV_VIDEO_HEIGHT * 2u), (unsigned)PANEL_FLOOR_MS);
+    }
+    free(a); free(b);
+}
+
+// A deterministic byte stream whose compressibility is set by the two
+// arguments: `repeat_block` bytes drawn from a pseudo-random pattern repeat for
+// the whole buffer, and every `noise_every`-th byte is fresh noise instead.
+// Longer blocks and more frequent noise both make the stream harder to
+// compress, so the pair walks the ratio across the range the wire sees.
+//
+// Must stay byte-for-byte identical to fill_source() in tools/make_bench_blobs.py
+// -- that is the whole contract between the two files. The benchmark inflates
+// each blob and compares the result against what this produces, so a drift
+// shows up as a failed check rather than as a plausible cycle count. The
+// generator is the authority: it is where the compressed bytes come from, and
+// this exists so the device can verify the decode rather than trust it.
+int bench_fill_source(uint8_t *dst, size_t n, unsigned repeat_block,
+                      unsigned noise_every) {
+    if (!dst || !repeat_block) return -1;
+    uint32_t x = 0x12345678u;
+    uint8_t *pattern = heap_caps_malloc(repeat_block, MALLOC_CAP_8BIT);
+    if (!pattern) return -1;
+    for (unsigned i = 0; i < repeat_block; i++) {
+        x = x * 1103515245u + 12345u;
+        pattern[i] = (uint8_t)(x >> 16);
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (noise_every && (i % noise_every) == 0u) {
+            x = x * 1103515245u + 12345u;
+            dst[i] = (uint8_t)(x >> 16);
+        } else {
+            dst[i] = pattern[i % repeat_block];
+        }
+    }
+    free(pattern);
+    return 0;
+}
+
+static void bench_cpu(void) {
+    // The blob source size, four stripes: the blobs were generated against it
+    // and bench_fill_source() must produce that many bytes to verify them.
+    const size_t src_bytes = BENCH_BLOB_SOURCE_BYTES;
+    uint8_t *src = heap_caps_malloc(src_bytes, MALLOC_CAP_8BIT);
+    uint8_t *out = heap_caps_malloc(src_bytes, MALLOC_CAP_8BIT);
+    uint8_t *exp = heap_caps_malloc(src_bytes * 2u, MALLOC_CAP_8BIT);
+    tinfl_decompressor *infl = heap_caps_malloc(sizeof(tinfl_decompressor),
+                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!src || !out || !exp || !infl) {
+        ESP_LOGW(TAG,"BENCH name=cpu skipped=no_memory");
+        goto done;
+    }
+    // A known stream for the memcpy baseline, so the byte cost is read against
+    // real data rather than an all-zero block a wide copy could shortcut.
+    if (bench_fill_source(src, src_bytes, 512u, 0u) != 0) {
+        ESP_LOGW(TAG,"BENCH name=cpu_memcpy skipped=no_memory");
+        goto done;
+    }
+
+    // memcpy as the baseline a per-byte figure is read against.
+    {
+        uint64_t cyc = 0;
+        for (unsigned r = 0; r < BENCH_CPU_REPEATS; r++) {
+            uint32_t t = bench_cycles();
+            memcpy(out, src, src_bytes);
+            cyc += bench_cycles() - t;
+        }
+        ESP_LOGW(TAG,"BENCH name=cpu_memcpy bytes=%u repeats=%u cyc_per_byte_x1000=%u",
+                 (unsigned)src_bytes, BENCH_CPU_REPEATS,
+                 (unsigned)(cyc * 1000u / BENCH_CPU_REPEATS / src_bytes));
+    }
+
+    // inflate at four compression ratios, against blobs generated on the host.
+    //
+    // Not compressed here, because the ROM's tdefl cannot run on this chip:
+    // esp_rom's miniz.h defines MINIZ_NO_MALLOC and a tdefl_compressor is about
+    // 130 KB against the 112 KB this device has free. Measured -- the first
+    // version of this benchmark compressed on the device and reported four
+    // `compress_failed` skips. Compressing on the host also makes the ratio a
+    // chosen input rather than an outcome.
+    //
+    // Each blob is verified against bench_fill_source() before it is timed, so
+    // a generator that drifted from the C mirror reports a check failure rather
+    // than a believable cycle count.
+    for (unsigned bi = 0; bi < BENCH_BLOB_COUNT; bi++) {
+        const bench_blob_t *blob = &BENCH_BLOBS[bi];
+        if (bench_fill_source(src, blob->length ? BENCH_BLOB_SOURCE_BYTES : 0u,
+                              blob->repeat_block, blob->noise_every) != 0) {
+            ESP_LOGW(TAG,"BENCH name=cpu_tinfl_r%u skipped=no_memory",
+                     (unsigned)(blob->ratio_x1000 / 1000u));
+            continue;
+        }
+        // Verify once, outside the timing loop: the point of the check is the
+        // decode's correctness, and doing it inside would charge the comparison
+        // to the decoder.
+        {
+            size_t in_len = blob->length, out_len = BENCH_BLOB_SOURCE_BYTES;
+            tinfl_init(infl);
+            tinfl_status st = tinfl_decompress(infl, blob->data, &in_len,
+                                               out, out, &out_len,
+                                               TINFL_FLAG_PARSE_ZLIB_HEADER |
+                                               TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+            if (st != TINFL_STATUS_DONE || out_len != BENCH_BLOB_SOURCE_BYTES ||
+                memcmp(out, src, BENCH_BLOB_SOURCE_BYTES) != 0) {
+                ESP_LOGW(TAG,"BENCH name=cpu_tinfl_r%u skipped=verify_failed st=%d"
+                    " out=%u",(unsigned)(blob->ratio_x1000 / 1000u),(int)st,
+                    (unsigned)out_len);
+                continue;
+            }
+        }
+        uint64_t cyc = 0;
+        bool ok = true;
+        for (unsigned r = 0; r < BENCH_CPU_REPEATS; r++) {
+            size_t in_len = blob->length, out_len = BENCH_BLOB_SOURCE_BYTES;
+            tinfl_init(infl);
+            uint32_t t = bench_cycles();
+            // The same flags the product's decoder uses: the blobs are zlib
+            // streams, so a bare 0 here would fail on all four and the
+            // benchmark would report four skips and no cycle counts.
+            tinfl_status st = tinfl_decompress(infl, blob->data, &in_len,
+                                               out, out, &out_len,
+                                               TINFL_FLAG_PARSE_ZLIB_HEADER |
+                                               TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+            cyc += bench_cycles() - t;
+            if (st != TINFL_STATUS_DONE) { ok = false; break; }
+        }
+        if (!ok) {
+            ESP_LOGW(TAG,"BENCH name=cpu_tinfl_r%u skipped=inflate_failed",
+                     (unsigned)(blob->ratio_x1000 / 1000u));
+            continue;
+        }
+        // Two figures, both wanted: cycles per compressed byte is what the
+        // receiver pays per byte off the wire, and cycles per output byte is
+        // what the decode costs the frame. They differ by the ratio.
+        ESP_LOGW(TAG,"BENCH name=cpu_tinfl_r%u ratio_x1000=%u in_bytes=%u out_bytes=%u"
+            " repeats=%u cyc_per_in_x1000=%u cyc_per_out_x1000=%u",
+            (unsigned)(blob->ratio_x1000 / 1000u), (unsigned)blob->ratio_x1000,
+            (unsigned)blob->length, (unsigned)BENCH_BLOB_SOURCE_BYTES,
+            BENCH_CPU_REPEATS,
+            (unsigned)(cyc * 1000u / BENCH_CPU_REPEATS / blob->length),
+            (unsigned)(cyc * 1000u / BENCH_CPU_REPEATS / BENCH_BLOB_SOURCE_BYTES));
+    }
+
+    // The expander as it ships, on the indexed data the wire actually carries.
+    {
+        const size_t pixels = src_bytes / 2u;
+        uint16_t palette[AV_PALETTE_ENTRIES];
+        for (unsigned i = 0; i < AV_PALETTE_ENTRIES; i++) palette[i] = (uint16_t)(i * 257u);
+        uint64_t cyc = 0;
+        for (unsigned r = 0; r < BENCH_CPU_REPEATS; r++) {
+            // Every index value present, so no palette entry is cold in cache
+            // and no value is special -- the product's own stream is arbitrary.
+            for (size_t i = 0; i < pixels; i++) exp[i] = (uint8_t)i;
+            uint32_t t = bench_cycles();
+            av_expand_indexed(exp, pixels, palette);
+            cyc += bench_cycles() - t;
+        }
+        ESP_LOGW(TAG,"BENCH name=cpu_expand_cur pixels=%u repeats=%u cyc_per_pixel_x1000=%u",
+                 (unsigned)pixels, BENCH_CPU_REPEATS,
+                 (unsigned)(cyc * 1000u / BENCH_CPU_REPEATS / pixels));
+    }
+
+    // The four-at-a-time expander the product uses, against the plain one above,
+    // on the same varied indices: it must be byte for byte the same, and this
+    // reports what it costs. The check is on the device because the host tests
+    // need a native compiler that not every machine has.
+    {
+        const size_t pixels = src_bytes / 2u;
+        uint16_t palette[AV_PALETTE_ENTRIES], wire[AV_PALETTE_ENTRIES];
+        for (unsigned i = 0; i < AV_PALETTE_ENTRIES; i++) wire[i] = palette[i] = (uint16_t)(i * 257u + (i << 3));
+        av_palette_wire_order(wire);
+        uint8_t *ref = heap_caps_malloc(pixels * 2u, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!ref) { ESP_LOGW(TAG,"BENCH name=cpu_expand_wire skipped=no-memory"); goto done; }
+        for (size_t i = 0; i < pixels; i++) exp[i] = ref[i] = (uint8_t)(i * 7u + (i >> 3));
+        av_expand_indexed(ref, pixels, palette);
+        uint64_t cyc = 0;
+        bool same = true;
+        for (unsigned r = 0; r < BENCH_CPU_REPEATS; r++) {
+            for (size_t i = 0; i < pixels; i++) exp[i] = (uint8_t)(i * 7u + (i >> 3));
+            uint32_t t = bench_cycles();
+            av_expand_indexed_wire(exp, pixels, wire);
+            cyc += bench_cycles() - t;
+            if (memcmp(ref, exp, pixels * 2u) != 0) same = false;
+        }
+        free(ref);
+        ESP_LOGW(TAG,"BENCH name=cpu_expand_wire pixels=%u repeats=%u same=%d cyc_per_pixel_x1000=%u",
+                 (unsigned)pixels, BENCH_CPU_REPEATS, (int)same,
+                 (unsigned)(cyc * 1000u / BENCH_CPU_REPEATS / pixels));
+    }
+done:;
+    free(src); free(out); free(exp); free(infl);
+}
+
+static void hw_bench(void) {
+    if (bsp_display_raw_claim() != ESP_OK) {
+        ESP_LOGE(TAG,"BENCH aborted: panel busy");
+        return;
+    }
+    ESP_LOGW(TAG,"BENCH begin version=1 floor_ms=%u pclk_hz=%u width=%u height=%u"
+        " stripe_rows=%u stripes=%u heap=%u",
+        (unsigned)PANEL_FLOOR_MS, (unsigned)BSP_LCD_PCLK_HZ,
+        (unsigned)AV_WIDTH, (unsigned)AV_HEIGHT,
+        (unsigned)AV_STRIPE_ROWS, (unsigned)AV_STRIPES,
+        (unsigned)esp_get_free_heap_size());
+    // Stripe height is swept to separate the fixed per-stripe addressing and
+    // synchronisation cost from the pixel clock: the same pixels at three
+    // stripe heights differ only in how many times that fixed cost is paid.
+    bench_display_variant("disp_stripes12", 12);
+    if (AV_HEIGHT % 30u == 0u) bench_display_variant("disp_stripes30", 30);
+    if (AV_HEIGHT % 60u == 0u) bench_display_variant("disp_stripes60", 60);
+    bench_display_onewindow();
+    bench_cpu();
+    ESP_LOGW(TAG,"BENCH end heap=%u largest=%u",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     bsp_display_raw_release();
 }
 #endif
@@ -2303,6 +2924,8 @@ for(unsigned y=0;y<AV_HEIGHT && !stopping();y+=AV_STRIPE_ROWS) {
 
 static void video_task(void *arg) {
     (void)arg;
+    int64_t pkt_start_us=0;
+    bool pkt_ok=true;
     bool claimed=bsp_display_raw_claim()==ESP_OK;
     if(!claimed) { fail("raw display claim"); goto done; }
     // Painted before the first frame so the panel never shows uninitialised
@@ -2316,6 +2939,7 @@ static void video_task(void *arg) {
         // only place its owner runs while it waits, so this is where the check
         // belongs.
         if (waiting_screen_stale() && !paint_waiting_screen()) break;
+        if (!refresh_info_bars()) break;
         video_t v;
         if(!xQueueReceive(s.video,&v,pdMS_TO_TICKS(20))) { if(rx_done()) break; continue; }
         // The clock is waited on once per frame, at the packet that opens it.
@@ -2360,19 +2984,10 @@ static void video_task(void *arg) {
             if(s.skipping) { s.dropped++; atomic_fetch_add(&s.rx_frame_skipped,1u); }
         }
         if(!s.skipping) {
-            int64_t start=esp_timer_get_time();
-            bool drawn=true;
-            // Zeroed rather than left to whatever the stack held. On the path
-            // where the decoder refuses the packet, `parts` is never written
-            // and the stripe count below would then be read from an
-            // uninitialised struct -- which decides whether the frame counts
-            // as drawn, so a stale value there is a wrong answer and not just
-            // a stray read.
-            av_video_t parts={0};
-            if(!av_video_decode(v.jpeg,v.length,&parts)) drawn=false;
-            else {
+            if(v.packet_start) { pkt_start_us=esp_timer_get_time(); pkt_ok=true; }
+            if(!v.dropped) {
 #if AV_VIDEO_Y_OFFSET > 0
-                if(s.decoded == 0 && parts.first == 0) {
+                if(s.decoded == 0 && v.stripe == 0) {
                     memset(s.stripe[0], 0, STRIPE_BYTES);
                     for (unsigned cy = 0; cy < (unsigned)AV_VIDEO_Y_OFFSET; ) {
                         unsigned rows = (unsigned)AV_VIDEO_Y_OFFSET - cy;
@@ -2391,22 +3006,17 @@ static void video_task(void *arg) {
                     }
                 }
 #endif
-                // Each packet carries a run of consecutive stripes, drawn as it
-                // arrives so the panel updates while the rest of the frame is
-                // still crossing the network.
-                for(unsigned i=0;i<parts.count;i++) {
-                    unsigned y=(unsigned)AV_VIDEO_Y_OFFSET + (parts.first+i)*AV_STRIPE_ROWS;
-                    if(!push_stripe(&parts,i,y)) { drawn=false; break; }
-                }
+                unsigned y=(unsigned)AV_VIDEO_Y_OFFSET + (unsigned)v.stripe*AV_STRIPE_ROWS;
+                if(!push_stripe(v.data,v.length,v.stripe,y)) pkt_ok=false;
+                s.drawn_stripes++;
             }
-            s.drawn_stripes += parts.count;
+        }
+        if(!s.skipping && v.packet_end) {
+            int64_t start=pkt_start_us;
+            bool drawn=pkt_ok;
             if (s.drawn_stripes > atomic_load(&s.rx_max_stripes)) {
                 atomic_store(&s.rx_max_stripes, s.drawn_stripes);
             }
-            // A frame counts as drawn only when every stripe of it has been.
-            // The count is what says so, and the receiver checks it because a
-            // frame that lost a packet would otherwise be counted as a whole
-            // picture while the panel still showed part of the last one.
             if(drawn && s.drawn_stripes>=AV_STRIPES) {
                 s.decoded++;
                 s.drawn_stripes=0;
@@ -2451,7 +3061,7 @@ static void video_task(void *arg) {
             atomic_fetch_add(&s.panel_frames,1u);
             if(!drawn && !stopping()) fail("indexed stripe decode/geometry/DMA error");
         }
-        xQueueSend(s.free_video,&v.jpeg,0);
+        if(v.data) ring_release(&v);
     }
     // Fault recovery preserves ownership until completion or a hardware reboot.
     drain_display();
@@ -2474,11 +3084,11 @@ static bool allocate_session(void) {
     // that mattered was the channel list's, and every slot added anywhere in
     // the session is paid for out of the same heap before the first CONFIG is
     // parsed.
-    s.video=xQueueCreate(AV_VIDEO_BUFFERS,sizeof(video_t));
-    s.free_video=xQueueCreate(AV_VIDEO_BUFFERS,sizeof(uint8_t *));
-    for(int i=0;i<AV_VIDEO_BUFFERS;i++) {
-        s.jpeg[i]=heap_caps_malloc(AV_VIDEO_MAX,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
-    }
+    s.video=xQueueCreate(AV_VIDEO_ITEMS,sizeof(video_t));
+    s.ring=heap_caps_malloc(AV_VIDEO_RING_BYTES,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    s.ring_head=0;
+    atomic_store(&s.ring_tail,0u);
+    atomic_store(&s.ring_inflight,0u);
     // Internal memory, not DMA-capable: the panel reads it through the same
     // DMA submission as before, but the buffer also has to hold the index bytes
     // while they are expanded in place, so it is written by the CPU first.
@@ -2498,22 +3108,14 @@ static bool allocate_session(void) {
     s.palette_ready=false;
     s.drawn_stripes=0;
     s.skipping=false;
-    if(!s.audio || !s.video || !s.free_video || !s.stripe[0] || !s.stripe[1] || !s.inflate) return false;
-    for(int i=0;i<AV_VIDEO_BUFFERS;i++) {
-        // Every buffer has to be there. A short pool is not a session that runs
-        // on less memory; it is a session that stalls on its first picture,
-        // because the receiver waits for a buffer that is never coming back.
-        if(!s.jpeg[i]) return false;
-    }
-    for(int i=0;i<AV_VIDEO_BUFFERS;i++) xQueueSend(s.free_video,&s.jpeg[i],0);
+    if(!s.audio || !s.video || !s.ring || !s.stripe[0] || !s.stripe[1] || !s.inflate) return false;
     return true;
 }
 static void free_session(void) {
     if(s.audio) vQueueDelete(s.audio);
     if(s.video) vQueueDelete(s.video);
-    if(s.free_video) vQueueDelete(s.free_video);
-    s.audio=s.video=s.free_video=NULL;
-    for(int i=0;i<AV_VIDEO_BUFFERS;i++) { free(s.jpeg[i]); s.jpeg[i]=NULL; }
+    s.audio=s.video=NULL;
+    free(s.ring); s.ring=NULL;
     free(s.stripe[0]); s.stripe[0]=NULL;
     free(s.stripe[1]); s.stripe[1]=NULL;
     free(s.inflate); s.inflate=NULL;
@@ -3092,6 +3694,12 @@ void av_player_main(void) {
     // one line in the boot log; see the function for what it settles.
     display_bench();
 #endif
+#ifdef CONFIG_AV_HW_BENCH
+    // Same place, same reason, and it runs even when AV_DISPLAY_BENCH is off.
+    // Both take the panel and both release it before returning, so the order
+    // between them does not matter.
+    hw_bench();
+#endif
     // The USB peripheral, when this build measures with it. Not installed
     // otherwise: it holds about 20 KB of internal RAM in ring buffers for the
     // life of the device, and a build that never uses it should not pay that
@@ -3205,12 +3813,17 @@ void av_player_main(void) {
         atomic_store(&s.inflate_bytes,0u);
         atomic_store(&s.rx_video_bytes,0u); atomic_store(&s.rx_video_packets,0u);
         atomic_store(&s.rx_audio_packets,0u);
+        atomic_store(&s.fps_x10,0u); atomic_store(&s.rx_bytes_per_s,0u);
+        bars_drawn=false;   // the first frame blackens the bars again
         atomic_store(&s.rx_io_us,0u); atomic_store(&s.rx_wait_us,0u);
         atomic_store(&s.rx_overhead_us,0u); atomic_store(&s.rx_iterations,0u);
         atomic_store(&s.rx_frame_starts,0u); atomic_store(&s.rx_frame_skipped,0u);
         atomic_store(&s.rx_stray_packets,0u); atomic_store(&s.rx_max_stripes,0u);
         atomic_store(&s.rx_nobuf_packets,0u);
         atomic_store(&s.rx_header_gap_max_ms,0u);
+#ifdef CONFIG_AV_HW_BENCH
+        atomic_store(&s.rx_cycles,0u);
+#endif
         s.audio_high=s.video_high=0; s.clock_us=0;
         atomic_store(&s.media_started,false);
         // Back to "dialling", but only when that is worth saying.
@@ -3251,13 +3864,13 @@ void av_player_main(void) {
         // the allocations behind them changed -- 49152 was three 16384-byte
         // buffers when a frame could be split, and the real figures are now
         // 2 x AV_VIDEO_MAX = 45056 for the picture buffers, 24 x AV_AUDIO_BYTES
-        // = 30720 of PCM payload, and STRIPE_BYTES x 2 = 20480. An external
+        // = 7776 of ADPCM payload (30720 when the queue held PCM), and
+        // STRIPE_BYTES x 2 = 20480. An external
         // review noticed the line was stale twice before anyone corrected it.
         // A log line that reports numbers nobody computed is worse than no
         // line: it is read as a measurement.
-        ESP_LOGI(TAG,"Allocated video=%ux%u=%u PCM=%ux%u=%u stripes=%ux%u=%u; heap=%u largest=%u",
-            (unsigned)AV_VIDEO_BUFFERS,(unsigned)AV_VIDEO_MAX,
-            (unsigned)(AV_VIDEO_BUFFERS*AV_VIDEO_MAX),
+        ESP_LOGI(TAG,"Allocated video ring=%u audio(ADPCM)=%ux%u=%u stripes=%ux%u=%u; heap=%u largest=%u",
+            (unsigned)AV_VIDEO_RING_BYTES,
             (unsigned)PCM_QUEUE,(unsigned)AV_AUDIO_BYTES,
             (unsigned)(PCM_QUEUE*AV_AUDIO_BYTES),
             (unsigned)STRIPE_BUFFERS,(unsigned)STRIPE_BYTES,
@@ -3295,11 +3908,17 @@ void av_player_main(void) {
         // the timeline everything else is paced against.
         shot_maybe_request();
         if(xTaskCreate(video_task,"av_video",4096,NULL,5,NULL)!=pdPASS) { fail("video task allocation"); xEventGroupSetBits(s.events,VIDEO_DONE); }
-        if(xTaskCreate(audio_task,"av_audio",4096,NULL,7,NULL)!=pdPASS) { fail("audio task allocation"); xEventGroupSetBits(s.events,AUDIO_DONE); }
+        // One chunk of PCM now lives on this stack beside the queued ADPCM block,
+        // 324 bytes more than the PCM-only layout needed, so the stack grows a
+        // kilobyte; the queue gave back about 23 KB. The high-water mark is
+        // logged when the task ends -- trim this to what that says.
+        if(xTaskCreate(audio_task,"av_audio",5120,NULL,7,NULL)!=pdPASS) { fail("audio task allocation"); xEventGroupSetBits(s.events,AUDIO_DONE); }
         if(xTaskCreate(receive_task,"av_rx",5120,NULL,6,NULL)!=pdPASS) { fail("receive task allocation"); xEventGroupSetBits(s.events,RX_DONE); }
         int64_t session_start=esp_timer_get_time();
         int64_t next_metrics=session_start+10000000;
         int64_t next_battery=session_start;
+        int64_t rate_at=session_start, next_rate=session_start+1000000;
+        uint32_t rate_decoded=0, rate_bytes=0;
         int64_t last_tick=session_start;
         // The banner fires once per session, at the moment the server confirms
         // the channel; last_announced carries across sessions so reconnecting to
@@ -3314,6 +3933,9 @@ void av_player_main(void) {
         uint32_t last_expand_us=0, last_enlarge_us=0, last_overlay_us=0,
                  last_submit_us=0;
         uint32_t last_rx_bytes=0, last_rx_pkts=0, last_rx_audio=0;
+#ifdef CONFIG_AV_HW_BENCH
+        uint32_t last_rx_cycles=0;
+#endif
         uint32_t last_rx_io=0, last_rx_wait=0, last_rx_iters=0;
         while((xEventGroupGetBits(s.events)&(RX_DONE|AUDIO_DONE|VIDEO_DONE))!=(RX_DONE|AUDIO_DONE|VIDEO_DONE)) {
             // A channel was chosen: end this session and reconnect on the new
@@ -3379,6 +4001,24 @@ void av_player_main(void) {
                 atomic_store(&s.battery_soc,soc);   // -1 when unreadable
                 next_battery=tick_now+30000000;     // every 30 s
             }
+            // Frame rate and receive rate over the last second. The counters are
+            // zeroed at the start of each session, as are these baselines, so
+            // the differences never wrap. Audio is counted at its fixed packet
+            // size: the receive counter only tallies video bytes.
+            if(tick_now>=next_rate) {
+                uint32_t span_ms=(uint32_t)((tick_now-rate_at)/1000);
+                uint32_t decoded_now=s.decoded;
+                uint32_t bytes_now=atomic_load(&s.rx_video_bytes)
+                    +atomic_load(&s.rx_audio_packets)*(uint32_t)AV_AUDIO_BYTES;
+                if(span_ms) {
+                    atomic_store(&s.fps_x10,
+                        (uint32_t)((uint64_t)(decoded_now-rate_decoded)*10000u/span_ms));
+                    atomic_store(&s.rx_bytes_per_s,
+                        (uint32_t)((uint64_t)(bytes_now-rate_bytes)*1000u/span_ms));
+                }
+                rate_decoded=decoded_now; rate_bytes=bytes_now;
+                rate_at=tick_now; next_rate=tick_now+1000000;
+            }
             // Write back a setting that changed. Done here rather than in the key
             // handler because a flash write takes long enough to be felt as a
             // laggy button, and this loop is the one place with time to spare.
@@ -3434,6 +4074,23 @@ void av_player_main(void) {
                 uint32_t rx_io=atomic_load(&s.rx_io_us)-last_rx_io;
                 uint32_t rx_wait=atomic_load(&s.rx_wait_us)-last_rx_wait;
                 uint32_t rx_iters=atomic_load(&s.rx_iterations)-last_rx_iters;
+#ifdef CONFIG_AV_HW_BENCH
+                // The receive path's real cost, in cycles, over this interval.
+                //
+                // Reported with the byte count it was measured over, because the
+                // figure only means something as a ratio: cycles per byte is
+                // what the handoff wanted and could not get, and it is the one
+                // number that decides whether the receiver still has headroom at
+                // the frame rate the panel might reach once it is unblocked.
+                //
+                // Bytes are video plus audio, since the counter wraps every
+                // recv() on the one socket both arrive on -- which is the point:
+                // a per-stream attribution is not available here and was never
+                // the question.
+                uint32_t rx_cycles=atomic_load(&s.rx_cycles)-last_rx_cycles;
+                uint32_t rx_all_bytes=rx_bytes+rx_audio*(uint32_t)AV_AUDIO_BYTES;
+                uint32_t rx_cpb=rx_all_bytes ? (uint32_t)((uint64_t)rx_cycles/rx_all_bytes) : 0u;
+#endif
                 // The stripe's cost, split. `parts_sum` is not a measurement:
                 // it is the four parts added up on the way out, so that a
                 // reader can see at a glance whether they account for
@@ -3459,6 +4116,9 @@ void av_player_main(void) {
                     " expand_ms=%"PRIu32" enlarge_ms=%"PRIu32" overlay_ms=%"PRIu32" submit_ms=%"PRIu32" parts_ms=%"PRIu32
                     " rx_pkts=%"PRIu32" rx_bps=%"PRIu32" rx_audio=%"PRIu32" rssi=%d"
                     " io_ms=%"PRIu32" wait_ms=%"PRIu32" iters=%"PRIu32" per_iter_us=%"PRIu32
+#ifdef CONFIG_AV_HW_BENCH
+                    " rx_cyc=%"PRIu32" rx_cyc_per_byte=%"PRIu32
+#endif
                     " starts=%"PRIu32" late=%"PRIu32" stray=%"PRIu32" maxstripes=%"PRIu32 " nobuf=%"PRIu32
                     " hdrgap_max=%"PRIu32" phy=%s ch=%u",
                     frames-last_decoded,interval_ms,
@@ -3471,6 +4131,9 @@ void av_player_main(void) {
                     rx_pkts,rx_rate,rx_audio,wifi_rssi(),
                     rx_io/1000,rx_wait/1000,rx_iters,
                     rx_iters ? (uint32_t)(rx_io/rx_iters) : 0,
+#ifdef CONFIG_AV_HW_BENCH
+                    rx_cycles, rx_cpb,
+#endif
                     (uint32_t)atomic_load(&s.rx_frame_starts),
                     (uint32_t)atomic_load(&s.rx_frame_skipped),
                     (uint32_t)atomic_load(&s.rx_stray_packets),
@@ -3483,6 +4146,9 @@ void av_player_main(void) {
                 last_panel_frames+=panel_frames; last_panel_wait+=panel_wait;
                 last_rx_bytes+=rx_bytes; last_rx_pkts+=rx_pkts; last_rx_audio+=rx_audio;
                 last_rx_io+=rx_io; last_rx_wait+=rx_wait; last_rx_iters+=rx_iters;
+#ifdef CONFIG_AV_HW_BENCH
+                last_rx_cycles+=rx_cycles;
+#endif
                 last_expand_us+=expand_us; last_enlarge_us+=enlarge_us;
                 last_overlay_us+=overlay_us; last_submit_us+=submit_us;
                 next_metrics=now+10000000;

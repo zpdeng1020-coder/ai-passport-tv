@@ -1,0 +1,2 @@
+# Overlay: JPEG decode benchmark (main/jpeg_bench.c).
+CONFIG_AV_JPEG_BENCH=y

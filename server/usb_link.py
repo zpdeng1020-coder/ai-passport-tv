@@ -69,8 +69,17 @@ class SerialConnection:
         # cannot corrupt the stream. It is set high anyway, because some
         # drivers on some platforms use it to size internal buffers and a low
         # value throttles the port for real.
-        self._serial = serial.Serial(port, baudrate=baudrate, timeout=timeout,
-                                     write_timeout=WRITE_TIMEOUT_S)
+        # DTR and RTS are held low before the port opens. The board's auto-reset
+        # circuit hangs off those two lines, so a plain open resets the device
+        # and the first bytes sent afterwards land on a chip that is rebooting.
+        self._serial = serial.Serial()
+        self._serial.port = port
+        self._serial.baudrate = baudrate
+        self._serial.timeout = timeout
+        self._serial.write_timeout = WRITE_TIMEOUT_S
+        self._serial.dtr = False
+        self._serial.rts = False
+        self._serial.open()
         self.closed = False
 
     # --- the socket surface the sender uses ---------------------------------
